@@ -528,7 +528,7 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
             minute += 2.5
         }
         #expect(last?.judgement.verdict == .idle)
-        #expect(Observation.maxGap == 150)
+        #expect(ObservationWindow.maxGap == 150)
     }
 
     @Test func restartObservationForgetsWhatWasWatched() async throws {

@@ -366,7 +366,7 @@ public struct ContainersModule: CategoryModule {
             return nil
         }
         memory.withLock { state in
-            if Observation.isGap(since: state.lastCollect, now: now) {
+            if ObservationWindow.isGap(since: state.lastCollect, now: now) {
                 state.samples = [:]
                 state.lowCPUSince = [:]
             }
@@ -555,7 +555,7 @@ public struct ContainersModule: CategoryModule {
 
         let clients = Self.dockerClients(in: ctx.processes, ownPID: ctx.ownPID)
         let machines = memory.withLock { state -> EngineFacts.Machines in
-            if Observation.isGap(since: state.lastEngineScan, now: ctx.now) { state.engineQuietSince = [:] }
+            if ObservationWindow.isGap(since: state.lastEngineScan, now: ctx.now) { state.engineQuietSince = [:] }
             state.lastEngineScan = max(state.lastEngineScan ?? ctx.now, ctx.now)
             return state.orbMachines
         }

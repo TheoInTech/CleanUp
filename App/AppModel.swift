@@ -14,12 +14,8 @@ import WidgetKit
 final class AppModel {
     static let shared = AppModel()
 
-    enum Mode: Hashable {
-        /// Everything idle and not kept is ticked (never apps).
-        case quick
-        /// Nothing ticked until the user ticks it.
-        case manual
-    }
+    /// Quick select | Choose myself.
+    typealias Mode = TickController.Mode
 
     static let useAIKey = "useAppleIntelligence"
     static let lastWarningKey = "drainMonitor.lastWarning"
@@ -30,9 +26,12 @@ final class AppModel {
     private(set) var snapshot: Snapshot = .empty
     /// False until the first scan lands.
     private(set) var hasScanned = false
-    var selection = Selection()
-    var mode: Mode = .quick {
-        didSet { if mode != oldValue { applyMode() } }
+    /// What is ticked and how (Quick select | Choose myself); the rules live in CleanUpCore.
+    private(set) var ticks = TickController()
+    var selection: Selection { ticks.selection }
+    var mode: Mode {
+        get { ticks.mode }
+        set { ticks.setMode(newValue, in: snapshot, keep: keepList) }
     }
     var expanded: Set<CategoryID> = []
     var toast: ToastState?
@@ -64,9 +63,6 @@ final class AppModel {
     @ObservationIgnored private var lastRefresh: Date?
     @ObservationIgnored private var lastExternal: Date?
     @ObservationIgnored private var lastUndo: [UndoToken] = []
-    /// Ids Quick select proposed last refresh; only newly proposed ones are ticked on the next one,
-    /// so an item the user unticked stays unticked.
-    @ObservationIgnored private var lastQuickProposal: Set<ItemIdentity> = []
     @ObservationIgnored private var toastDismissal: Task<Void, Never>?
     @ObservationIgnored private let log = Logger(subsystem: "io.cleanup.CleanUp", category: "AppModel")
     @ObservationIgnored private var drainMonitor: DrainMonitor
@@ -96,7 +92,7 @@ final class AppModel {
     // MARK: Derived
 
     /// What Quick select would tick right now; the widget's and the notification's idle count.
-    var quickSelection: Selection { Selection.quick(snapshot, keep: keepList) }
+    var quickSelection: Selection { TickController.cleanIdleSelection(snapshot, keep: keepList) }
 
     var freedCores: Double { selection.freedCores(in: snapshot) }
 
@@ -154,12 +150,7 @@ final class AppModel {
         let oldMood = snapshot.mood
         let oldIdle = hasScanned ? quickSelection.count : -1
         withAnimation(.smooth(duration: 0.6)) { snapshot = fresh }
-        if mode == .quick {
-            let proposal = Selection.quick(fresh, keep: keepList).ticked
-            selection.ticked.formUnion(proposal.subtracting(lastQuickProposal))
-            lastQuickProposal = proposal
-        }
-        selection.reconcile(with: fresh)
+        ticks.apply(fresh, keep: keepList)
         hasScanned = true
 
         let quick = quickSelection
@@ -189,43 +180,19 @@ final class AppModel {
 
     // MARK: Ticks
 
-    private func applyMode() {
-        switch mode {
-        case .quick:
-            selection = quickSelection
-            lastQuickProposal = selection.ticked
-        case .manual:
-            selection = Selection()
-        }
-    }
-
     func toggle(_ item: Item) {
-        selection.toggle(item, in: snapshot)
+        ticks.toggle(item, in: snapshot)
     }
 
     /// Header tick: unticks the whole category if anything in it is ticked, otherwise ticks its idle
-    /// items (never apps, which are only ever ticked one by one).
+    /// items that aren't Always kept (never apps, which are only ever ticked one by one).
     func toggleCategory(_ id: CategoryID) {
-        guard let category = snapshot.categories.first(where: { $0.id == id }) else { return }
-        if selection.state(of: id, in: snapshot) != .none {
-            for item in category.items where isTicked(item) { selection.toggle(item, in: snapshot) }
-            return
-        }
-        // Two passes: containers first, so their engine can be ticked after them.
-        for _ in 0..<2 {
-            for item in category.items where canTickAll(item) && !isTicked(item) {
-                selection.toggle(item, in: snapshot)
-            }
-        }
+        ticks.toggleCategory(id, in: snapshot, keep: keepList)
     }
 
     /// Whether the header tick can tick anything in this category.
     func hasIdle(_ id: CategoryID) -> Bool {
-        snapshot.categories.first { $0.id == id }?.items.contains(where: canTickAll) ?? false
-    }
-
-    private func canTickAll(_ item: Item) -> Bool {
-        item.category != .apps && item.judgement.verdict == .idle
+        TickController.hasIdle(id, in: snapshot, keep: keepList)
     }
 
     func toggleExpanded(_ id: CategoryID) {
@@ -260,7 +227,7 @@ final class AppModel {
 
         let report = await clean(items, forced: forced)
         lastUndo = report.undo
-        selection.ticked.subtract(report.stopped)
+        ticks.stopped(report.stopped)
 
         let parts = Self.summary(of: report)
         show(ToastState(parts: parts, canUndo: !report.undo.isEmpty), for: .seconds(8))
@@ -310,8 +277,7 @@ final class AppModel {
     /// Adds the item to "Always kept" (Quick select never ticks it again) and unticks it.
     func keep(_ item: Item) {
         keepList.add(item.id, name: item.name)
-        if isTicked(item) { selection.toggle(item, in: snapshot) }
-        lastQuickProposal.remove(item.id)
+        ticks.kept(item, in: snapshot)
         show(ToastState("Always kept"), for: .seconds(2))
     }
 
@@ -391,7 +357,7 @@ final class AppModel {
     func cleanIdle() async {
         guard !isCleaning else { return }
         await refresh(forceExternal: true)
-        let quick = Selection.quick(snapshot, keep: keepList)
+        let quick = TickController.cleanIdleSelection(snapshot, keep: keepList)
         guard quick.count > 0 else {
             show(ToastState("Nothing idle"), for: .seconds(4))
             if !isVisible { await Notifications.postResult("Nothing idle to stop") }

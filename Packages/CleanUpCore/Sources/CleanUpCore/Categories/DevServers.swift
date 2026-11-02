@@ -312,7 +312,7 @@ public struct DevServersModule: CategoryModule {
         let table = ctx.processes
         // Time between two scans far apart (sleep, App Nap) wasn't watched: connections then went unseen.
         memory.withLock { state in
-            if Observation.isGap(since: state.lastScan, now: ctx.now) { state.watches = [:] }
+            if ObservationWindow.isGap(since: state.lastScan, now: ctx.now) { state.watches = [:] }
             state.lastScan = max(state.lastScan ?? ctx.now, ctx.now)
         }
 

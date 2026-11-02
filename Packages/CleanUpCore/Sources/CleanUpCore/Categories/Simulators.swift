@@ -224,7 +224,7 @@ public struct SimulatorsModule: CategoryModule {
     /// Starts, keeps or clears the services' watch; an unwatched gap starts it over.
     private func rememberServices(watching: Bool, now: Date) -> Date? {
         memory.withLockUnchecked { state in
-            if Observation.isGap(since: state.lastScan, now: now) { state.servicesQuietSince = nil }
+            if ObservationWindow.isGap(since: state.lastScan, now: now) { state.servicesQuietSince = nil }
             state.lastScan = max(state.lastScan ?? now, now)
             guard watching else {
                 state.servicesQuietSince = nil

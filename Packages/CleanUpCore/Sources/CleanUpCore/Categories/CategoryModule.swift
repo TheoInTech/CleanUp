@@ -74,7 +74,7 @@ extension CategoryModule {
 }
 
 /// How observation windows treat time CleanUp didn't watch.
-public enum Observation {
+public enum ObservationWindow {
     /// Scans come every 5 s (window open) or 60 s (background). A longer gap between two scans
     /// (sleep, App Nap, a stuck refresh) wasn't watched, so it can't count as quiet time: every
     /// window starts over.

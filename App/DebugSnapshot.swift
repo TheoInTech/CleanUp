@@ -1,6 +1,7 @@
 #if DEBUG
 import AppKit
 import CleanUpCore
+import SwiftUI
 
 /// Debug builds only. Launched with `-debugSnapshotDir <dir>`, the app renders its own windows to PNGs
 /// (no Screen Recording permission needed) while walking through the main window, an opened
@@ -20,6 +21,7 @@ enum DebugSnapshot {
         // The first scan has no CPU deltas yet; wait for the next one.
         await pause(7)
         capture("main-window", into: dir)
+        await capturePopover(model, into: dir)
 
         // Never touch an item the user already keeps (the walk removes its own Keep at the end).
         let kept = model.keepList
@@ -55,6 +57,42 @@ enum DebugSnapshot {
         await pause(1)
         capture("settings-removed", into: dir)
         finish()
+    }
+
+    /// Hosts the popover and the menu bar label in throwaway windows (the real ones only exist while
+    /// the status item is open) and writes `menubar-popover.png` and `menubar-label.png`.
+    private static func capturePopover(_ model: AppModel, into dir: URL) async {
+        let host = NSHostingView(rootView: MenuBarPopover().environment(model))
+        let size = host.fittingSize
+        host.frame = NSRect(origin: .zero, size: size)
+        let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = host
+        window.backgroundColor = .clear
+        window.isOpaque = false
+        window.setFrameOrigin(NSPoint(x: 80, y: 80))
+        window.orderFront(nil)
+        await pause(2)
+        if let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+            host.cacheDisplay(in: host.bounds, to: rep)
+            try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent("menubar-popover.png"))
+        }
+        window.orderOut(nil)
+
+        let strip = HStack(spacing: 28) {
+            MenuBarLabelContent(mood: .allGood, load: 0.2, minutes: "2h 5m")
+            MenuBarLabelContent(mood: .busy, load: 0.5, minutes: "58m")
+            MenuBarLabelContent(mood: .drainingFast, load: 0.9, minutes: "35m")
+            MenuBarLabelContent(mood: .allGood, load: 0.2, minutes: nil)
+        }
+        .foregroundStyle(.white)
+        .padding(14)
+        .background(Color(white: 0.12))
+        .environment(\.colorScheme, .dark)
+        let renderer = ImageRenderer(content: strip)
+        renderer.scale = 4
+        if let image = renderer.nsImage, let tiff = image.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) {
+            try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent("menubar-label.png"))
+        }
     }
 
     private static func finish() {

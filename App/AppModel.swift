@@ -34,8 +34,13 @@ final class AppModel {
     var toast: ToastState?
     /// The item whose "?" sheet is open.
     var explaining: Item?
-    /// The window or popover is on screen: refresh every 5 s instead of every 60 s.
-    var isVisible = false
+    /// The main window is on screen.
+    var windowVisible = false
+    /// The menu bar popover is on screen.
+    var popoverVisible = false
+    /// Either surface is on screen: refresh every 5 s instead of every 60 s. Tracked per surface so
+    /// closing one never slows the refresh while the other is still open.
+    var isVisible: Bool { windowVisible || popoverVisible }
     private(set) var isCleaning = false
     private(set) var keepList = KeepList(defaults: .standard)
     var useAI: Bool {

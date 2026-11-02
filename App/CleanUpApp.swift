@@ -13,10 +13,14 @@ struct CleanUpApp: App {
     }
 
     var body: some Scene {
-        MenuBarExtra("CleanUp", systemImage: "sparkles") {
-            // Placeholder until the menu bar popover lands.
-            OpenMainWindowButton()
+        MenuBarExtra {
+            MenuBarPopover()
+                .environment(model)
+        } label: {
+            MenuBarLabel()
+                .environment(model)
         }
+        .menuBarExtraStyle(.window)
 
         Window("CleanUp", id: "main") {
             MainView()
@@ -34,25 +38,12 @@ struct CleanUpApp: App {
         }
     }
 
-    /// Debug builds open the window at launch so it can be checked without the menu bar.
+    /// Menu bar only. The debug snapshot renderer needs the window up front, so it asks for it.
     private static var launchBehavior: SceneLaunchBehavior {
         #if DEBUG
-        .presented
+        UserDefaults.standard.string(forKey: "debugSnapshotDir") != nil ? .presented : .suppressed
         #else
         .suppressed
         #endif
-    }
-}
-
-private struct OpenMainWindowButton: View {
-    @Environment(\.openWindow) private var openWindow
-
-    var body: some View {
-        Button("Open CleanUp") {
-            NSApp.activate()
-            openWindow(id: "main")
-        }
-        Divider()
-        Button("Quit CleanUp") { NSApp.terminate(nil) }
     }
 }

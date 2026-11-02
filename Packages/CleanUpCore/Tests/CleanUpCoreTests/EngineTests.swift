@@ -46,7 +46,8 @@ private final class FakeMachine: Sendable {
             battery: { self.state.withLock { $0.battery } },
             swap: { self.state.withLock { $0.swap } },
             uptime: { .days(2) },
-            ownPID: 1
+            ownPID: 1,
+            freshSampleInterval: .zero
         )
     }
 }
@@ -636,6 +637,32 @@ extension EngineTests {
             #expect(ctx.frontmostBundleID == "com.example.front")
             #expect(ctx.now == fixedNow.addingTimeInterval(99))
             #expect(ctx.runExternal)
+        }
+
+        @Test func freshContextMeasuresCPUOverAShortSample() async {
+            // Two process-table reads 1 s apart (by the probe's clock): pid 7 used half a core.
+            let reads = OSAllocatedUnfairLock(initialState: 0)
+            let clock = OSAllocatedUnfairLock(initialState: 0)
+            let probe = SystemProbe(
+                now: { fixedNow.addingTimeInterval(Double(clock.withLock { c in defer { c += 1 }; return c })) },
+                processes: {
+                    let n = reads.withLock { r in defer { r += 1 }; return r }
+                    return [7: ProcessInfoRecord(
+                        pid: 7, ppid: 1, pgid: 7, uid: getuid(), name: "p", path: "/x/p", arguments: [], cwd: nil,
+                        startTime: fixedNow.addingTimeInterval(-60), cpuTimeNanos: UInt64(n) * 500_000_000, residentBytes: 0
+                    )]
+                },
+                sockets: { _ in [] }, frontmostBundleID: { nil }, battery: { nil }, swap: { (0, 0) }, uptime: { 0 },
+                ownPID: 1, freshSampleInterval: .milliseconds(5)
+            )
+            let ctx = await probe.freshContext()
+            #expect(abs((ctx.cpu[7] ?? -1) - 50) < 0.001)
+            #expect(ctx.runExternal)
+        }
+
+        @Test func freshContextWithoutASampleHasNoCPU() async {
+            let ctx = await FakeMachine().probe.freshContext()
+            #expect(ctx.cpu.isEmpty)
         }
 
         @Test func noRetryWhenNoEngineCameBack() async {

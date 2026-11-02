@@ -266,6 +266,7 @@ private final class FakeDocker: Sendable {
         /// Exact byte counters served by the (fake) Engine API; a missing name → API error.
         var api: [String: Int64] = [:]
         var socketOK = true
+        var orbList = CommandResult(status: 0, stdout: "", stderr: "", timedOut: false)
         var calls: [[String]] = []
     }
     let state = Mutex(State())
@@ -284,6 +285,7 @@ private final class FakeDocker: Sendable {
             case ("docker", "inspect"): return ok(s.inspect)
             case ("docker", "context"):
                 return s.socketOK ? ok("unix:///tmp/fake-docker.sock\n") : CommandResult(status: 1, stdout: "", stderr: "no context", timedOut: false)
+            case ("orb", "list"): return s.orbList
             case ("/usr/bin/curl", _):
                 let url = args.last ?? ""
                 let name = url.components(separatedBy: "/containers/").last?.components(separatedBy: "/stats").first ?? ""
@@ -343,6 +345,177 @@ private func ctx(_ minutes: Double = 0, processes: [Int32: ProcessInfoRecord] = 
 }
 
 private let client5432 = SocketInfo(pid: 900, state: .established, localPort: 51_000, remotePort: 5432)
+
+/// Docker Desktop's processes using 3.5% of a core in all: a quiet engine.
+private let quietEngineCPU: [Int32: Double] = [100: 1, 101: 1.5, 102: 1, 103: 0]
+
+/// Scans once a minute from `from` to `to` (inclusive), as the refresh loop does; returns the last scan.
+private func scanEveryMinute(
+    _ m: ContainersModule, from: Double = 0, to: Double,
+    processes: [Int32: ProcessInfoRecord] = [:], cpu: [Int32: Double] = [:], sockets: [SocketInfo] = []
+) async -> [Item] {
+    var last: [Item] = []
+    var minute = from
+    while minute <= to {
+        last = await m.scan(ctx(minute, processes: processes, cpu: cpu, sockets: sockets))
+        minute += 1
+    }
+    return last
+}
+
+private func engine(_ items: [Item], _ name: String = "Docker Desktop") -> Item? {
+    items.first { $0.id == .engine(name: name) }
+}
+
+private func withProcess(_ table: [Int32: ProcessInfoRecord], _ p: ProcessInfoRecord) -> [Int32: ProcessInfoRecord] {
+    var table = table
+    table[p.pid] = p
+    return table
+}
+
+private func orbStackTable() -> [Int32: ProcessInfoRecord] {
+    processTable(
+        .fixture(pid: 10, name: "OrbStack Helper", path: "/Applications/OrbStack.app/Contents/Frameworks/OrbStack Helper.app/Contents/MacOS/OrbStack Helper"),
+        .fixture(pid: 11, name: "OrbStack", path: "/Applications/OrbStack.app/Contents/MacOS/OrbStack")
+    )
+}
+
+private let quietOrbCPU: [Int32: Double] = [10: 1, 11: 1]
+
+// MARK: - Engine activity
+
+@Suite struct EngineActivityTests {
+    @Test func engineIsIdleOnlyAfterTenQuietMinutes() async throws {
+        let m = module(fakeDocker([]))
+        let first = try #require(engine(await m.scan(ctx(0, processes: dockerTable(), cpu: quietEngineCPU))))
+        #expect(first.judgement.verdict == .inUse)
+        #expect(first.judgement.fact == "measuring activity")
+        let nine = engine(await scanEveryMinute(m, from: 1, to: 9, processes: dockerTable(), cpu: quietEngineCPU))
+        #expect(nine?.judgement.verdict == .inUse)
+        let ten = try #require(engine(await m.scan(ctx(10, processes: dockerTable(), cpu: quietEngineCPU))))
+        #expect(ten.judgement.verdict == .idle)
+        #expect(ten.judgement.fact == "idle engine")
+    }
+
+    @Test(arguments: ["docker", "com.docker.cli", "docker-buildx", "docker-compose", "kubectl", "orb", "limactl"])
+    func aDockerClientKeepsTheEngineInUse(client: String) async throws {
+        let m = module(fakeDocker([]))
+        let procs = withProcess(dockerTable(), .fixture(pid: 600, ppid: 50, name: client, path: "/usr/local/bin/\(client)", arguments: [client, "build", "."]))
+        let item = try #require(engine(await scanEveryMinute(m, to: 15, processes: procs, cpu: quietEngineCPU)))
+        #expect(item.judgement.verdict == .inUse)
+        #expect(item.judgement.fact == "used by \(client)")
+    }
+
+    @Test func theQuietClockStartsOverWhenTheClientEnds() async throws {
+        let m = module(fakeDocker([]))
+        let pulling = withProcess(dockerTable(), .fixture(pid: 600, ppid: 50, name: "docker", path: "/usr/local/bin/docker", arguments: ["docker", "pull", "postgres"]))
+        _ = await scanEveryMinute(m, to: 20, processes: pulling, cpu: quietEngineCPU)
+        // The pull ended at minute 20: still in use at 29, idle from 31.
+        #expect(engine(await scanEveryMinute(m, from: 21, to: 29, processes: dockerTable(), cpu: quietEngineCPU))?.judgement.verdict == .inUse)
+        #expect(engine(await m.scan(ctx(31, processes: dockerTable(), cpu: quietEngineCPU)))?.judgement.verdict == .idle)
+    }
+
+    @Test func cleanUpsOwnDockerCallsAreNotClients() async {
+        let m = module(fakeDocker([]))
+        let procs = withProcess(dockerTable(), .fixture(pid: 600, ppid: getpid(), name: "docker", path: "/usr/local/bin/docker", arguments: ["docker", "ps"]))
+        #expect(engine(await scanEveryMinute(m, to: 10, processes: procs, cpu: quietEngineCPU))?.judgement.verdict == .idle)
+    }
+
+    @Test func colimasOwnHostAgentIsNotAClient() async {
+        let procs = processTable(
+            .fixture(pid: 20, name: "limactl", path: "/opt/homebrew/bin/limactl",
+                     arguments: ["limactl", "hostagent", "--pidfile", "/Users/me/.colima/_lima/colima/ha.pid", "colima"], startedAgo: .hours(2)),
+            .fixture(pid: 21, name: "com.apple.Virtualization.VirtualMachine", path: vmPath, startedAgo: .hours(2) - 1)
+        )
+        let m = module(fakeDocker([]))
+        let item = engine(await scanEveryMinute(m, to: 10, processes: procs, cpu: [20: 0.5, 21: 2]), "Colima")
+        #expect(item?.judgement.verdict == .idle)
+    }
+
+    @Test func aBusyVMKeepsTheEngineInUse() async {
+        // A build or pull runs inside the VM; no container shows it.
+        let m = module(fakeDocker([]))
+        let busy: [Int32: Double] = [100: 1, 101: 1, 102: 30, 103: 0]
+        let item = engine(await scanEveryMinute(m, to: 15, processes: dockerTable(), cpu: busy))
+        #expect(item?.judgement.verdict == .inUse)
+        #expect(item?.judgement.fact == "busy")
+        #expect(EngineJudge.idleOverheadPercent == 5)
+    }
+
+    @Test func unmeasuredEngineCPUIsInUse() async {
+        let m = module(fakeDocker([]))
+        let item = engine(await scanEveryMinute(m, to: 15, processes: dockerTable(), cpu: [:]))
+        #expect(item?.judgement.verdict == .inUse)
+        #expect(item?.judgement.fact == "measuring activity")
+    }
+
+    @Test func containerCPUIsNotCountedTwice() async throws {
+        // Eight idle containers at 0.9% each run inside the VM: 7.2 of the VM's 9% are theirs.
+        let rows = (1...8).map { Row(name: "c\($0)", cpu: "0.90%", port: 6_000 + $0) }
+        let m = module(fakeDocker(rows))
+        let cpu: [Int32: Double] = [100: 0.5, 101: 0.5, 102: 9, 103: 0]
+        let items = await scanEveryMinute(m, to: 21, processes: dockerTable(), cpu: cpu)
+        let docker = try #require(engine(items))
+        #expect(docker.judgement.verdict == .idle)
+        #expect(abs(docker.cores - 0.028) < 0.0001)   // 10% of the engine minus 7.2% of its containers
+        let containerCores = items.filter { $0.id != docker.id }.reduce(0) { $0 + $1.cores }
+        #expect(abs(containerCores - 0.072) < 0.0001)
+    }
+
+    @Test func aRunningOrbStackMachineKeepsItInUse() async {
+        let d = fakeDocker([])
+        d.set { $0.orbList = CommandResult(status: 0, stdout: "NAME    STATE    DISTRO  VERSION  ARCH\nubuntu  running  ubuntu  noble    arm64\n", stderr: "", timedOut: false) }
+        let item = engine(await scanEveryMinute(module(d), to: 15, processes: orbStackTable(), cpu: quietOrbCPU), "OrbStack")
+        #expect(item?.judgement.verdict == .inUse)
+        #expect(item?.judgement.fact == "a Linux machine is running")
+    }
+
+    @Test func orbStackMachinesThatCantBeListedCountAsRunning() async {
+        let d = fakeDocker([])
+        d.set { $0.orbList = CommandResult(status: 1, stdout: "", stderr: "boom", timedOut: false) }
+        let item = engine(await scanEveryMinute(module(d), to: 15, processes: orbStackTable(), cpu: quietOrbCPU), "OrbStack")
+        #expect(item?.judgement.verdict == .inUse)
+        #expect(item?.judgement.fact == "couldn't check its Linux machines")
+    }
+
+    @Test func orbStackWithOnlyStoppedMachinesCanBeIdle() async {
+        let d = fakeDocker([])
+        d.set { $0.orbList = CommandResult(status: 0, stdout: "NAME    STATE    DISTRO  VERSION  ARCH\nubuntu  stopped  ubuntu  noble    arm64\n", stderr: "", timedOut: false) }
+        let item = engine(await scanEveryMinute(module(d), to: 10, processes: orbStackTable(), cpu: quietOrbCPU), "OrbStack")
+        #expect(item?.judgement.verdict == .idle)
+        #expect(d.calls.contains(["orb", "list"]))
+    }
+
+    @Test func orbListIsOnlyRunForOrbStack() async {
+        let d = fakeDocker([])
+        _ = await scanEveryMinute(module(d), to: 2, processes: dockerTable(), cpu: quietEngineCPU)
+        #expect(!d.calls.contains { $0.first == "orb" })
+    }
+
+    @Test func parsesOrbList() {
+        #expect(ContainersModule.parseOrbMachines("NAME STATE DISTRO\n") == EngineFacts.Machines.none)
+        #expect(ContainersModule.parseOrbMachines("") == EngineFacts.Machines.none)
+        #expect(ContainersModule.parseOrbMachines("No machines found\n") == EngineFacts.Machines.none)
+        #expect(ContainersModule.parseOrbMachines("NAME STATE\nubuntu running\n") == .running)
+        #expect(ContainersModule.parseOrbMachines("NAME STATE\na stopped\nb stopped\n") == EngineFacts.Machines.none)
+        // A state we don't know counts as running.
+        #expect(ContainersModule.parseOrbMachines("NAME STATE\na starting\n") == .running)
+    }
+
+    @Test func engineStopChecksForDockerClientsAgain() async {
+        let quits = Mutex(0)
+        let m = module(FakeDocker(), quit: { _ in quits.withLock { $0 += 1 }; return true })
+        let item = Item(
+            id: .engine(name: "Docker Desktop"), category: .containers, name: "Docker Desktop", symbol: "gearshape.2",
+            judgement: Judgement(verdict: .idle, fact: "idle engine", signals: []), cores: 0, memoryBytes: 0,
+            processes: [], detail: ["appPath": "/Applications/Docker.app"]
+        )
+        let building = processTable(.fixture(pid: 600, ppid: 50, name: "docker", path: "/usr/local/bin/docker", arguments: ["docker", "build", "."]))
+        let result = await m.stop(item, ctx: .testContext(processes: building))
+        #expect(result == .skipped(reason: "Docker Desktop is used by docker"))
+        #expect(quits.withLock { $0 } == 0)
+    }
+}
 
 @Suite struct ContainersModuleTests {
     @Test func dockerDaemonDownYieldsNoItems() async {
@@ -532,15 +705,15 @@ private let client5432 = SocketInfo(pid: 900, state: .established, localPort: 51
         let d = fakeDocker([Row(name: "a"), Row(name: "b", port: 5433)])
         let m = module(d)
         let procs = dockerTable()
-        let cpu: [Int32: Double] = [100: 50, 101: 100, 102: 25]
-        _ = await m.scan(ctx(0, processes: procs, cpu: cpu))
-        let items = await m.scan(ctx(11, processes: procs, cpu: cpu))
+        let cpu: [Int32: Double] = [100: 1, 101: 2, 102: 1.5, 103: 0]
+        // The containers are idle from minute 10; the engine ten quiet minutes after that.
+        let items = await scanEveryMinute(m, to: 20, processes: procs, cpu: cpu)
         #expect(items.count == 3)
         let engine = try #require(items.first { $0.id == .engine(name: "Docker Desktop") })
         #expect(engine.name == "Docker Desktop")
         #expect(engine.judgement.verdict == .idle)
         #expect(engine.judgement.fact == "idle engine")
-        #expect(abs(engine.cores - 1.75) < 0.0001)   // 0.5 + 1.0 + 0.25, VM CPU attributed
+        #expect(abs(engine.cores - 0.045) < 0.0001)   // 1 + 2 + 1.5 % of a core, VM CPU attributed
         #expect(engine.memoryBytes == 1_007_000)
         #expect(Set(engine.processes.map(\.pid)) == [100, 101, 103])   // the VM is never signalled
         #expect(engine.detail["appPath"] == "/Applications/Docker.app")
@@ -560,12 +733,14 @@ private let client5432 = SocketInfo(pid: 900, state: .established, localPort: 51
         #expect(engine.judgement.verdict == .inUse)
     }
 
-    @Test func engineWithZeroContainersIsIdle() async throws {
+    @Test func engineWithZeroContainersIsNotIdleOnSight() async throws {
+        // No container running proves nothing: a build, a pull or a Linux machine may be using the engine.
         let d = fakeDocker([])
-        let items = await module(d).scan(ctx(processes: dockerTable()))
+        let items = await module(d).scan(ctx(processes: dockerTable(), cpu: quietEngineCPU))
         #expect(items.count == 1)
         #expect(items[0].id == .engine(name: "Docker Desktop"))
-        #expect(items[0].judgement.verdict == .idle)
+        #expect(items[0].judgement.verdict == .inUse)
+        #expect(items[0].judgement.fact == "measuring activity")
     }
 
     @Test func noEngineItemWhenNoEngineProcesses() async {

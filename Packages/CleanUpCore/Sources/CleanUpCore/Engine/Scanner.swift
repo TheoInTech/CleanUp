@@ -13,6 +13,9 @@ public struct SystemProbe: Sendable {
     public var swap: @Sendable () -> (used: UInt64, total: UInt64)
     public var uptime: @Sendable () -> TimeInterval
     public var ownPID: Int32
+    /// How long `freshContext()` watches CPU before acting, so modules can re-judge activity right
+    /// before a stop. `.zero` → no sample (empty CPU map).
+    public var freshSampleInterval: Duration
 
     public init(
         now: @escaping @Sendable () -> Date = { Date() },
@@ -22,7 +25,8 @@ public struct SystemProbe: Sendable {
         battery: @escaping @Sendable () -> BatteryReading? = Battery.read,
         swap: @escaping @Sendable () -> (used: UInt64, total: UInt64) = SystemMemory.swap,
         uptime: @escaping @Sendable () -> TimeInterval = SystemMemory.uptime,
-        ownPID: Int32 = getpid()
+        ownPID: Int32 = getpid(),
+        freshSampleInterval: Duration = .seconds(1)
     ) {
         self.now = now
         self.processes = processes
@@ -32,6 +36,7 @@ public struct SystemProbe: Sendable {
         self.swap = swap
         self.uptime = uptime
         self.ownPID = ownPID
+        self.freshSampleInterval = freshSampleInterval
     }
 
     public static let live = SystemProbe()
@@ -54,9 +59,17 @@ public struct SystemProbe: Sendable {
         )
     }
 
-    /// A fresh context for acting right now (no CPU delta; modules re-verify live state from it).
+    /// A fresh context for acting right now: modules re-verify live state from it. CPU comes from a
+    /// short sample (`freshSampleInterval`), so "busy right now" is seen even if the last scan is old.
     public func freshContext() async -> ScanContext {
-        await context(now: now(), processes: processes(), cpu: [:], runExternal: true)
+        guard freshSampleInterval > .zero else {
+            return await context(now: now(), processes: processes(), cpu: [:], runExternal: true)
+        }
+        let start = now(), first = processes()
+        try? await Task.sleep(for: freshSampleInterval)
+        let end = now(), second = processes()
+        let cpu = CPUSampler.percentages(from: first, at: start, to: second, at: end)
+        return await context(now: end, processes: second, cpu: cpu, runExternal: true)
     }
 }
 

@@ -98,6 +98,119 @@ public enum ContainerEngine: String, Codable, Sendable, CaseIterable {
     case colima = "Colima"
 }
 
+/// What CleanUp knows about one running container engine at one moment.
+public struct EngineFacts: Sendable {
+    /// OrbStack's Linux machines (`orb list`); `.notApplicable` for the other engines.
+    public enum Machines: Sendable, Equatable {
+        case notApplicable, none, running, unknown
+    }
+
+    public let engine: ContainerEngine
+    public let containerVerdicts: [Verdict]
+    /// Names of docker-client processes running right now (`docker build`, `kubectl`, `orb shell`, …).
+    public let clients: [String]
+    /// The engine's own CPU (its processes and VM, minus its containers), 100 = one core; nil when not measured.
+    public let overheadPercent: Double?
+    public let machines: Machines
+    /// Another container engine is running too, so we can't tell whose containers these are.
+    public let otherEngineRunning: Bool
+    /// Since when every condition has held without a break; nil when they don't hold now.
+    public let quietSince: Date?
+
+    public init(
+        engine: ContainerEngine, containerVerdicts: [Verdict], clients: [String], overheadPercent: Double?,
+        machines: Machines, otherEngineRunning: Bool, quietSince: Date?
+    ) {
+        self.engine = engine
+        self.containerVerdicts = containerVerdicts
+        self.clients = clients
+        self.overheadPercent = overheadPercent
+        self.machines = machines
+        self.otherEngineRunning = otherEngineRunning
+        self.quietSince = quietSince
+    }
+}
+
+/// An engine is idle only when nothing at all is using it, continuously for the observation window:
+/// no container in use, no docker client running, no Linux machine up, and almost no CPU of its own.
+public enum EngineJudge {
+    /// The engine's own CPU (VM and helpers, its containers left out) must stay below this.
+    public static let idleOverheadPercent = 5.0
+    public static let observationWindow: TimeInterval = 10 * 60
+
+    /// Every condition holds right now; the module starts (or keeps) its quiet clock while this is true.
+    public static func isQuietNow(_ f: EngineFacts) -> Bool {
+        reasonsAndSignals(f).reasons.isEmpty
+    }
+
+    public static func judge(_ f: EngineFacts, now: Date) -> Judgement {
+        var (reasons, signals) = reasonsAndSignals(f)
+        if let reason = reasons.first {
+            return Judgement(verdict: .inUse, fact: reason, signals: signals)
+        }
+        let quiet = f.quietSince.map { now.timeIntervalSince($0) } ?? 0
+        guard quiet >= observationWindow else {
+            signals.append(Signal(kind: .inUse, text: "Quiet for only \(RelativeAge.short(quiet)) so far"))
+            reasons.append("measuring activity")
+            return Judgement(verdict: .inUse, fact: "measuring activity", signals: signals)
+        }
+        signals.append(Signal(kind: .idle, text: "Nothing has used it for \(RelativeAge.short(quiet))"))
+        signals.append(Signal(kind: .neutral, text: "Stopping it also stops its containers"))
+        return Judgement(verdict: .idle, fact: "idle engine", signals: signals)
+    }
+
+    private static func reasonsAndSignals(_ f: EngineFacts) -> (reasons: [String], signals: [Signal]) {
+        var reasons: [String] = []
+        var signals: [Signal] = []
+
+        if f.otherEngineRunning {
+            signals.append(Signal(kind: .inUse, text: "More than one container engine is running, so we can't tell which one hosts the containers"))
+            reasons.append("another engine is running")
+        }
+
+        let containers = ContainersModule.engineJudgement(containerVerdicts: f.containerVerdicts)
+        if containers.verdict == .idle {
+            signals.append(containers.signals[0])
+        } else {
+            signals += containers.signals
+            reasons.append(containers.fact)
+        }
+
+        if let client = f.clients.first {
+            let names = f.clients.joined(separator: ", ")
+            signals.append(Signal(kind: .inUse, text: "\(names) is talking to it (a build, a pull or a shell)"))
+            reasons.append("used by \(client)")
+        } else {
+            signals.append(Signal(kind: .idle, text: "No docker command is running"))
+        }
+
+        switch f.machines {
+        case .notApplicable: break
+        case .none: signals.append(Signal(kind: .idle, text: "No Linux machine is running"))
+        case .running:
+            signals.append(Signal(kind: .inUse, text: "A Linux machine is running in it"))
+            reasons.append("a Linux machine is running")
+        case .unknown:
+            signals.append(Signal(kind: .inUse, text: "Couldn't check its Linux machines"))
+            reasons.append("couldn't check its Linux machines")
+        }
+
+        if let overhead = f.overheadPercent {
+            let cpu = String(format: "%.1f", overhead)
+            if overhead < idleOverheadPercent {
+                signals.append(Signal(kind: .idle, text: "The engine itself uses \(cpu)% of a core"))
+            } else {
+                signals.append(Signal(kind: .inUse, text: "The engine itself uses \(cpu)% of a core"))
+                reasons.append("busy")
+            }
+        } else {
+            signals.append(Signal(kind: .inUse, text: "CPU use not measured yet"))
+            reasons.append("measuring activity")
+        }
+        return (reasons, signals)
+    }
+}
+
 /// A running container engine and the processes that belong to it.
 struct DetectedEngine: Sendable {
     let engine: ContainerEngine
@@ -152,6 +265,10 @@ public struct ContainersModule: CategoryModule {
         var lowCPUSince: [String: Date] = [:]
         /// Docker Engine API socket, discovered once.
         var socketPath: String?
+        /// OrbStack's Linux machines at the last external scan.
+        var orbMachines: EngineFacts.Machines = .unknown
+        /// Since when each engine has been quiet without a break.
+        var engineQuietSince: [ContainerEngine: Date] = [:]
     }
 
     /// Idleness has to hold for this long: low CPU the whole time, and traffic measured against a
@@ -171,25 +288,34 @@ public struct ContainersModule: CategoryModule {
     public func scan(_ ctx: ScanContext) async -> [Item] {
         let collected: [Collected]?
         if ctx.runExternal {
-            collected = await collect(now: ctx.now)
+            collected = await collect(ctx: ctx)
         } else {
             collected = memory.withLock { $0.collected }
         }
         // Docker missing, daemon down, or never asked: claim nothing.
         guard let collected else { return [] }
-        return Self.buildItems(collected, ctx: ctx)
+        return buildItems(collected, ctx: ctx)
     }
 
     /// Runs docker and remembers the answer. nil when the daemon doesn't answer.
-    private func collect(now: Date) async -> [Collected]? {
+    private func collect(ctx: ScanContext) async -> [Collected]? {
+        let now = ctx.now
+        let engines = Self.detectEngines(ctx.processes)
+        async let orbList: CommandResult? = engines.contains { $0.engine == .orbStack } ? run("orb", ["list"]) : nil
         let ps = await run("docker", ["ps", "--format", "{{json .}}"])
+        let machines = await orbList.map(Self.orbMachines) ?? .unknown
         guard ps.status == 0, !ps.timedOut else {
             memory.withLock { $0 = Memory() }
             return nil
         }
+        memory.withLock { $0.orbMachines = machines }
         let running = Self.parsePS(ps.stdout)
         guard !running.isEmpty else {
-            memory.withLock { state in state = Memory(collected: [], socketPath: state.socketPath) }
+            memory.withLock { state in
+                state.collected = []
+                state.samples = [:]
+                state.lowCPUSince = [:]
+            }
             return []
         }
 
@@ -290,24 +416,101 @@ public struct ContainersModule: CategoryModule {
 
     // MARK: items
 
-    private static func buildItems(_ collected: [Collected], ctx: ScanContext) -> [Item] {
-        let engines = detectEngines(ctx.processes)
+    private func buildItems(_ collected: [Collected], ctx: ScanContext) -> [Item] {
+        let engines = Self.detectEngines(ctx.processes)
         let proxyPIDs = engines.reduce(into: Set<Int32>()) { $0.formUnion($1.allPIDs) }
 
         var containerItems: [Item] = []
         var verdicts: [Verdict] = []
         var allPorts = Set<Int>()
+        var containersCPU = 0.0
         for c in collected.sorted(by: { $0.name < $1.name }) {
-            let item = containerItem(c, engine: engines.first?.engine, proxyPIDs: proxyPIDs, ctx: ctx)
+            let item = Self.containerItem(c, engine: engines.first?.engine, proxyPIDs: proxyPIDs, ctx: ctx)
             containerItems.append(item)
             verdicts.append(item.judgement.verdict)
             allPorts.formUnion(c.ports ?? [])
+            containersCPU += c.cpuPercent ?? 0
         }
 
-        // Two engines can run at once but the docker CLI talks to only one of them, so we can't say
-        // whose containers these are, or whether the other engine hosts any: never offer to quit.
-        let engineItems = engines.map { engineItem($0, verdicts: verdicts, ambiguous: engines.count > 1, ports: allPorts, ctx: ctx) }
+        let clients = Self.dockerClients(in: ctx.processes, ownPID: ctx.ownPID)
+        let machines = memory.withLock { $0.orbMachines }
+        let engineItems = engines.map { e -> Item in
+            let (overhead, cores) = Self.overhead(of: e, containersCPU: containersCPU, cpu: ctx.cpu)
+            // Two engines can run at once but the docker CLI talks to only one of them, so we can't say
+            // whose containers these are, or whether the other engine hosts any: never offer to quit.
+            let draft = EngineFacts(
+                engine: e.engine, containerVerdicts: verdicts, clients: clients, overheadPercent: overhead,
+                machines: e.engine == .orbStack ? machines : .notApplicable,
+                otherEngineRunning: engines.count > 1, quietSince: nil
+            )
+            let since = rememberQuiet(e.engine, quiet: EngineJudge.isQuietNow(draft), now: ctx.now)
+            let facts = EngineFacts(
+                engine: draft.engine, containerVerdicts: verdicts, clients: clients, overheadPercent: overhead,
+                machines: draft.machines, otherEngineRunning: draft.otherEngineRunning, quietSince: since
+            )
+            return Self.engineItem(e, facts: facts, cores: cores, ports: allPorts, ctx: ctx)
+        }
+        let running = Set(engines.map(\.engine))
+        memory.withLock { state in state.engineQuietSince = state.engineQuietSince.filter { running.contains($0.key) } }
         return containerItems + engineItems
+    }
+
+    /// Starts, keeps or clears the engine's quiet clock; returns since when it has been quiet.
+    private func rememberQuiet(_ engine: ContainerEngine, quiet: Bool, now: Date) -> Date? {
+        memory.withLock { state in
+            guard quiet else {
+                state.engineQuietSince[engine] = nil
+                return nil
+            }
+            let since = state.engineQuietSince[engine] ?? now
+            state.engineQuietSince[engine] = since
+            return since
+        }
+    }
+
+    /// The engine's own CPU: its processes and VM, minus what its containers use (the VM's CPU
+    /// already contains theirs). `overhead` is nil while any of its processes is unmeasured; `cores`
+    /// is the same figure from what was measured, for display.
+    private static func overhead(of e: DetectedEngine, containersCPU: Double, cpu: [Int32: Double]) -> (overhead: Double?, cores: Double) {
+        let values = (e.processes + e.vm).map { cpu[$0.pid] }
+        let measured = values.reduce(0.0) { $0 + ($1 ?? 0) }
+        let own = max(0, measured - containersCPU)
+        return (values.contains { $0 == nil } ? nil : own, own / 100)
+    }
+
+    /// Command-line clients that talk to an engine. While one runs (a build, a pull, `kubectl`,
+    /// `orb shell`…), the engine is in use whatever its containers do.
+    static let clientNames: Set<String> = ["docker", "com.docker.cli", "docker-buildx", "docker-compose", "kubectl", "orb", "limactl"]
+
+    /// Our user's docker clients, sorted by name, without CleanUp's own calls and without Colima's
+    /// own `limactl hostagent` / `usernet` daemons (they are the engine).
+    static func dockerClients(in table: [Int32: ProcessInfoRecord], ownPID: Int32) -> [String] {
+        let own = ProcessTree.ownTree(ownPID, in: table)
+        let uid = getuid()
+        var names = Set<String>()
+        for p in table.values where p.uid == uid && !own.contains(p.pid) {
+            let name = ProcessTree.leaf(p)
+            guard clientNames.contains(name) || clientNames.contains(p.name) else { continue }
+            if name == "limactl", p.arguments.contains(where: { $0 == "hostagent" || $0 == "usernet" }) { continue }
+            names.insert(clientNames.contains(name) ? name : p.name)
+        }
+        return names.sorted()
+    }
+
+    /// `orb list`: running when any machine isn't plainly stopped; unknown when it can't be read.
+    static func orbMachines(_ result: CommandResult) -> EngineFacts.Machines {
+        guard result.status == 0, !result.timedOut else { return .unknown }
+        return parseOrbMachines(result.stdout)
+    }
+
+    static func parseOrbMachines(_ out: String) -> EngineFacts.Machines {
+        for line in out.split(whereSeparator: \.isNewline) {
+            let words = line.split(whereSeparator: \.isWhitespace).map { $0.lowercased() }
+            guard let first = words.first, first != "name", !line.lowercased().contains("no machines") else { continue }
+            if words.contains("stopped"), !words.contains("running") { continue }
+            return .running
+        }
+        return .none
     }
 
     private static func containerItem(_ c: Collected, engine: ContainerEngine?, proxyPIDs: Set<Int32>, ctx: ScanContext) -> Item {
@@ -345,26 +548,23 @@ public struct ContainersModule: CategoryModule {
         return Judgement(verdict: .inUse, fact: "measuring activity", signals: judgement.signals + [Signal(kind: .inUse, text: text)])
     }
 
-    private static func engineItem(_ e: DetectedEngine, verdicts: [Verdict], ambiguous: Bool, ports: Set<Int>, ctx: ScanContext) -> Item {
-        let judgement = ambiguous
-            ? Judgement(verdict: .inUse, fact: "another engine is running",
-                        signals: [Signal(kind: .inUse, text: "More than one container engine is running, so we can't tell which one hosts the containers")])
-            : engineJudgement(containerVerdicts: verdicts)
+    private static func engineItem(_ e: DetectedEngine, facts: EngineFacts, cores: Double, ports: Set<Int>, ctx: ScanContext) -> Item {
         let all = e.processes + e.vm
-        var detail = ["containers": String(verdicts.count)]
+        var detail = ["containers": String(facts.containerVerdicts.count)]
         if let appPath = e.appPath { detail["appPath"] = appPath }
         if !ports.isEmpty { detail["ports"] = ports.sorted().map(String.init).joined(separator: ",") }
         return Item(
             id: .engine(name: e.engine.rawValue), category: .containers, name: e.engine.rawValue, symbol: "gearshape.2",
-            judgement: judgement,
-            cores: all.reduce(0.0) { $0 + (ctx.cpu[$1.pid] ?? 0) } / 100,
+            judgement: EngineJudge.judge(facts, now: ctx.now),
+            cores: cores,
             memoryBytes: all.reduce(0) { $0 + $1.residentBytes },
             processes: e.processes.map(\.ref),
             detail: detail
         )
     }
 
-    /// Idle iff no container is running or every running container is idle.
+    /// The containers' part of an engine's verdict: idle iff no container is running or every
+    /// running container is idle. `EngineJudge` adds the engine's own activity on top.
     public static func engineJudgement(containerVerdicts: [Verdict]) -> Judgement {
         let busy = containerVerdicts.filter { $0 != .idle }.count
         if busy > 0 {
@@ -593,6 +793,10 @@ public struct ContainersModule: CategoryModule {
             }
         }
         if isEngine {
+            // A build, pull or shell may have started since the engine was judged.
+            if let client = Self.dockerClients(in: ctx.processes, ownPID: ctx.ownPID).first {
+                return .skipped(reason: "\(item.name) is used by \(client)")
+            }
             return await stopEngine(item)
         }
         guard Self.isSafeName(item.name) else { return .failed(reason: "Unexpected container name") }

@@ -21,13 +21,29 @@ public actor CPUSampler {
             previousDate = date
         }
         guard let last = previousDate else { return [:] }
-        let elapsedNanos = date.timeIntervalSince(last) * 1_000_000_000
-        guard elapsedNanos > 0 else { return [:] }
+        return Self.percentages(
+            from: previous.mapValues { ($0.startTime, $0.cpuTimeNanos) }, at: last, to: table, at: date
+        )
+    }
 
+    /// CPU % per pid between two snapshots of the table. Empty when `end` is not after `start`;
+    /// processes missing from the first snapshot (or with a recycled pid) are left out.
+    public static func percentages(
+        from first: [Int32: ProcessInfoRecord], at start: Date, to second: [Int32: ProcessInfoRecord], at end: Date
+    ) -> [Int32: Double] {
+        percentages(from: first.mapValues { ($0.startTime, $0.cpuTimeNanos) }, at: start, to: second, at: end)
+    }
+
+    private static func percentages(
+        from first: [Int32: (startTime: Date, cpuTimeNanos: UInt64)], at start: Date,
+        to second: [Int32: ProcessInfoRecord], at end: Date
+    ) -> [Int32: Double] {
+        let elapsedNanos = end.timeIntervalSince(start) * 1_000_000_000
+        guard elapsedNanos > 0 else { return [:] }
         var result: [Int32: Double] = [:]
-        result.reserveCapacity(table.count)
-        for (pid, record) in table {
-            guard let old = previous[pid], old.startTime == record.startTime else { continue }
+        result.reserveCapacity(second.count)
+        for (pid, record) in second {
+            guard let old = first[pid], old.startTime == record.startTime else { continue }
             let delta = record.cpuTimeNanos >= old.cpuTimeNanos ? record.cpuTimeNanos - old.cpuTimeNanos : 0
             result[pid] = Double(delta) / elapsedNanos * 100
         }

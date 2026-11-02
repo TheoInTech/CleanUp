@@ -6,7 +6,8 @@ import Foundation
 
 /// When each app was last in front, so "not used 5 h" is knowable. The app feeds it from
 /// `NSWorkspace.didActivateApplicationNotification`; it persists across launches in the
-/// `io.cleanup` defaults domain.
+/// `io.cleanup` defaults domain. The app calls `record` on both activation and deactivation, so the
+/// stamp means "last time the app was in front" (not "last time it was used").
 public actor ActivationLog {
     public static let shared = ActivationLog(suiteName: "io.cleanup")
 
@@ -251,7 +252,7 @@ public struct AppsModule: CategoryModule {
             let deadline = clock.now.advanced(by: timeout)
             while clock.now < deadline {
                 if await !stillRunning(request) { return .quit }
-                try? await Task.sleep(for: .milliseconds(250))
+                do { try await Task.sleep(for: .milliseconds(250)) } catch { return .didntQuit }
             }
             return await stillRunning(request) ? .didntQuit : .quit
         }

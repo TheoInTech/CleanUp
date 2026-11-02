@@ -23,13 +23,13 @@ private func appsModule(
 
 @Suite struct AppsTests {
     @Test func appsAreNeverIdle() async {
-        let items = await AppsModule(apps: { [.fixture("com.valvesoftware.steam", lastUsedAgo: .days(3))] }).scan(.testContext())
+        let items = await AppsModule(apps: { [.fixture("com.valvesoftware.steam", lastUsedAgo: .days(3))] }, trackingSince: { trackingStart }).scan(.testContext())
         #expect(items.count == 1)
         #expect(items.allSatisfy { $0.judgement.verdict == .manual })
     }
 
     @Test func frontmostAndFinderExcluded() async {
-        let items = await AppsModule(apps: { [.fixture("com.apple.finder"), .fixture("com.brave.Browser")] })
+        let items = await AppsModule(apps: { [.fixture("com.apple.finder"), .fixture("com.brave.Browser")] }, trackingSince: { trackingStart })
             .scan(.testContext(frontmost: "com.brave.Browser"))
         #expect(items.isEmpty)
     }
@@ -80,14 +80,14 @@ private func appsModule(
         #expect(items.first?.judgement.fact == "not used 2 h")
     }
 
-    @Test func coresAndMemoryCoverOnlyProcessesInsideTheBundle() async {
+    @Test func coresAndMemoryCoverOnlyProcessesInsideTheBundle() async throws {
         let main = ProcessInfoRecord.fixture(pid: 10, path: "/Applications/steam.app/Contents/MacOS/steam", residentBytes: 100)
         let helper = ProcessInfoRecord.fixture(pid: 11, path: "/Applications/steam.app/Contents/Frameworks/Helper.app/Contents/MacOS/Helper", residentBytes: 50)
         let lookalike = ProcessInfoRecord.fixture(pid: 12, path: "/Applications/steam.app2/Contents/MacOS/steam", residentBytes: 7)
         let items = await appsModule([.fixture("com.valvesoftware.steam", pid: 10)]).scan(.testContext(
             processes: processTable(main, helper, lookalike), cpu: [10: 30, 11: 20, 12: 400]
         ))
-        let item = try! #require(items.first)
+        let item = try #require(items.first)
         #expect(abs(item.cores - 0.5) < 0.0001)
         #expect(item.memoryBytes == 150)
         #expect(item.processes.map(\.pid) == [10, 11])
@@ -227,11 +227,30 @@ private func appsModule(
             .fixture(pid: 7, name: "Web Content", path: "/Applications/Firefox.app/Contents/MacOS/plugin-container.app/Contents/MacOS/Web Content")
         )
         let items = await BrowserTabsModule().scan(.testContext(processes: table, cpu: [1: 140, 2: 90, 3: 60, 4: 51, 5: 200, 6: 75, 7: 80]))
-        #expect(items.map(\.name) == ["Brave tab", "Chrome tab", "Edge tab", "Arc tab", "Safari tab", "Firefox tab", "Firefox tab"])
+        #expect(items.map(\.name) == ["Brave tab", "Chrome tab", "Edge tab", "Arc tab", "Web page (WebKit)", "Firefox tab", "Firefox tab"])
         #expect(items.allSatisfy { $0.judgement.verdict == .check && $0.category == .browserTabs })
         #expect(items.first?.id == .browserTab(pid: 1))
         #expect(items.first?.judgement.fact == "using 1.4 cores")
         #expect(abs((items.first?.cores ?? 0) - 1.4) < 0.0001)
+    }
+
+    @Test func electronAppsAreNotBrowsers() async {
+        let table = processTable(
+            renderer(1, "Code", "Code Helper (Renderer)"),
+            renderer(2, "Slack", "Slack Helper (Renderer)"),
+            renderer(3, "Discord", "Discord Helper (Renderer)"),
+            // A known browser name, but not inside that browser's own app.
+            .fixture(pid: 4, path: "/tmp/evil/Slack.app/Contents/Frameworks/Brave Browser Helper (Renderer).app/Contents/MacOS/Brave Browser Helper (Renderer)")
+        )
+        let items = await BrowserTabsModule().scan(.testContext(processes: table, cpu: [1: 300, 2: 300, 3: 300, 4: 300]))
+        #expect(items.isEmpty)
+    }
+
+    @Test func webKitPageIsNamedNeutrally() async throws {
+        let webkit = ProcessInfoRecord.fixture(pid: 5, path: "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent")
+        let item = try #require(await BrowserTabsModule().scan(.testContext(processes: processTable(webkit), cpu: [5: 200])).first)
+        #expect(item.name == "Web page (WebKit)")
+        #expect(item.judgement.signals.contains { $0.text == "A WebKit page, possibly from another app" })
     }
 
     @Test func quietRenderersAndOtherHelpersAreIgnored() async {

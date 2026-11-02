@@ -64,14 +64,19 @@ public struct RestartModule: CategoryModule {
 
     public func undo(_ token: UndoToken) async -> Bool { false }
 
-    /// Asks loginwindow for the standard Restart confirmation. AppleScript must run on the main thread.
-    @MainActor
-    public static func showRestartDialog() -> String? {
-        var error: NSDictionary?
-        let script = NSAppleScript(source: #"tell application "loginwindow" to «event aevtrrst»"#)
-        script?.executeAndReturnError(&error)
-        guard script != nil else { return "Couldn't prepare the restart request" }
-        guard let error else { return nil }
-        return (error[NSAppleScript.errorMessage] as? String) ?? "Couldn't show the restart dialog"
+    private static let restartTimeout: Duration = .seconds(30)
+
+    /// Asks loginwindow for the standard Restart confirmation through `osascript`, off the main thread
+    /// (the first call can wait on the Automation prompt).
+    public static func showRestartDialog() async -> String? {
+        let result = await CommandRunner.run(
+            "/usr/bin/osascript",
+            ["-e", #"tell application "loginwindow" to «event aevtrrst»"#],
+            timeout: restartTimeout
+        )
+        if result.timedOut { return "Restart request timed out" }
+        guard result.status != 0 else { return nil }
+        let line = result.stderr.split(whereSeparator: \.isNewline).first.map(String.init)
+        return (line?.isEmpty == false ? line : nil) ?? "Couldn't show the restart dialog"
     }
 }

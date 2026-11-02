@@ -197,3 +197,9 @@ import Testing
     #expect(swap.used <= swap.total || swap.total == 0)
     #expect(SystemMemory.parseSwapUsage("garbage") == nil)
 }
+
+@Test func searchPathFindsDockerDesktopsOwnCLI() {
+    // Docker Desktop can put its CLI in ~/.docker/bin (the "User" option) or only inside the app.
+    #expect(CommandRunner.searchPath.contains(NSHomeDirectory() + "/.docker/bin"))
+    #expect(CommandRunner.searchPath.contains("/Applications/Docker.app/Contents/Resources/bin"))
+}

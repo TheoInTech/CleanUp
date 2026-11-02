@@ -25,6 +25,8 @@ public enum CommandRunner {
         "/opt/homebrew/bin",
         "/usr/bin",
         NSHomeDirectory() + "/.orbstack/bin",
+        NSHomeDirectory() + "/.docker/bin",
+        "/Applications/Docker.app/Contents/Resources/bin",
     ]
 
     /// Per-stream capture limit; output beyond this is read and discarded.

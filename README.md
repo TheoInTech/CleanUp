@@ -29,14 +29,16 @@ One day a MacBook Pro lasted 30–40 minutes on a full charge. The battery was f
 
 Every check must pass. Anything uncertain counts as **in use** and is left unticked.
 
+CleanUp has to watch before it can call anything quiet, so **nothing shows as idle for the first 10–30 minutes** after it starts (and again after the Mac wakes from sleep).
+
 | Category | Idle only when |
 |---|---|
-| **Simulators** | Booted for over 1 h, no app opened in the last hour, the Simulator app is not in front, and nothing (Xcode build, test runner) refers to it. |
-| **Containers** | Up over 6 h, under 1% CPU for 10 quiet minutes, no connections to its ports, and under 4 kB of network traffic over that window, measured with Docker's exact byte counters. Works with Docker Desktop, OrbStack and Colima. |
+| **Simulators** | Booted for over 1 h, no app opened in the last hour, the Simulator app not in front for the last 30 min, its apps under 5% CPU, no debugger attached, and nothing (Xcode build, test runner) refers to it. |
+| **Containers** | Up over 6 h, under 1% CPU for 10 quiet minutes, no connections to its ports, under 4 kB of network traffic over that window (Docker's exact byte counters), and no shell, `docker attach` or dev container session in it. The engine itself is quit only after 10 minutes with no container in use, no `docker`/`kubectl` command running and almost no CPU of its own. Docker Desktop (tested); OrbStack and Colima (untested). |
 | **Dev servers** | Running over 6 h, under 2% CPU, no connection in the last 30 min, and watched by CleanUp for at least 30 min. |
 | **Apps** | Never pre-ticked. Shown as "not used for X h"; only you can say you are done with one. They are asked to quit normally, so they can still offer to save. |
 | **Browser tabs** | Read-only. CleanUp shows a runaway tab and points you to the browser's own task manager. It never closes tabs. |
-| **Restart** | Advice only, when swap is nearly full or the Mac has been up for weeks. The button opens the normal macOS Restart dialog. |
+| **Restart** | Advice only, when swap is over 75% full and over 8 GB, or the Mac has been up more than 14 days with swap over half full. The button opens the normal macOS Restart dialog. |
 
 ## Requirements
 

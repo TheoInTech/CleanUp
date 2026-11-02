@@ -166,3 +166,36 @@ func loadFixture(_ name: String) throws -> String {
 var fixtureSimctlJSON: String {
     get throws { try loadFixture("incident") }
 }
+
+extension RunningAppInfo {
+    /// A regular app that was last in front `lastUsedAgo` before `now` (nil = no activation recorded).
+    static func fixture(
+        _ bundleID: String,
+        lastUsedAgo: TimeInterval? = nil,
+        name: String? = nil,
+        path: String? = nil,
+        pid: Int32 = 4242
+    ) -> RunningAppInfo {
+        let name = name ?? String(bundleID.split(separator: ".").last ?? "App")
+        return RunningAppInfo(
+            bundleID: bundleID, name: name, bundlePath: path ?? "/Applications/\(name).app", pid: pid,
+            lastActivated: lastUsedAgo.map { now.addingTimeInterval(-$0) }
+        )
+    }
+}
+
+extension Item {
+    static func fixtureTab(pid: Int32 = 555, browser: String = "Brave", cpu: Double = 140) -> Item {
+        Item(
+            id: .browserTab(pid: pid),
+            category: .browserTabs,
+            name: "\(browser) tab",
+            symbol: "globe",
+            judgement: Judgement(verdict: .check, fact: "using 1.4 cores", signals: []),
+            cores: cpu / 100,
+            memoryBytes: 0,
+            processes: [ProcessRef(pid: pid, startTime: now.addingTimeInterval(-.hours(2)))],
+            detail: ["browser": browser]
+        )
+    }
+}

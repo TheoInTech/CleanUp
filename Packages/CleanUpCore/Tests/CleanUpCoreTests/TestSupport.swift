@@ -129,18 +129,21 @@ extension Item {
     static func fixtureDevServer(
         ref: ProcessRef = ProcessRef(pid: 86_037, startTime: now.addingTimeInterval(-.days(18))),
         verdict: Verdict = .idle,
-        ports: [Int] = [8081]
+        ports: [Int] = [8081],
+        project: String = "evone/apps/mobile",
+        command: String = "node expo start",
+        name: String = "expo start :8081"
     ) -> Item {
         Item(
             id: .devServer(cwd: "/Users/u/Projects/evone/apps/mobile", command: "expo start :8081"),
             category: .devServers,
-            name: "expo start :8081",
+            name: name,
             symbol: "server.rack",
             judgement: Judgement(verdict: verdict, fact: "running 18 days", signals: []),
             cores: 0,
             memoryBytes: 0,
             processes: [ref],
-            detail: ["command": "node expo start", "ports": ports.map(String.init).joined(separator: ",")]
+            detail: ["command": command, "project": project, "ports": ports.map(String.init).joined(separator: ",")]
         )
     }
 }
@@ -339,7 +342,12 @@ extension Item {
         .fixture(.engine(name: name), category: .containers, name: name, verdict: verdict, cores: cores)
     }
 
-    static func fixtureSimulator(udid: String, name: String, verdict: Verdict, cores: Double) -> Item {
+    static func fixtureSimulator(
+        udid: String = "F92ECACE-D87E-40D2-93F3-32974DED72BF",
+        name: String = "iPhone Duo",
+        verdict: Verdict = .idle,
+        cores: Double = 1
+    ) -> Item {
         .fixture(.simulator(udid: udid), category: .simulators, name: name, verdict: verdict, cores: cores, detail: ["udid": udid])
     }
 }

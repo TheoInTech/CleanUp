@@ -85,3 +85,14 @@ import Testing
     #expect(old.idleCount == 0)
     #expect(old.freedCores == 0)
 }
+
+@Test func enginesAreRecognisedByIdentity() {
+    #expect(Item.fixtureEngine().isEngine)
+    #expect(Item.fixture(.engine(name: "simulator-services"), category: .simulators).isEngine)
+    #expect(!Item.fixtureContainer().isEngine)
+}
+
+@Test func batteryWithoutHealthRoundTrips() throws {
+    let b = BatteryReading(onBattery: true, percent: 40, drainWatts: 9, minutesLeft: 50, healthPercent: nil, cycleCount: nil)
+    #expect(try JSONDecoder().decode(BatteryReading.self, from: JSONEncoder().encode(b)) == b)
+}

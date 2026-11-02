@@ -780,16 +780,102 @@ extension EngineTests {
         }
     }
 
+    @Suite struct SnapshotWriterTests {
+        @Test func anOlderSnapshotNeverOverwritesANewerOne() async throws {
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("cleanup-writer-\(UUID().uuidString)/snapshot.json")
+            defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+            let writer = SnapshotWriter(url: url)
+            let newer = Snapshot.incident()
+            let older = Snapshot(date: fixedNow.addingTimeInterval(-5), battery: nil, coresBusy: 1, swapUsedBytes: 0,
+                                 swapTotalBytes: 0, uptime: 0, categories: [], mood: .allGood)
+            #expect(try await writer.write(newer))
+            #expect(try await writer.write(older) == false)
+            #expect(SnapshotStore.read(from: url) == newer)
+        }
+
+        @Test func theWidgetCopyCarriesNoDetailsOrSignals() throws {
+            let full = Snapshot.incident()
+            let item = full.allItems[0]
+            let withSecrets = Item(
+                id: item.id, category: item.category, name: item.name, symbol: item.symbol,
+                judgement: Judgement(verdict: .idle, fact: "idle 2 days", signals: [Signal(kind: .idle, text: "Used by --token=abc")]),
+                cores: item.cores, memoryBytes: 1, processes: [ProcessRef(pid: 4, startTime: fixedNow)],
+                detail: ["command": "node server.js --token=abc", "cwd": "/Users/me/secret"]
+            )
+            let s = Snapshot(date: full.date, battery: full.battery, coresBusy: full.coresBusy, swapUsedBytes: 0, swapTotalBytes: 0,
+                             uptime: 0, categories: [CategorySummary(id: .simulators, items: [withSecrets])], mood: full.mood,
+                             idleCount: 1, freedCores: 1.2)
+            let widget = s.forWidget()
+            let json = String(decoding: try JSONEncoder().encode(widget), as: UTF8.self)
+            #expect(!json.contains("token"))
+            #expect(!json.contains("secret"))
+            let copy = try #require(widget.allItems.first)
+            #expect(copy.detail.isEmpty && copy.judgement.signals.isEmpty && copy.processes.isEmpty)
+            #expect(copy.judgement.verdict == .idle && copy.cores == withSecrets.cores && copy.name == withSecrets.name)
+            #expect(widget.idleCount == 1 && widget.freedCores == 1.2 && widget.mood == s.mood && widget.date == s.date)
+        }
+    }
+
+    @Suite struct CleanupRequestTests {
+        private func tempURL() -> URL {
+            FileManager.default.temporaryDirectory.appendingPathComponent("cleanup-request-\(UUID().uuidString)/cleanup-request.json")
+        }
+
+        @Test func roundTripsTheRequestTime() throws {
+            let url = tempURL()
+            defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+            #expect(CleanupRequest.read(from: url) == nil)
+            try CleanupRequest.write(at: fixedNow, to: url)
+            #expect(CleanupRequest.read(from: url) == fixedNow)
+            try Data("garbage".utf8).write(to: url)
+            #expect(CleanupRequest.read(from: url) == nil)
+        }
+
+        @Test func aFreshRequestIsHandledOnce() {
+            var gate = CleanupSignalGate()
+            let r1 = gate.accept(requestedAt: fixedNow, now: fixedNow.addingTimeInterval(2))
+            #expect(r1)
+            // The same request again (a replayed or duplicated signal) does nothing.
+            let r2 = gate.accept(requestedAt: fixedNow, now: fixedNow.addingTimeInterval(40))
+            #expect(!r2)
+        }
+
+        @Test func aSignalWithoutAFreshRequestIsIgnored() {
+            var gate = CleanupSignalGate()
+            let r3 = gate.accept(requestedAt: nil, now: fixedNow)
+            #expect(!r3)                               // no file: anyone can post the signal
+            let r4 = gate.accept(requestedAt: fixedNow, now: fixedNow.addingTimeInterval(10))
+            #expect(!r4)     // 10 s old
+            let r5 = gate.accept(requestedAt: fixedNow.addingTimeInterval(30), now: fixedNow)
+            #expect(!r5)     // from the future
+            let r6 = gate.accept(requestedAt: fixedNow, now: fixedNow.addingTimeInterval(9.9))
+            #expect(r6)
+        }
+
+        @Test func signalCleanupsRunAtMostEveryThirtySeconds() {
+            var gate = CleanupSignalGate()
+            let r7 = gate.accept(requestedAt: fixedNow, now: fixedNow)
+            #expect(r7)
+            let r8 = gate.accept(requestedAt: fixedNow.addingTimeInterval(5), now: fixedNow.addingTimeInterval(5))
+            #expect(!r8)
+            let r9 = gate.accept(requestedAt: fixedNow.addingTimeInterval(30), now: fixedNow.addingTimeInterval(30))
+            #expect(r9)
+            #expect(CleanupSignalGate.debounce == 30 && CleanupRequest.maxAge == 10)
+        }
+    }
+
     @Suite struct CleanupSignalTests {
         @Test func nameIsExact() {
             #expect(CleanupSignal.name == "io.cleanup.cleanIdle")
         }
 
         @Test func postReachesObserver() async throws {
+            // A private name: the real one would reach a running CleanUp.
+            let name = "io.cleanup.tests.\(UUID().uuidString)"
             let received = OSAllocatedUnfairLock(initialState: 0)
-            let token = CleanupSignal.observe { received.withLock { $0 += 1 } }
+            let token = CleanupSignal.observe(name: name) { received.withLock { $0 += 1 } }
             defer { CleanupSignal.cancel(token) }
-            CleanupSignal.post()
+            CleanupSignal.post(name: name)
             let deadline = ContinuousClock.now + .seconds(3)
             while received.withLock({ $0 }) == 0, ContinuousClock.now < deadline {
                 try await Task.sleep(for: .milliseconds(20))

@@ -35,3 +35,23 @@ public enum SnapshotStore {
         return try? JSONDecoder().decode(Snapshot.self, from: data)
     }
 }
+
+/// Writes snapshots one at a time, newest wins: a snapshot older than the last one written is
+/// dropped, so a slow write can never put an old snapshot back over a newer one.
+public actor SnapshotWriter {
+    private let url: URL
+    private var lastWritten: Date?
+
+    public init(url: URL) {
+        self.url = url
+    }
+
+    /// True when `s` was written; false when a newer (or the same) snapshot is already there.
+    @discardableResult
+    public func write(_ s: Snapshot) throws -> Bool {
+        if let lastWritten, s.date <= lastWritten { return false }
+        try SnapshotStore.write(s, to: url)
+        lastWritten = s.date
+        return true
+    }
+}

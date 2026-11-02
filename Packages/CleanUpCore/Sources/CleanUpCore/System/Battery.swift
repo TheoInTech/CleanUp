@@ -14,13 +14,16 @@ public enum Battery {
         return reading(from: properties)
     }
 
-    /// Builds a reading from `AppleSmartBattery` registry properties; `nil` if the essentials
-    /// (charge level, design/raw capacity) are missing.
+    /// Builds a reading from `AppleSmartBattery` registry properties; `nil` only without a charge
+    /// level. Health (design / raw capacity, cycles) is optional: drain and time left don't need it.
     static func reading(from p: [String: Any]) -> BatteryReading? {
-        guard let current = int(p["CurrentCapacity"]), let maxCapacity = int(p["MaxCapacity"]), maxCapacity > 0,
-              let design = capacity("DesignCapacity", in: p), design > 0,
-              let rawMax = capacity("AppleRawMaxCapacity", in: p) ?? capacity("NominalChargeCapacity", in: p)
-                ?? capacity("FullChargeCapacity", in: p) else { return nil }
+        guard let current = int(p["CurrentCapacity"]), let maxCapacity = int(p["MaxCapacity"]), maxCapacity > 0 else { return nil }
+        var health: Int?
+        if let design = capacity("DesignCapacity", in: p), design > 0,
+           let rawMax = capacity("AppleRawMaxCapacity", in: p) ?? capacity("NominalChargeCapacity", in: p)
+            ?? capacity("FullChargeCapacity", in: p) {
+            health = rawMax * 100 / design
+        }
 
         let external = bool(p["ExternalConnected"]) ?? bool(p["IsCharging"]) ?? false
         let onBattery = !external
@@ -43,8 +46,8 @@ public enum Battery {
             percent: min(100, max(0, current * 100 / maxCapacity)),
             drainWatts: drainWatts,
             minutesLeft: minutesLeft,
-            healthPercent: rawMax * 100 / design,
-            cycleCount: int(p["CycleCount"]) ?? 0
+            healthPercent: health,
+            cycleCount: int(p["CycleCount"])
         )
     }
 

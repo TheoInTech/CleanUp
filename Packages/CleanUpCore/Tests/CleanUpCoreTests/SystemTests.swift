@@ -30,7 +30,8 @@ import Testing
 
 @Test func batteryValuesInRangeWhenPresent() {
     guard let b = Battery.read() else { return }
-    #expect((0...100).contains(b.percent)); #expect((1...150).contains(b.healthPercent))
+    #expect((0...100).contains(b.percent))
+    if let health = b.healthPercent { #expect((1...150).contains(health)) }
 }
 
 // MARK: - Additional behaviour checks
@@ -135,8 +136,20 @@ import Testing
     #expect(b?.drainWatts != nil)
 }
 
-@Test func batteryMissingDesignCapacityIsNil() {
-    #expect(Battery.reading(from: ["CurrentCapacity": 50, "MaxCapacity": 100]) == nil)
+@Test func batteryWithoutCapacityKeysStillReadsDrainAndMinutes() {
+    // Some batteries don't publish their design capacity: health is unknown, nothing else is.
+    let props: [String: Any] = [
+        "InstantAmperage": UInt64(18446744073709549597), "Voltage": 11935, "AvgTimeToEmpty": 42,
+        "CurrentCapacity": 50, "MaxCapacity": 100, "ExternalConnected": false,
+    ]
+    let b = Battery.reading(from: props)
+    #expect(b != nil)
+    #expect(b?.percent == 50)
+    #expect(b?.minutesLeft == 42)
+    #expect(b?.drainWatts != nil)
+    #expect(b?.healthPercent == nil)
+    #expect(b?.cycleCount == nil)
+    #expect(Battery.reading(from: ["MaxCapacity": 100]) == nil)   // no charge level: no reading
 }
 
 @Test func processTableRecordsAreSane() {

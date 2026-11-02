@@ -35,6 +35,10 @@ public struct Item: Codable, Identifiable, Hashable, Sendable {
 }
 
 extension Item {
+    /// A container engine or the simulator services: stopping one stops everything in it, so it is
+    /// never forced ("Stop anyway").
+    public var isEngine: Bool { id.rawValue.hasPrefix("engine:") }
+
     /// A copy with one more detail entry.
     func with(detail key: String, _ value: String) -> Item {
         var detail = self.detail

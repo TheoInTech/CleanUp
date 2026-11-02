@@ -48,6 +48,25 @@ public struct Snapshot: Codable, Hashable, Sendable {
         )
     }
 
+    /// The copy shared with the widget: items keep their name, verdict, fact and cores, but no
+    /// details, signals or processes (command lines and paths never leave the app).
+    public func forWidget() -> Snapshot {
+        let lean = categories.map { category in
+            CategorySummary(id: category.id, items: category.items.map { item in
+                Item(
+                    id: item.id, category: item.category, name: item.name, symbol: item.symbol,
+                    judgement: Judgement(verdict: item.judgement.verdict, fact: item.judgement.fact, signals: []),
+                    cores: item.cores, memoryBytes: item.memoryBytes, processes: [], detail: [:]
+                )
+            })
+        }
+        return Snapshot(
+            date: date, battery: battery, coresBusy: coresBusy, swapUsedBytes: swapUsedBytes,
+            swapTotalBytes: swapTotalBytes, uptime: uptime, categories: lean, mood: mood,
+            idleCount: idleCount, freedCores: freedCores
+        )
+    }
+
     /// Older JSON has no `idleCount` / `freedCores`; they read as 0.
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)

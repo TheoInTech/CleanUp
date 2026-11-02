@@ -1,0 +1,80 @@
+{
+  "devices": {
+    "com.apple.CoreSimulator.SimRuntime.iOS-27-1": [],
+    "com.apple.CoreSimulator.SimRuntime.watchOS-27-0": [],
+    "com.apple.CoreSimulator.SimRuntime.iOS-27-0": [
+      {
+        "dataPath": "/Users/theointech/Library/Developer/CoreSimulator/Devices/10EBDE8C-B5D1-47E1-8B8A-5621F07127FA/data",
+        "dataPathSize": 6000000000,
+        "logPath": "/Users/theointech/Library/Logs/CoreSimulator/10EBDE8C-B5D1-47E1-8B8A-5621F07127FA",
+        "udid": "10EBDE8C-B5D1-47E1-8B8A-5621F07127FA",
+        "lastUsedAt": "2026-11-02T07:33:48Z",
+        "isAvailable": true,
+        "logPathSize": 528384,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-18-Pro",
+        "state": "Booted",
+        "name": "iPhone 18 Pro"
+      },
+      {
+        "dataPath": "/Users/theointech/Library/Developer/CoreSimulator/Devices/1AC8D351-981F-439F-9A2D-AB2DF85DE448/data",
+        "dataPathSize": 6000000000,
+        "logPath": "/Users/theointech/Library/Logs/CoreSimulator/1AC8D351-981F-439F-9A2D-AB2DF85DE448",
+        "udid": "1AC8D351-981F-439F-9A2D-AB2DF85DE448",
+        "lastUsedAt": "2026-11-02T07:33:48Z",
+        "isAvailable": true,
+        "logPathSize": 528384,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-Duo",
+        "state": "Booted",
+        "name": "Orbit Duo Layout QA"
+      },
+      {
+        "dataPath": "/Users/theointech/Library/Developer/CoreSimulator/Devices/31049A9E-927D-49D6-9304-E80B2D6514C3/data",
+        "dataPathSize": 6000000000,
+        "logPath": "/Users/theointech/Library/Logs/CoreSimulator/31049A9E-927D-49D6-9304-E80B2D6514C3",
+        "udid": "31049A9E-927D-49D6-9304-E80B2D6514C3",
+        "lastUsedAt": "2026-11-02T07:33:48Z",
+        "isAvailable": true,
+        "logPathSize": 528384,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-17",
+        "state": "Booted",
+        "name": "iPhone 17"
+      },
+      {
+        "dataPath": "/Users/theointech/Library/Developer/CoreSimulator/Devices/13CCBF93-1281-497A-B7F3-1B8D2D531B4F/data",
+        "dataPathSize": 6000000000,
+        "logPath": "/Users/theointech/Library/Logs/CoreSimulator/13CCBF93-1281-497A-B7F3-1B8D2D531B4F",
+        "udid": "13CCBF93-1281-497A-B7F3-1B8D2D531B4F",
+        "lastUsedAt": "2026-11-02T07:33:48Z",
+        "isAvailable": true,
+        "logPathSize": 528384,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-SE-4",
+        "state": "Booted",
+        "name": "EVOne SE check"
+      },
+      {
+        "dataPath": "/Users/theointech/Library/Developer/CoreSimulator/Devices/F92ECACE-D87E-40D2-93F3-32974DED72BF/data",
+        "dataPathSize": 6000000000,
+        "logPath": "/Users/theointech/Library/Logs/CoreSimulator/F92ECACE-D87E-40D2-93F3-32974DED72BF",
+        "udid": "F92ECACE-D87E-40D2-93F3-32974DED72BF",
+        "lastUsedAt": "2026-11-02T07:33:48Z",
+        "isAvailable": true,
+        "logPathSize": 528384,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-Duo",
+        "state": "Booted",
+        "name": "iPhone Duo"
+      },
+      {
+        "dataPath": "/Users/theointech/Library/Developer/CoreSimulator/Devices/59D609E5-0299-44F7-98BF-A83CF9601F36/data",
+        "dataPathSize": 6000000000,
+        "logPath": "/Users/theointech/Library/Logs/CoreSimulator/59D609E5-0299-44F7-98BF-A83CF9601F36",
+        "udid": "59D609E5-0299-44F7-98BF-A83CF9601F36",
+        "lastUsedAt": "2026-11-02T07:33:48Z",
+        "isAvailable": true,
+        "logPathSize": 528384,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-Duo",
+        "state": "Booted",
+        "name": "Orbit iPhone Duo"
+      }
+    ]
+  }
+}

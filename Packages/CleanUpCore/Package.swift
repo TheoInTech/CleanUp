@@ -9,7 +9,11 @@ let package = Package(
     ],
     targets: [
         .target(name: "CleanUpCore"),
-        .testTarget(name: "CleanUpCoreTests", dependencies: ["CleanUpCore"]),
+        .testTarget(
+            name: "CleanUpCoreTests",
+            dependencies: ["CleanUpCore"],
+            resources: [.copy("Fixtures")]
+        ),
     ],
     swiftLanguageModes: [.v6]
 )

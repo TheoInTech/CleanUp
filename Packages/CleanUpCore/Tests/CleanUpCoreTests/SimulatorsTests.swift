@@ -328,9 +328,11 @@ private func engineTable(cpu: Double) -> ([Int32: ProcessInfoRecord], [Int32: Do
     ), [500: cpu * 50, 501: cpu * 30, 502: cpu * 20, 503: 900])
 }
 
+private let watchedLongEnough = now.addingTimeInterval(-.minutes(11))
+
 @Test func engineItemEmittedWhenNothingBootedAndBusy() {
     let (procs, cpu) = engineTable(cpu: 0.5)   // 0.5 cores total
-    let items = SimulatorsModule.buildItems(devices: [], ctx: .testContext(processes: procs, cpu: cpu))
+    let items = SimulatorsModule.buildItems(devices: [], ctx: .testContext(processes: procs, cpu: cpu), servicesQuietSince: watchedLongEnough)
     #expect(items.count == 1)
     #expect(items[0].id == .engine(name: "simulator-services")); #expect(items[0].name == "Simulator services")
     #expect(items[0].judgement.verdict == .idle)
@@ -359,12 +361,119 @@ private func engineTable(cpu: Double) -> ([Int32: ProcessInfoRecord], [Int32: Do
 }
 @Test func stopEngineSkipsWhenASimulatorIsStarting() async {
     let (procs, cpu) = engineTable(cpu: 0.5)
-    let items = SimulatorsModule.buildItems(devices: [], ctx: .testContext(processes: procs, cpu: cpu))
+    let items = SimulatorsModule.buildItems(devices: [], ctx: .testContext(processes: procs, cpu: cpu), servicesQuietSince: watchedLongEnough)
     let engine = try! #require(items.first)
     var starting = procs
     starting[900] = .fixture(pid: 900, name: "launchd_sim", arguments: ["launchd_sim", home + udidA + "/data/var/run/x.plist"], startedAgo: 5)
     let result = await SimulatorsModule().stop(engine, ctx: .testContext(processes: starting))
     #expect(result == .skipped(reason: "a simulator is starting"))
+}
+
+// MARK: - Simulator services: observed, not polled awake
+
+/// Records every command; answers `simctl list` with `listing`.
+private func listingModule(_ listing: String = #"{"devices":{}}"#) -> (SimulatorsModule, OSAllocatedUnfairLock<[[String]]>) {
+    let calls = OSAllocatedUnfairLock<[[String]]>(initialState: [])
+    let module = SimulatorsModule(
+        run: { cmd, args, _ in
+            calls.withLock { $0.append([cmd] + args) }
+            return CommandResult(status: 0, stdout: args.contains("list") ? listing : "", stderr: "", timedOut: false)
+        },
+        lastInFront: { _ in nil }, trackingSince: { .distantPast }
+    )
+    return (module, calls)
+}
+
+private func at(_ minutes: Double, _ procs: [Int32: ProcessInfoRecord], _ cpu: [Int32: Double]) -> ScanContext {
+    .testContext(now: now.addingTimeInterval(.minutes(minutes)), processes: procs, cpu: cpu)
+}
+
+private func services(_ items: [Item]) -> Item? { items.first { $0.id == .engine(name: "simulator-services") } }
+
+@Test func simctlRunsOnlyWhileASimulatorLauncherExists() async {
+    // `simctl list` can relaunch CoreSimulatorService, which would then look like idle services.
+    let (procs, cpu) = engineTable(cpu: 0.5)
+    let (module, calls) = listingModule()
+    _ = await module.scan(at(0, procs, cpu))
+    #expect(calls.withLock { $0 }.isEmpty)
+    _ = await module.scan(at(1, simTable(), [:]))
+    #expect(calls.withLock { $0 } == [["xcrun", "simctl", "list", "devices", "booted", "-j"]])
+}
+
+@Test func servicesAreIdleOnlyAfterTenWatchedMinutes() async {
+    let (procs, cpu) = engineTable(cpu: 0.5)
+    let (module, _) = listingModule()
+    let first = services(await module.scan(at(0, procs, cpu)))
+    #expect(first?.judgement.verdict == .inUse)
+    #expect(first?.judgement.fact == "measuring activity")
+    var minute = 1.0
+    while minute < 10 { _ = await module.scan(at(minute, procs, cpu)); minute += 1 }
+    #expect(services(await module.scan(at(9.5, procs, cpu)))?.judgement.verdict == .inUse)
+    #expect(services(await module.scan(at(10, procs, cpu)))?.judgement.verdict == .idle)
+}
+
+@Test(arguments: ["xcodebuild", "simctl", "xcrun"])
+func aSimulatorToolKeepsServicesInUse(tool: String) async {
+    var (procs, cpu) = engineTable(cpu: 0.5)
+    procs[700] = .fixture(pid: 700, ppid: 50, name: tool, path: "/usr/bin/\(tool)", arguments: [tool, "-downloadPlatform", "iOS"])
+    cpu[700] = 0
+    let (module, _) = listingModule()
+    var minute = 0.0, last: Item?
+    while minute <= 15 { last = services(await module.scan(at(minute, procs, cpu))); minute += 1 }
+    #expect(last?.judgement.verdict == .inUse)
+    #expect(last?.judgement.fact == "used by \(tool)")
+}
+
+@Test func busyDiskImageServiceKeepsServicesInUse() async {
+    // simdiskimaged mounts runtimes (an install or an update).
+    var (procs, cpu) = engineTable(cpu: 0.5)
+    procs[701] = .fixture(pid: 701, name: "simdiskimaged", path: "/Library/Developer/PrivateFrameworks/CoreSimulator.framework/Resources/bin/simdiskimaged")
+    cpu[701] = 20
+    let (module, _) = listingModule()
+    var minute = 0.0, last: Item?
+    while minute <= 15 { last = services(await module.scan(at(minute, procs, cpu))); minute += 1 }
+    #expect(last?.judgement.verdict == .inUse)
+    #expect(last?.judgement.fact == "used by simdiskimaged")
+    // Quiet (and measured), it doesn't count.
+    cpu[701] = 0.5
+    minute = 16
+    while minute <= 26 { last = services(await module.scan(at(minute, procs, cpu))); minute += 1 }
+    #expect(last?.judgement.verdict == .idle)
+}
+
+@Test func aGapRestartsTheServicesWatch() async {
+    let (procs, cpu) = engineTable(cpu: 0.5)
+    let (module, _) = listingModule()
+    _ = await module.scan(at(0, procs, cpu))
+    #expect(services(await module.scan(at(12, procs, cpu)))?.judgement.verdict == .inUse)   // slept 12 min
+    module.restartObservation()
+    var minute = 13.0, last: Item?
+    while minute <= 22 { last = services(await module.scan(at(minute, procs, cpu))); minute += 1 }
+    #expect(last?.judgement.verdict == .inUse)
+    #expect(services(await module.scan(at(23, procs, cpu)))?.judgement.verdict == .idle)
+}
+
+@Test func servicesStopChecksForToolsAgain() async {
+    let (procs, cpu) = engineTable(cpu: 0.5)
+    let engine = try! #require(services(SimulatorsModule.buildItems(devices: [], ctx: .testContext(processes: procs, cpu: cpu), servicesQuietSince: watchedLongEnough)))
+    #expect(engine.judgement.verdict == .idle)
+    var building = procs
+    building[700] = .fixture(pid: 700, ppid: 50, name: "xcodebuild", path: "/usr/bin/xcodebuild", arguments: ["xcodebuild", "test"])
+    #expect(await SimulatorsModule().stop(engine, ctx: .testContext(processes: building)) == .skipped(reason: "used by xcodebuild"))
+}
+
+// MARK: - A host process naming the device folder is a user, not part of the device
+
+@Test func hostProcessMentioningTheDeviceFolderOnlyInItsArgumentsIsAReferencer() {
+    var table = simTable()
+    table[650] = .fixture(pid: 650, ppid: 50, name: "tail", path: "/usr/bin/tail",
+                          arguments: ["tail", "-f", home + udidA + "/data/Library/Logs/system.log"])
+    let ctx = ScanContext.testContext(processes: table)
+    let item = SimulatorsModule.buildItems(devices: devices, ctx: ctx).first { $0.id == .simulator(udid: udidA) }
+    #expect(item?.processes.contains { $0.pid == 650 } == false)
+    #expect(SimulatorsModule.facts(udid: udidA, name: "x", ctx: ctx).referencedBy == ["tail"])
+    // The device's own launchd_sim names the folder in its arguments too, and stays part of the device.
+    #expect(item?.processes.contains { $0.pid == 100 } == true)
 }
 
 // MARK: - Stop guard

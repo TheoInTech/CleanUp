@@ -149,8 +149,18 @@ public struct SimulatorsModule: CategoryModule {
 
     typealias BootedDevice = (udid: String, name: String)
 
-    /// Last good `simctl` answer, reused when a refresh runs with `runExternal == false`.
-    private let cache = OSAllocatedUnfairLock<[BootedDevice]?>(uncheckedState: nil)
+    private struct Memory {
+        /// Last good `simctl` answer, reused when a refresh runs with `runExternal == false`.
+        var devices: [BootedDevice]?
+        /// Since when the services have been running with nothing booted, watched without a break.
+        var servicesQuietSince: Date?
+        var lastScan: Date?
+    }
+
+    private let memory = OSAllocatedUnfairLock<Memory>(uncheckedState: Memory())
+
+    /// The services must have been watched with nothing booted for this long before they count as idle.
+    public static let servicesObservationWindow: TimeInterval = 10 * 60
 
     /// Runs an external command with a timeout; injectable for tests.
     public typealias Run = @Sendable (String, [String], Duration) async -> CommandResult
@@ -194,20 +204,42 @@ public struct SimulatorsModule: CategoryModule {
     public func scan(_ ctx: ScanContext) async -> [Item] {
         let devices: [BootedDevice]?
         if ctx.runExternal {
-            devices = await Self.listBooted()
-            cache.withLockUnchecked { $0 = devices }
+            // Every booted (or booting) device runs its own launchd_sim. Without one nothing is booted,
+            // and asking simctl anyway would wake CoreSimulatorService, the very thing we report.
+            devices = Self.simulatorLauncherExists(ctx.processes) ? await listBooted() : []
+            memory.withLockUnchecked { $0.devices = devices }
         } else {
-            devices = cache.withLockUnchecked { $0 }
+            devices = memory.withLockUnchecked { $0.devices }
         }
         // simctl failed or never ran: we don't know what is booted, so claim nothing.
         guard let devices else { return [] }
-        return Self.buildItems(devices: devices, ctx: ctx, front: await frontHistory())
+        let since = rememberServices(watching: devices.isEmpty && Self.servicesWatchable(ctx), now: ctx.now)
+        return Self.buildItems(devices: devices, ctx: ctx, front: await frontHistory(), servicesQuietSince: since)
     }
 
-    private static func listBooted() async -> [BootedDevice]? {
-        let result = await CommandRunner.run("xcrun", ["simctl", "list", "devices", "booted", "-j"], timeout: simctlTimeout)
+    public func restartObservation() {
+        memory.withLockUnchecked { $0.servicesQuietSince = nil }
+    }
+
+    /// Starts, keeps or clears the services' watch; an unwatched gap starts it over.
+    private func rememberServices(watching: Bool, now: Date) -> Date? {
+        memory.withLockUnchecked { state in
+            if Observation.isGap(since: state.lastScan, now: now) { state.servicesQuietSince = nil }
+            state.lastScan = max(state.lastScan ?? now, now)
+            guard watching else {
+                state.servicesQuietSince = nil
+                return nil
+            }
+            let since = state.servicesQuietSince ?? now
+            state.servicesQuietSince = since
+            return since
+        }
+    }
+
+    private func listBooted() async -> [BootedDevice]? {
+        let result = await run("xcrun", ["simctl", "list", "devices", "booted", "-j"], Self.simctlTimeout)
         guard !result.timedOut, result.status == 0 else { return nil }
-        return try? parseBooted(result.stdout)
+        return try? Self.parseBooted(result.stdout)
     }
 
     /// Booted devices from `xcrun simctl list devices booted -j`, sorted by name.
@@ -225,9 +257,13 @@ public struct SimulatorsModule: CategoryModule {
 
     // MARK: items
 
-    static func buildItems(devices: [BootedDevice], ctx: ScanContext, front: FrontHistory = .never) -> [Item] {
+    /// `servicesQuietSince`: since when the services have been watched with nothing booted (nil: not yet).
+    static func buildItems(
+        devices: [BootedDevice], ctx: ScanContext, front: FrontHistory = .never, servicesQuietSince: Date? = nil
+    ) -> [Item] {
         var items = devices.map { item(udid: $0.udid, name: $0.name, ctx: ctx, front: front) }
-        if devices.isEmpty, !simulatorLauncherExists(ctx.processes), let engine = engineItem(ctx: ctx) { items.append(engine) }
+        if devices.isEmpty, !simulatorLauncherExists(ctx.processes),
+           let engine = engineItem(ctx: ctx, quietSince: servicesQuietSince) { items.append(engine) }
         return items
     }
 
@@ -307,27 +343,25 @@ public struct SimulatorsModule: CategoryModule {
 
     // MARK: attribution
 
-    /// Processes belonging to the device: path or arguments inside `/Devices/<UDID>/`, plus
-    /// everything descending from that device's `launchd_sim`.
+    /// Processes belonging to the device: executable inside `/Devices/<UDID>/`, the device's own
+    /// `launchd_sim` (it names the folder in its arguments), and everything descending from it. Any
+    /// other process that only names the folder in its arguments (`tail -f …/Devices/<UDID>/…`) is
+    /// using the device, not part of it.
     private static func deviceProcesses(udid: String, in table: [Int32: ProcessInfoRecord]) -> [ProcessInfoRecord] {
         let marker = "/Devices/\(udid)/"
-        let direct = table.values.filter { containsIgnoringCase($0.path, marker) || mentions($0.arguments, marker) }
-        let launchers = direct.filter { $0.name == "launchd_sim" || ($0.path as NSString).lastPathComponent == "launchd_sim" }
-        var pids = Set(direct.map(\.pid))
+        let direct = table.values.filter { containsIgnoringCase($0.path, marker) }
+        let launchers = table.values.filter { isLauncher($0) && mentions($0.arguments, marker) }
+        var pids = Set((direct + launchers).map(\.pid))
         pids.formUnion(descendants(of: Set(launchers.map(\.pid)), in: table))
         return pids.compactMap { table[$0] }
     }
 
+    private static func isLauncher(_ p: ProcessInfoRecord) -> Bool {
+        p.name == "launchd_sim" || (p.path as NSString).lastPathComponent == "launchd_sim"
+    }
+
     private static func descendants(of roots: Set<Int32>, in table: [Int32: ProcessInfoRecord]) -> Set<Int32> {
-        guard !roots.isEmpty else { return [] }
-        var children: [Int32: [Int32]] = [:]
-        for process in table.values where process.pid != process.ppid { children[process.ppid, default: []].append(process.pid) }
-        var found = Set<Int32>()
-        var queue = Array(roots)
-        while let pid = queue.popLast() {
-            for child in children[pid] ?? [] where found.insert(child).inserted { queue.append(child) }
-        }
-        return found
+        ProcessTree.descendants(of: roots, in: table)
     }
 
     /// CoreSimulator's own services and the Simulator app never count as "something using" a device.
@@ -344,7 +378,7 @@ public struct SimulatorsModule: CategoryModule {
 
     /// A `launchd_sim` exists, so some simulator is booting or booted, whatever the cached device list says.
     private static func simulatorLauncherExists(_ table: [Int32: ProcessInfoRecord]) -> Bool {
-        table.values.contains { $0.name == "launchd_sim" || ($0.path as NSString).lastPathComponent == "launchd_sim" }
+        table.values.contains(where: isLauncher)
     }
 
     private static func mentions(_ arguments: [String], _ needle: String) -> Bool {
@@ -368,26 +402,61 @@ public struct SimulatorsModule: CategoryModule {
             || p.name.hasPrefix("com.apple.CoreSimulator.CoreSim")   // the kernel truncates long names
     }
 
+    /// The services can be watched: they are running and nothing is booting.
+    private static func servicesWatchable(_ ctx: ScanContext) -> Bool {
+        !simulatorLauncherExists(ctx.processes) && ctx.processes.values.contains { $0.uid == getuid() && isEngineProcess($0) }
+    }
+
+    /// Tools that work the services without booting a device: a build or test run, `simctl` (runtime
+    /// installs, `simctl runtime add`), `xcrun`, and the disk image service mounting a runtime (when
+    /// it is visible and busy; it usually runs as root, where its CPU can't be read).
+    private static let toolNames: Set<String> = ["xcodebuild", "simctl", "xcrun"]
+    static let busyToolPercent = 5.0
+
+    private static func servicesUsers(_ ctx: ScanContext) -> [String] {
+        let own = ProcessTree.ownTree(ctx.ownPID, in: ctx.processes)
+        var names = Set<String>()
+        for p in ctx.processes.values where !own.contains(p.pid) {
+            let name = ProcessTree.leaf(p)
+            if toolNames.contains(name) { names.insert(name) }
+            if name == "simdiskimaged" || p.name == "simdiskimaged" {
+                if (ctx.cpu[p.pid] ?? .infinity) > busyToolPercent { names.insert("simdiskimaged") }
+            }
+        }
+        return names.sorted()
+    }
+
     /// The CoreSimulator background services, emitted only when nothing is booted yet they burn CPU.
-    private static func engineItem(ctx: ScanContext) -> Item? {
+    /// Idle only after ten watched minutes with nothing booted and no tool using them: a runtime
+    /// install or a disk image mount looks just like this for a while.
+    private static func engineItem(ctx: ScanContext, quietSince: Date?) -> Item? {
         let mine = ctx.processes.values.filter { $0.uid == getuid() && isEngineProcess($0) }
         let cores = mine.reduce(0.0) { $0 + (ctx.cpu[$1.pid] ?? 0) } / 100
         guard !mine.isEmpty, cores > engineBusyCores else { return nil }
         let usage = String(format: "%.1f", cores)
+        var signals = [
+            Signal(kind: .idle, text: "No simulator is booted"),
+            Signal(kind: .idle, text: "Background services using \(usage) cores"),
+        ]
+        let users = servicesUsers(ctx)
+        let watched = quietSince.map { ctx.now.timeIntervalSince($0) } ?? 0
+        let judgement: Judgement
+        if let user = users.first {
+            signals.append(Signal(kind: .inUse, text: "\(users.joined(separator: ", ")) is working with them"))
+            judgement = Judgement(verdict: .inUse, fact: "used by \(user)", signals: signals)
+        } else if watched < servicesObservationWindow {
+            signals.append(Signal(kind: .inUse, text: "Watched for only \(RelativeAge.short(watched)) so far"))
+            judgement = Judgement(verdict: .inUse, fact: "measuring activity", signals: signals)
+        } else {
+            signals.append(Signal(kind: .neutral, text: "They restart on demand"))
+            judgement = Judgement(verdict: .idle, fact: "no simulator booted, using \(usage) cores", signals: signals)
+        }
         return Item(
             id: engineIdentity,
             category: .simulators,
             name: "Simulator services",
             symbol: "gearshape.2",
-            judgement: Judgement(
-                verdict: .idle,
-                fact: "no simulator booted, using \(usage) cores",
-                signals: [
-                    Signal(kind: .idle, text: "No simulator is booted"),
-                    Signal(kind: .idle, text: "Background services using \(usage) cores"),
-                    Signal(kind: .neutral, text: "They restart on demand"),
-                ]
-            ),
+            judgement: judgement,
             cores: cores,
             memoryBytes: mine.reduce(0) { $0 + $1.residentBytes },
             processes: mine.sorted { $0.pid < $1.pid }.map(\.ref),
@@ -428,6 +497,7 @@ public struct SimulatorsModule: CategoryModule {
     private static func stopEngine(_ item: Item, ctx: ScanContext) -> StopResult {
         // The item may be from a cached scan; never kill the services under a simulator that is starting.
         if simulatorLauncherExists(ctx.processes) { return .skipped(reason: "a simulator is starting") }
+        if let user = servicesUsers(ctx).first { return .skipped(reason: "used by \(user)") }
         let outcome = ProcessSignaler.terminate(item.processes)
         if !outcome.refused.isEmpty {
             return .failed(reason: "Couldn't stop \(outcome.refused.count) simulator service process(es)")

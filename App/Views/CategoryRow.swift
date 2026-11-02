@@ -47,6 +47,8 @@ struct CategoryRow: View {
                 .buttonStyle(.plain)
                 .disabled(!model.hasIdle(category.id) && model.selection.state(of: category.id, in: model.snapshot) == .none)
                 .help("Tick the idle ones")
+                .accessibilityLabel("Tick idle \(Palette.name(category.id))")
+                .accessibilityAddTraits(model.selection.state(of: category.id, in: model.snapshot) == .all ? .isSelected : [])
             }
 
             Button { model.toggleExpanded(category.id) } label: {
@@ -75,6 +77,8 @@ struct CategoryRow: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("\(Palette.name(category.id)), \(subtitle)")
+            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
         }
         .padding(.vertical, 8)
     }

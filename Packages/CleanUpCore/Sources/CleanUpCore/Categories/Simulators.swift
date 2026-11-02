@@ -105,7 +105,13 @@ public struct SimulatorsModule: CategoryModule {
     /// Last good `simctl` answer, reused when a refresh runs with `runExternal == false`.
     private let cache = OSAllocatedUnfairLock<[BootedDevice]?>(uncheckedState: nil)
 
-    public init() {}
+    /// Runs an external command with a timeout; injectable for tests.
+    public typealias Run = @Sendable (String, [String], Duration) async -> CommandResult
+    private let run: Run
+
+    public init(run: Run? = nil) {
+        self.run = run ?? { await CommandRunner.run($0, $1, timeout: $2) }
+    }
 
     // MARK: scan
 
@@ -288,17 +294,19 @@ public struct SimulatorsModule: CategoryModule {
 
     // MARK: stop / undo
 
-    public func stop(_ item: Item, ctx: ScanContext) async -> StopResult {
-        guard item.judgement.verdict == .idle else {
+    public func stop(_ item: Item, ctx: ScanContext, force: Bool) async -> StopResult {
+        // The simulator services are an engine: never forced.
+        let isEngine = item.id == Self.engineIdentity
+        guard item.judgement.verdict == .idle || (force && !isEngine) else {
             return .skipped(reason: "\(item.name) is in use")
         }
-        if item.id == Self.engineIdentity {
+        if isEngine {
             return Self.stopEngine(item, ctx: ctx)
         }
         guard let udid = item.detail["udid"], UUID(uuidString: udid) != nil else {
             return .failed(reason: "Missing or malformed simulator id")
         }
-        let result = await CommandRunner.run("xcrun", ["simctl", "shutdown", udid], timeout: Self.simctlTimeout)
+        let result = await run("xcrun", ["simctl", "shutdown", udid], Self.simctlTimeout)
         if result.timedOut { return .failed(reason: "simctl shutdown timed out") }
         // Already shut down by someone else: the goal is met.
         if result.status != 0, !result.stderr.contains("current state: Shutdown") {
@@ -320,7 +328,7 @@ public struct SimulatorsModule: CategoryModule {
     public func undo(_ token: UndoToken) async -> Bool {
         guard token.action == "boot", token.arguments.count == 1,
               let udid = token.arguments.first, UUID(uuidString: udid) != nil else { return false }
-        let result = await CommandRunner.run("xcrun", ["simctl", "boot", udid], timeout: Self.simctlTimeout)
+        let result = await run("xcrun", ["simctl", "boot", udid], Self.simctlTimeout)
         return !result.timedOut && (result.status == 0 || result.stderr.contains("current state: Booted"))
     }
 

@@ -86,6 +86,12 @@ struct ExplainSheet: View {
                 }
             }
 
+            if verdict == .check {
+                Text(Self.tabAdvice(browser: item.detail["browser"]))
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             if explanation?.byAI == true {
                 Text("✨ Explained by Apple Intelligence, on this Mac")
                     .font(.caption)
@@ -133,8 +139,9 @@ struct ExplainSheet: View {
                 .buttonStyle(.glass)
                 Button {
                     let target = item
+                    let force = verdict == .inUse
                     dismiss()
-                    Task { await model.stop(target) }
+                    Task { await model.stop(target, force: force) }
                 } label: {
                     Text(verdict == .inUse ? "Stop anyway" : "Stop").frame(maxWidth: .infinity)
                 }
@@ -145,6 +152,15 @@ struct ExplainSheet: View {
         }
         .controlSize(.large)
         .frame(maxWidth: .infinity, alignment: .trailing)
+    }
+
+    /// Chromium browsers have a task manager (Shift+Esc); Safari and Firefox don't show one per tab.
+    static func tabAdvice(browser: String?) -> String {
+        let chromium: Set<String> = ["Chrome", "Brave", "Edge", "Chromium", "Arc", "Vivaldi", "Opera"]
+        if let browser, chromium.contains(browser) {
+            return "Open the browser's task manager to close it (Shift+Esc in Chrome, Brave, Edge)."
+        }
+        return "Close the busy tab in the browser."
     }
 
     private func signalColor(_ kind: Signal.Kind) -> Color {

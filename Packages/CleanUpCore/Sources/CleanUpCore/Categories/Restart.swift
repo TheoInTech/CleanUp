@@ -56,7 +56,7 @@ public struct RestartModule: CategoryModule {
         )]
     }
 
-    public func stop(_ item: Item, ctx: ScanContext) async -> StopResult {
+    public func stop(_ item: Item, ctx: ScanContext, force: Bool) async -> StopResult {
         guard item.id == .restart else { return .skipped(reason: "not a restart item") }
         if let error = await restarter() { return .failed(reason: error) }
         return .skipped(reason: "restart dialog shown")

@@ -56,20 +56,22 @@ public actor Cleaner {
         self.engineCheckTimeout = engineCheckTimeout
     }
 
-    /// Cleans against a fresh context (new process table, sockets and frontmost app).
-    public func clean(_ items: [Item]) async -> CleanupReport {
-        await clean(items, ctx: await probe.freshContext())
+    /// Cleans against a fresh context (new process table, sockets and frontmost app). Items in
+    /// `forced` ("Stop anyway") skip the idle/activity checks but none of the safety guards;
+    /// engines are never forced.
+    public func clean(_ items: [Item], forced: Set<ItemIdentity> = []) async -> CleanupReport {
+        await clean(items, ctx: await probe.freshContext(), forced: forced)
     }
 
     /// Everything that isn't an engine first (categories in parallel, items within a category one by
     /// one), then the engines. A container engine is skipped if one of its containers in `items`
     /// didn't stop, or unless a fresh listing (new context, `runExternal: true`) judges the engine idle
     /// and shows no running container of it: quitting the engine would stop those containers.
-    public func clean(_ items: [Item], ctx: ScanContext) async -> CleanupReport {
+    public func clean(_ items: [Item], ctx: ScanContext, forced: Set<ItemIdentity> = []) async -> CleanupReport {
         var results = [StopResult?](repeating: nil, count: items.count)
         let isEngine = items.map { $0.id.rawValue.hasPrefix(Selection.enginePrefix) }
 
-        for (index, result) in await stop(items.indices.filter { !isEngine[$0] }, of: items, ctx: ctx) {
+        for (index, result) in await stop(items.indices.filter { !isEngine[$0] }, of: items, ctx: ctx, forced: forced) {
             results[index] = result
         }
 
@@ -114,7 +116,7 @@ public actor Cleaner {
                 }
             }
         }
-        for (index, result) in await stop(engines, of: items, ctx: engineCtx) {
+        for (index, result) in await stop(engines, of: items, ctx: engineCtx, forced: []) {
             results[index] = result
         }
 
@@ -166,22 +168,22 @@ public actor Cleaner {
 
     // MARK: Helpers
 
-    private func stop(_ indices: [Int], of items: [Item], ctx: ScanContext) async -> [(Int, StopResult)] {
+    private func stop(_ indices: [Int], of items: [Item], ctx: ScanContext, forced: Set<ItemIdentity>) async -> [(Int, StopResult)] {
         var groups: [CategoryID: [Int]] = [:]
         for index in indices { groups[items[index].category, default: []].append(index) }
         let modules = self.modules
         return await withTaskGroup(of: [(Int, StopResult)].self) { group in
             for (category, members) in groups {
                 let module = modules[category]
-                let work = members.map { ($0, items[$0]) }
+                let work = members.map { ($0, items[$0], forced.contains(items[$0].id)) }
                 group.addTask {
                     var out: [(Int, StopResult)] = []
-                    for (index, item) in work {
+                    for (index, item, force) in work {
                         guard let module else {
                             out.append((index, .failed(reason: "Nothing can stop \(category.rawValue) items")))
                             continue
                         }
-                        out.append((index, await module.stop(item, ctx: ctx)))
+                        out.append((index, await module.stop(item, ctx: ctx, force: force)))
                     }
                     return out
                 }

@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Testing
 @testable import CleanUpCore
 
@@ -240,6 +241,48 @@ private func engineTable(cpu: Double) -> ([Int32: ProcessInfoRecord], [Int32: Do
     )
     let result = await SimulatorsModule().stop(item, ctx: .testContext())
     guard case .skipped = result else { Issue.record("expected skipped, got \(result)"); return }
+}
+
+@Test func forcedStopShutsDownAnInUseSimulator() async {
+    let calls = OSAllocatedUnfairLock<[[String]]>(initialState: [])
+    let module = SimulatorsModule(run: { cmd, args, _ in
+        calls.withLock { $0.append([cmd] + args) }
+        return CommandResult(status: 0, stdout: "", stderr: "", timedOut: false)
+    })
+    let item = Item(
+        id: .simulator(udid: udidA), category: .simulators, name: "x", symbol: "iphone",
+        judgement: Judgement(verdict: .inUse, fact: "Orbit opened 13 min ago", signals: []),
+        cores: 0, memoryBytes: 0, processes: [], detail: ["udid": udidA]
+    )
+    #expect(await module.stop(item, ctx: .testContext()) == .skipped(reason: "x is in use"))
+    #expect(calls.withLock { $0 }.isEmpty)
+    let result = await module.stop(item, ctx: .testContext(), force: true)
+    #expect(result == .stopped(UndoToken(identity: item.id, action: "boot", arguments: [udidA])))
+    #expect(calls.withLock { $0 } == [["xcrun", "simctl", "shutdown", udidA]])
+}
+@Test func forcedStopStillRejectsMalformedUDID() async {
+    let module = SimulatorsModule(run: { _, _, _ in
+        Issue.record("must not run")
+        return CommandResult(status: 0, stdout: "", stderr: "", timedOut: false)
+    })
+    let item = Item(
+        id: .simulator(udid: "--all"), category: .simulators, name: "x", symbol: "iphone",
+        judgement: Judgement(verdict: .inUse, fact: "busy", signals: []),
+        cores: 0, memoryBytes: 0, processes: [], detail: ["udid": "--all"]
+    )
+    guard case .failed = await module.stop(item, ctx: .testContext(), force: true) else { Issue.record("expected failed"); return }
+}
+@Test func simulatorServicesAreNeverForced() async {
+    let module = SimulatorsModule(run: { _, _, _ in
+        Issue.record("must not run")
+        return CommandResult(status: 0, stdout: "", stderr: "", timedOut: false)
+    })
+    let item = Item(
+        id: SimulatorsModule.engineIdentity, category: .simulators, name: "Simulator services", symbol: "gearshape.2",
+        judgement: Judgement(verdict: .inUse, fact: "busy", signals: []),
+        cores: 0, memoryBytes: 0, processes: [], detail: [:]
+    )
+    guard case .skipped = await module.stop(item, ctx: .testContext(), force: true) else { Issue.record("expected skipped"); return }
 }
 @Test func stopRejectsMalformedUDID() async {
     let item = Item(

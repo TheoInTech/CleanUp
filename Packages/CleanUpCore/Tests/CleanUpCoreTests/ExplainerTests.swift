@@ -166,6 +166,37 @@ struct ExplainerTests {
         #expect(prompt.contains("engine: Docker Desktop"))
     }
 
+    @Test func promptGivesCategoryContextAndSignals() {
+        let sim = Item(
+            id: .simulator(udid: "F92ECACE-D87E-40D2-93F3-32974DED72BF"), category: .simulators, name: "iPhone 18 Pro", symbol: "iphone",
+            judgement: Judgement(verdict: .idle, fact: "idle 10 h", signals: [Signal(kind: .idle, text: "Nothing is building for it")]),
+            cores: 0, memoryBytes: 0, processes: [], detail: ["udid": "F92ECACE-D87E-40D2-93F3-32974DED72BF", "lastApp": "Orbit"]
+        )
+        let prompt = Explainer.prompt(for: sim)
+        #expect(prompt.contains("Context: an iPhone/iPad Simulator device started by Xcode, used to test apps"))
+        #expect(prompt.contains("- Nothing is building for it"))
+        #expect(prompt.contains("lastApp: Orbit"))
+        #expect(!prompt.contains("udid"))
+        #expect(Explainer.prompt(for: .fixtureEngine()).contains("Context: the app that runs Docker containers"))
+    }
+
+    @Test func promptSendsOnlyAllowListedDetailsCapped() {
+        let long = String(repeating: "x", count: 500)
+        let item = Item(
+            id: .devServer(cwd: "/Users/u/secret", command: "node server.js --token=abc"), category: .devServers,
+            name: "server", symbol: "server.rack",
+            judgement: Judgement(verdict: .idle, fact: "running 2 days", signals: []),
+            cores: 0, memoryBytes: 0, processes: [],
+            detail: ["cwd": "/Users/u/secret", "path": "/Users/u/bin/node", "command": "node server.js --token=abc", "project": long, "ports": "3000"]
+        )
+        let prompt = Explainer.prompt(for: item)
+        #expect(!prompt.contains("/Users/u"))
+        #expect(!prompt.contains("token"))
+        #expect(prompt.contains("ports: 3000"))
+        #expect(prompt.contains("project: " + String(repeating: "x", count: 200) + "\n") || prompt.hasSuffix("project: " + String(repeating: "x", count: 200)))
+        #expect(!prompt.contains(String(repeating: "x", count: 201)))
+    }
+
     @Test func instructionsAreVerbatim() {
         #expect(Explainer.instructions == "You explain Mac background processes to non-technical people in plain words. At most 2 short sentences. Never say whether it is safe; that is decided elsewhere.")
     }

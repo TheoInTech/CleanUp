@@ -34,6 +34,7 @@ struct SettingsView: View {
                             }
                             .buttonStyle(.plain)
                             .help("Remove")
+                            .accessibilityLabel("Remove \(entry.name)")
                         }
                     }
                 }

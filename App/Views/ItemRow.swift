@@ -14,7 +14,8 @@ struct ItemRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            if verdict == .advice {
+            if verdict == .advice || verdict == .check {
+                // Advice and busy tabs can't be stopped from here: no tick.
                 Color.clear.frame(width: 18, height: 18)
             } else {
                 Button { model.toggle(item) } label: {
@@ -24,6 +25,8 @@ struct ItemRow: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(!tickable)
+                .accessibilityLabel("Tick \(item.name)")
+                .accessibilityAddTraits(model.isTicked(item) ? .isSelected : [])
             }
 
             IconTile(symbol: item.symbol, color: color, size: 22)
@@ -61,6 +64,7 @@ struct ItemRow: View {
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
             .help("What is this?")
+            .accessibilityLabel("What is \(item.name)?")
         }
         .padding(.vertical, 7)
     }

@@ -216,21 +216,24 @@ final class AppModel {
         await stop(items)
     }
 
-    /// Stops one item from its "?" sheet.
-    func stop(_ item: Item) async {
-        await stop([snapshot.item(withID: item.id) ?? item])
+    /// Stops one item from its "?" sheet. `force` is "Stop anyway" on an in-use item: the engine
+    /// skips its idle checks for this one item but keeps every safety guard.
+    func stop(_ item: Item, force: Bool = false) async {
+        let current = snapshot.item(withID: item.id) ?? item
+        await stop([current], forced: force ? [current.id] : [])
     }
 
-    private func stop(_ items: [Item]) async {
+    private func stop(_ items: [Item], forced: Set<ItemIdentity> = []) async {
         guard !items.isEmpty, !isCleaning else { return }
         isCleaning = true
         defer { isCleaning = false }
 
-        let report = await cleaner.clean(items)
+        let report = await cleaner.clean(items, forced: forced)
         lastUndo = report.undo
         selection.ticked.subtract(report.stopped)
 
-        var parts = ["Stopped \(report.stopped.count)"]
+        var parts: [String] = []
+        if !report.stopped.isEmpty { parts.append("Stopped \(report.stopped.count)") }
         let notStopped = report.failed.count + report.skipped.count
         if notStopped > 0 { parts.append("Couldn't stop \(notStopped)") }
         show(ToastState(parts: parts, canUndo: !report.undo.isEmpty), for: .seconds(8))

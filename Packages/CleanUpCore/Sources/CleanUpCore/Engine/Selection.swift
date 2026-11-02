@@ -25,11 +25,12 @@ public struct Selection: Equatable, Sendable {
         return selection
     }
 
-    /// Items a user can tick: idle work, apps (by hand) and busy tabs. Never in-use items or advice.
+    /// Items a user can tick: idle work and apps (by hand). Never in-use items, advice, or busy
+    /// tabs (CleanUp can't stop a tab; the browser's task manager can).
     public static func isTickable(_ item: Item) -> Bool {
         switch item.judgement.verdict {
-        case .idle, .manual, .check: true
-        case .inUse, .advice: false
+        case .idle, .manual: true
+        case .inUse, .advice, .check: false
         }
     }
 
@@ -59,11 +60,13 @@ public struct Selection: Equatable, Sendable {
         untickBlockedEngines(in: s)
     }
 
+    /// Matches the "N of M ticked" count over every item: `.all` only when every item in the
+    /// category is ticked, so a category with an in-use item never looks fully ticked.
     public func state(of category: CategoryID, in s: Snapshot) -> TickState {
-        let tickable = s.categories.filter { $0.id == category }.flatMap(\.items).filter(Self.isTickable)
-        let on = tickable.filter { ticked.contains($0.id) }.count
+        let items = s.categories.filter { $0.id == category }.flatMap(\.items)
+        let on = items.filter { ticked.contains($0.id) }.count
         if on == 0 { return .none }
-        return on == tickable.count ? .all : .some
+        return on == items.count ? .all : .some
     }
 
     /// Cores the ticked items in this snapshot are using.

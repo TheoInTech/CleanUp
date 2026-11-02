@@ -42,6 +42,7 @@ struct MainView: View {
             .padding(.trailing, 14)
             .padding(.top, 6)
             .help("Settings")
+            .accessibilityLabel("Settings")
         }
         .overlay(alignment: .bottom) {
             if let toast = model.toast {
@@ -74,6 +75,7 @@ struct MainView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Battery health")
+                .accessibilityLabel("Battery health")
                 .popover(isPresented: $showsBattery, arrowEdge: .bottom) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Battery health \(battery.healthPercent)% · \(battery.cycleCount) cycles")
@@ -171,5 +173,6 @@ private struct ModePicker: View {
                 .contentShape(Capsule())
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }

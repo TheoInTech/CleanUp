@@ -169,11 +169,38 @@ extension EngineTests {
         @Test func categoryTickState() {
             let s = Snapshot.incident()
             var sel = Selection.quick(s, keep: .empty)
-            #expect(sel.state(of: .simulators, in: s) == .all)    // every tickable simulator is ticked
+            // 4 of 6 ticked (2 in use): half, matching "4 of 6 ticked", never full.
+            #expect(sel.state(of: .simulators, in: s) == .some)
             #expect(sel.state(of: .apps, in: s) == .none)
             sel.toggle(s.item(.simulator(udid: "F92ECACE-D87E-40D2-93F3-32974DED72BF")), in: s)
             #expect(sel.state(of: .simulators, in: s) == .some)
             #expect(sel.state(of: .devServers, in: s) == .none)
+        }
+
+        @Test func categoryTickStateIsFullOnlyWhenEveryItemIsTicked() {
+            let idle: [Item] = [
+                .fixtureSimulator(udid: "F92ECACE-D87E-40D2-93F3-32974DED72BF", name: "A", verdict: .idle, cores: 1),
+                .fixtureSimulator(udid: "1AC8D351-981F-439F-9A2D-AB2DF85DE448", name: "B", verdict: .idle, cores: 1),
+            ]
+            let s = Snapshot.with([CategorySummary(id: .simulators, items: idle)])
+            var sel = Selection.quick(s, keep: .empty)
+            #expect(sel.state(of: .simulators, in: s) == .all)
+            sel.toggle(idle[0], in: s)
+            #expect(sel.state(of: .simulators, in: s) == .some)
+            sel.toggle(idle[1], in: s)
+            #expect(sel.state(of: .simulators, in: s) == .none)
+        }
+
+        @Test func busyBrowserTabsCannotBeTicked() {
+            let tab = Item.fixtureTab()
+            let s = Snapshot.with([CategorySummary(id: .browserTabs, items: [tab])])
+            var sel = Selection(ticked: [])
+            sel.toggle(tab, in: s)
+            #expect(sel.ticked.isEmpty)
+            #expect(!Selection.isTickable(tab))
+            var carried = Selection(ticked: [tab.id])
+            carried.reconcile(with: s)
+            #expect(carried.ticked.isEmpty)
         }
 
         @Test func reconcileUnticksTheEngineWhenANewContainerAppears() {
@@ -493,6 +520,27 @@ extension EngineTests {
             let listing = try #require(containers.log.contexts.first)
             #expect(listing.runExternal)
             #expect(listing.now == fixedNow.addingTimeInterval(42))   // a fresh context, not the one passed in
+        }
+
+        @Test func forcedEngineIsStillSkippedWhileAContainerIsRunning() async {
+            let running = Item.fixtureContainer(name: "evone-postgres", verdict: .inUse)
+            let containers = StubModule(id: .containers, items: [running, .fixtureEngine()])
+            let engine = Item.fixtureEngine()
+            let report = await Cleaner(modules: [containers], probe: FakeMachine().probe)
+                .clean([engine], ctx: .testContext(), forced: [engine.id])
+            #expect(report.stopped.isEmpty)
+            #expect(report.skipped.first?.1 == "a container is still running")
+            #expect(containers.log.stopped.isEmpty)
+        }
+
+        @Test func forcedIDsReachTheirModuleAndNothingElseIsForced() async {
+            let forced = Item.fixtureContainer(name: "evone-postgres", verdict: .inUse)
+            let other = Item.fixtureContainer(name: "evone-routing", verdict: .idle)
+            let containers = StubModule(id: .containers)
+            _ = await Cleaner(modules: [containers], probe: FakeMachine().probe)
+                .clean([forced, other], ctx: .testContext(), forced: [forced.id])
+            #expect(containers.log.forced == [forced.id])
+            #expect(Set(containers.log.stopped) == [forced.id, other.id])
         }
 
         @Test func staleQuickSelectionCannotQuitTheEngine() async {

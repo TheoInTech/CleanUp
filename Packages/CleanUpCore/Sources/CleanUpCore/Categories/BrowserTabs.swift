@@ -88,7 +88,7 @@ public struct BrowserTabsModule: CategoryModule {
         return "Firefox"
     }
 
-    public func stop(_ item: Item, ctx: ScanContext) async -> StopResult {
+    public func stop(_ item: Item, ctx: ScanContext, force: Bool) async -> StopResult {
         .skipped(reason: "open the browser's task manager")
     }
 

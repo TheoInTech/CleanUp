@@ -236,6 +236,7 @@ struct StubModule: CategoryModule {
     struct Calls: Sendable {
         var scans = 0
         var stopped: [ItemIdentity] = []
+        var forced: [ItemIdentity] = []
         var undone: [UndoToken] = []
         var contexts: [ScanContext] = []
     }
@@ -270,8 +271,12 @@ struct StubModule: CategoryModule {
         return items
     }
 
-    func stop(_ item: Item, ctx: ScanContext) async -> StopResult {
-        calls.withLock { $0.stopped.append(item.id); $0.contexts.append(ctx) }
+    func stop(_ item: Item, ctx: ScanContext, force: Bool) async -> StopResult {
+        calls.withLock {
+            $0.stopped.append(item.id)
+            $0.contexts.append(ctx)
+            if force { $0.forced.append(item.id) }
+        }
         order.withLock { $0.append(item.id) }
         return results.withLock { $0.isEmpty ? .stopped(nil) : $0.removeFirst() }
     }
@@ -307,7 +312,7 @@ struct HangingModule: CategoryModule {
         }
     }
 
-    func stop(_ item: Item, ctx: ScanContext) async -> StopResult { .failed(reason: "hanging") }
+    func stop(_ item: Item, ctx: ScanContext, force: Bool) async -> StopResult { .failed(reason: "hanging") }
     func undo(_ token: UndoToken) async -> Bool { false }
 }
 
@@ -438,6 +443,6 @@ struct SlowModule: CategoryModule {
         }
     }
 
-    func stop(_ item: Item, ctx: ScanContext) async -> StopResult { .failed(reason: "slow") }
+    func stop(_ item: Item, ctx: ScanContext, force: Bool) async -> StopResult { .failed(reason: "slow") }
     func undo(_ token: UndoToken) async -> Bool { false }
 }

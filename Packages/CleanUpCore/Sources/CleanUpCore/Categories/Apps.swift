@@ -181,7 +181,8 @@ public struct AppsModule: CategoryModule {
 
     // MARK: stop / undo
 
-    public func stop(_ item: Item, ctx: ScanContext) async -> StopResult {
+    /// Apps are never pre-judged idle, so `force` changes nothing; the frontmost app is never quit.
+    public func stop(_ item: Item, ctx: ScanContext, force: Bool) async -> StopResult {
         guard let bundleID = item.detail["bundleID"], let bundlePath = item.detail["bundlePath"],
               let pid = item.detail["pid"].flatMap({ Int32($0) }) else {
             return .failed(reason: "Missing app details")

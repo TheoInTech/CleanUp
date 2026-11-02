@@ -72,14 +72,44 @@ public actor Explainer {
         return (result.whatIsIt, result.whatYouLose)
     }
 
+    /// Detail keys the model may see. Never paths, working directories or command lines.
+    static let promptDetailKeys: Set<String> = ["project", "image", "engine", "browser", "bundleID", "lastApp", "usedBy", "ports"]
+    static let promptValueLimit = 200
+
     static func prompt(for item: Item) -> String {
-        var lines = ["Name: \(item.name)", "Kind: \(item.category.rawValue)"]
-        let details = item.detail.sorted { $0.key < $1.key }
+        var lines = ["Name: \(item.name)", "Kind: \(item.category.rawValue)", "Context: \(context(for: item))"]
+        let details = item.detail
+            .filter { promptDetailKeys.contains($0.key) }
+            .sorted { $0.key < $1.key }
         if !details.isEmpty {
             lines.append("Details:")
-            lines += details.map { "- \($0.key): \($0.value)" }
+            lines += details.map { "- \($0.key): \(String($0.value.prefix(promptValueLimit)))" }
+        }
+        let signals = item.judgement.signals.map(\.text).filter { !$0.isEmpty }
+        if !signals.isEmpty {
+            lines.append("What CleanUp sees:")
+            lines += signals.map { "- \(String($0.prefix(promptValueLimit)))" }
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// One plain line saying what kind of thing this is, so the model doesn't guess from the name.
+    static func context(for item: Item) -> String {
+        let isEngine = item.id.rawValue.hasPrefix("engine:")
+        switch item.category {
+        case .simulators:
+            return isEngine
+                ? "background services of the iPhone/iPad Simulator, started by Xcode"
+                : "an iPhone/iPad Simulator device started by Xcode, used to test apps"
+        case .containers:
+            return isEngine
+                ? "the app that runs Docker containers"
+                : "a Docker container running a service like a database"
+        case .devServers: return "a local web/app development server started from a terminal"
+        case .apps: return "a Mac app"
+        case .browserTabs: return "a web page in a browser"
+        case .restart: return "advice to restart the Mac"
+        }
     }
 
     /// Trimmed text, or nil for an empty answer or one that gives a safety verdict.

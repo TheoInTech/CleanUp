@@ -657,6 +657,28 @@ private let client5432 = SocketInfo(pid: 900, state: .established, localPort: 51
         #expect(d.count("stop") == 0)
     }
 
+    @Test func forcedStopOfInUseContainerRunsDockerStop() async throws {
+        let d = fakeDocker([Row(name: "a", cpu: "50.00%")])
+        let m = module(d)
+        _ = await m.scan(ctx(0))
+        let item = try #require(await m.scan(ctx(11)).first)
+        #expect(item.judgement.verdict == .inUse)
+        d.set { $0.api["a"] = 999_000_000 }   // traffic, and a client, are ignored when forced
+        let result = await m.stop(item, ctx: ctx(11, sockets: [client5432]), force: true)
+        #expect(result == .stopped(UndoToken(identity: .container(name: "a"), action: "start", arguments: ["a"])))
+        #expect(d.calls.last == ["docker", "stop", "a"])
+    }
+
+    @Test func forcedStopStillRefusesUnsafeContainerNames() async {
+        let item = Item(
+            id: .container(name: "--all"), category: .containers, name: "--all", symbol: "shippingbox",
+            judgement: Judgement(verdict: .inUse, fact: "busy", signals: []), cores: 0, memoryBytes: 0, processes: [], detail: [:]
+        )
+        let d = FakeDocker()
+        guard case .failed = await module(d).stop(item, ctx: .testContext(), force: true) else { Issue.record("expected failure"); return }
+        #expect(d.count("stop") == 0)
+    }
+
     @Test func rechecksClientsRightBeforeStopping() async throws {
         let d = fakeDocker([Row(name: "a")])
         let m = module(d)
@@ -753,6 +775,14 @@ private let client5432 = SocketInfo(pid: 900, state: .established, localPort: 51
         let d = FakeDocker()
         let m = module(d, quit: { _ in Issue.record("must not quit"); return true })
         guard case .skipped = await m.stop(engineItem(.dockerDesktop, verdict: .inUse, appPath: "/Applications/Docker.app"), ctx: .testContext()) else {
+            Issue.record("expected skipped"); return
+        }
+    }
+
+    @Test func engineIsNeverForced() async {
+        let m = module(FakeDocker(), quit: { _ in Issue.record("must not quit"); return true })
+        let item = engineItem(.dockerDesktop, verdict: .inUse, appPath: "/Applications/Docker.app")
+        guard case .skipped = await m.stop(item, ctx: .testContext(), force: true) else {
             Issue.record("expected skipped"); return
         }
     }

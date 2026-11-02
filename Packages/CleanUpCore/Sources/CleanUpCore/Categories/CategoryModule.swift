@@ -54,8 +54,18 @@ public enum StopResult: Sendable, Equatable {
 public protocol CategoryModule: Sendable {
     var id: CategoryID { get }
     func scan(_ ctx: ScanContext) async -> [Item]
-    func stop(_ item: Item, ctx: ScanContext) async -> StopResult
+    /// `force` ("Stop anyway") skips only the idle/activity checks (verdict, connections, traffic).
+    /// Every identity and safety guard still applies: pid + start time, the never-stop list,
+    /// CleanUp's own process tree, id validation. Engines are never forced.
+    func stop(_ item: Item, ctx: ScanContext, force: Bool) async -> StopResult
     func undo(_ token: UndoToken) async -> Bool
+}
+
+extension CategoryModule {
+    /// A normal (not forced) stop.
+    public func stop(_ item: Item, ctx: ScanContext) async -> StopResult {
+        await stop(item, ctx: ctx, force: false)
+    }
 }
 
 /// Signals processes with the guard rails every module shares: only our own user's processes, only

@@ -576,24 +576,29 @@ public struct ContainersModule: CategoryModule {
 
     // MARK: stop / undo
 
-    public func stop(_ item: Item, ctx: ScanContext) async -> StopResult {
-        guard item.judgement.verdict == .idle else {
-            return .skipped(reason: "\(item.name) is in use")
+    public func stop(_ item: Item, ctx: ScanContext, force: Bool) async -> StopResult {
+        // Quitting an engine stops every container in it: an engine is never forced.
+        let isEngine = item.id.rawValue.hasPrefix(Self.engineIdentityPrefix)
+        let checkActivity = !force || isEngine
+        if checkActivity {
+            guard item.judgement.verdict == .idle else {
+                return .skipped(reason: "\(item.name) is in use")
+            }
+            // The item may come from a cached scan: look at the sockets again before stopping anything.
+            let ports = (item.detail["ports"] ?? "").split(separator: ",").compactMap { Int($0) }
+            let proxyPIDs = Self.detectEngines(ctx.processes).reduce(into: Set<Int32>()) { $0.formUnion($1.allPIDs) }
+            let clients = Self.clientConnections(ports: ports, sockets: ctx.sockets, excluding: proxyPIDs)
+            guard clients == 0 else {
+                return .skipped(reason: "\(item.name) now has \(clients) connection\(clients == 1 ? "" : "s")")
+            }
         }
-        // The item may come from a cached scan: look at the sockets again before stopping anything.
-        let ports = (item.detail["ports"] ?? "").split(separator: ",").compactMap { Int($0) }
-        let proxyPIDs = Self.detectEngines(ctx.processes).reduce(into: Set<Int32>()) { $0.formUnion($1.allPIDs) }
-        let clients = Self.clientConnections(ports: ports, sockets: ctx.sockets, excluding: proxyPIDs)
-        guard clients == 0 else {
-            return .skipped(reason: "\(item.name) now has \(clients) connection\(clients == 1 ? "" : "s")")
-        }
-        if item.id.rawValue.hasPrefix(Self.engineIdentityPrefix) {
+        if isEngine {
             return await stopEngine(item)
         }
         guard Self.isSafeName(item.name) else { return .failed(reason: "Unexpected container name") }
         // Traffic since the last scan (moments ago) must still be negligible, measured exactly.
         let (last, socket) = memory.withLock { ($0.samples[item.name]?.last, $0.socketPath) }
-        if let last {
+        if checkActivity, let last {
             guard let socket, let bytes = await apiNetworkBytes(name: item.name, socket: socket),
                   bytes >= last.bytes, bytes - last.bytes < ContainerJudge.idleNetBytes else {
                 return .skipped(reason: "\(item.name) has network traffic, or it couldn't be checked")

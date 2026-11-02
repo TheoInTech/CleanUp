@@ -21,7 +21,11 @@ enum DebugSnapshot {
         await pause(7)
         capture("main-window", into: dir)
 
-        let categories = model.snapshot.categories
+        // Never touch an item the user already keeps (the walk removes its own Keep at the end).
+        let kept = model.keepList
+        let categories = model.snapshot.categories.map { c in
+            CategorySummary(id: c.id, items: c.items.filter { !kept.contains($0.id) })
+        }.filter { !$0.items.isEmpty }
         guard let category = categories.first(where: { $0.items.contains { $0.judgement.verdict == .idle } })
             ?? categories.first(where: { $0.id != .apps }) ?? categories.first,
             let item = category.items.first(where: { $0.judgement.verdict == .idle }) ?? category.items.first

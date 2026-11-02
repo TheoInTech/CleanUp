@@ -469,8 +469,8 @@ public struct DevServersModule: CategoryModule {
 
     /// SIGTERM the tree (and any child spawned since the scan), SIGKILL survivors after the grace period.
     /// Every signal goes through `ProcessSignaler`, which re-verifies pid + start time each time.
-    public func stop(_ item: Item, ctx: ScanContext) async -> StopResult {
-        guard item.judgement.verdict == .idle else { return .skipped(reason: "\(item.name) is in use") }
+    public func stop(_ item: Item, ctx: ScanContext, force: Bool) async -> StopResult {
+        guard force || item.judgement.verdict == .idle else { return .skipped(reason: "\(item.name) is in use") }
 
         let listed = item.processes.filter { ctx.processes[$0.pid]?.startTime == $0.startTime }
         guard !listed.isEmpty else { return .skipped(reason: "already gone") }
@@ -478,7 +478,7 @@ public struct DevServersModule: CategoryModule {
         // Something may have connected since the item was scanned.
         let ports = Set((item.detail["ports"] ?? "").split(separator: ",").compactMap { Int($0) })
         let pids = Set(listed.map(\.pid))
-        if ctx.sockets.contains(where: { $0.state == .established && pids.contains($0.pid) && ports.contains($0.localPort) }) {
+        if !force, ctx.sockets.contains(where: { $0.state == .established && pids.contains($0.pid) && ports.contains($0.localPort) }) {
             return .skipped(reason: "a connection arrived")
         }
 

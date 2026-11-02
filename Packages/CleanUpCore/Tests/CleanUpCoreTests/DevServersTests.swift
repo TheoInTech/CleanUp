@@ -553,6 +553,35 @@ private func appProcess(_ pid: Int32, ppid: Int32 = 1, name: String, path: Strin
     #expect(child.process.isRunning)
 }
 
+@Test func forcedStopOfInUseServerTerminatesItEvenWithAClient() async throws {
+    let child = try spawnSleeper()
+    defer { child.dispose() }
+    let item = Item.fixtureDevServer(ref: child.record.ref, verdict: .inUse)
+    let sockets = [SocketInfo(pid: child.record.pid, state: .established, localPort: 8081, remotePort: 55_000)]
+    let r = await module().stop(item, ctx: .testContext(processes: ProcessTable.snapshot(), sockets: sockets), force: true)
+    #expect(r == .stopped(nil))
+    child.process.waitUntilExit()
+    #expect(!child.process.isRunning)
+}
+
+@Test func forcedStopStillLeavesAReusedPIDAlone() async throws {
+    let child = try spawnSleeper()
+    defer { child.dispose() }
+    let stale = ProcessRef(pid: child.record.pid, startTime: child.record.startTime.addingTimeInterval(-100))
+    let item = Item.fixtureDevServer(ref: stale, verdict: .inUse)
+    let r = await module().stop(item, ctx: .testContext(processes: ProcessTable.snapshot()), force: true)
+    #expect(r == .skipped(reason: "already gone"))
+    #expect(child.process.isRunning)
+}
+
+@Test func forcedStopStillRefusesTreesContainingCleanUp() async {
+    let own = ProcessTable.snapshot()[getpid()]!
+    let item = Item.fixtureDevServer(ref: own.ref, verdict: .inUse)
+    guard case .skipped = await module().stop(item, ctx: .testContext(processes: [own.pid: own]), force: true) else {
+        Issue.record("expected skipped"); return
+    }
+}
+
 @Test func stopRefusesTreesContainingCleanUp() async {
     let own = ProcessTable.snapshot()[getpid()]!
     let item = Item.fixtureDevServer(ref: own.ref)

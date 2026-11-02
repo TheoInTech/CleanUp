@@ -1,0 +1,37 @@
+import Foundation
+
+/// The latest snapshot, shared with the widget as JSON in the App Group container.
+public enum SnapshotStore {
+    public static let fileName = "snapshot.json"
+
+    public enum StoreError: Error {
+        case noGroupContainer(String)
+    }
+
+    /// `<group container>/snapshot.json`, or nil when the App Group isn't available.
+    public static func url(groupID: String) -> URL? {
+        FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupID)?
+            .appendingPathComponent(fileName)
+    }
+
+    public static func write(_ s: Snapshot, groupID: String) throws {
+        guard let url = url(groupID: groupID) else { throw StoreError.noGroupContainer(groupID) }
+        try write(s, to: url)
+    }
+
+    /// nil on any error (no container, no file, unreadable, undecodable).
+    public static func read(groupID: String) -> Snapshot? {
+        url(groupID: groupID).flatMap { read(from: $0) }
+    }
+
+    /// Atomic: a reader sees the old file or the new one, never half of one.
+    public static func write(_ s: Snapshot, to url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try JSONEncoder().encode(s).write(to: url, options: .atomic)
+    }
+
+    public static func read(from url: URL) -> Snapshot? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(Snapshot.self, from: data)
+    }
+}

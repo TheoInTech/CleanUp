@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Testing
 @testable import CleanUpCore
 
@@ -125,7 +126,11 @@ extension DevServerFacts {
 }
 
 extension Item {
-    static func fixtureDevServer(ref: ProcessRef, verdict: Verdict = .idle, ports: [Int] = [8081]) -> Item {
+    static func fixtureDevServer(
+        ref: ProcessRef = ProcessRef(pid: 86_037, startTime: now.addingTimeInterval(-.days(18))),
+        verdict: Verdict = .idle,
+        ports: [Int] = [8081]
+    ) -> Item {
         Item(
             id: .devServer(cwd: "/Users/u/Projects/evone/apps/mobile", command: "expo start :8081"),
             category: .devServers,
@@ -197,5 +202,209 @@ extension Item {
             processes: [ProcessRef(pid: pid, startTime: now.addingTimeInterval(-.hours(2)))],
             detail: ["browser": browser]
         )
+    }
+}
+
+// MARK: - Engine test support
+
+/// A `UserDefaults` on a unique suite whose on-disk domain is removed when the last reference goes away.
+final class EphemeralUserDefaults: UserDefaults, @unchecked Sendable {
+    private let suite: String
+
+    init(suite: String) {
+        self.suite = suite
+        super.init(suiteName: suite)!
+    }
+
+    deinit { removePersistentDomain(forName: suite) }
+}
+
+extension UserDefaults {
+    /// A unique, throwaway suite, removed after use.
+    static func ephemeral() -> UserDefaults {
+        EphemeralUserDefaults(suite: "io.cleanup.tests.\(UUID().uuidString)")
+    }
+}
+
+/// A module with canned scan items and canned stop results (handed out in order; `.stopped(nil)` once
+/// they run out). Records every stop and undo it receives;
+/// undo fails for the identities in `undoFailing`.
+struct StubModule: CategoryModule {
+    struct Calls: Sendable {
+        var scans = 0
+        var stopped: [ItemIdentity] = []
+        var undone: [UndoToken] = []
+        var contexts: [ScanContext] = []
+    }
+
+    let id: CategoryID
+    let items: [Item]
+    private let results: OSAllocatedUnfairLock<[StopResult]>
+    private let undoFailing: Set<ItemIdentity>
+    let calls: OSAllocatedUnfairLock<Calls>
+    /// A copy of what was recorded so far.
+    var log: Calls { calls.withLock { $0 } }
+    /// Shared across modules to observe the global stop order.
+    let order: OSAllocatedUnfairLock<[ItemIdentity]>
+
+    init(
+        id: CategoryID,
+        items: [Item] = [],
+        results: [StopResult] = [],
+        undoFailing: Set<ItemIdentity> = [],
+        order: OSAllocatedUnfairLock<[ItemIdentity]> = OSAllocatedUnfairLock(initialState: [])
+    ) {
+        self.id = id
+        self.items = items
+        self.results = OSAllocatedUnfairLock(initialState: results)
+        self.undoFailing = undoFailing
+        self.calls = OSAllocatedUnfairLock(initialState: Calls())
+        self.order = order
+    }
+
+    func scan(_ ctx: ScanContext) async -> [Item] {
+        calls.withLock { $0.scans += 1; $0.contexts.append(ctx) }
+        return items
+    }
+
+    func stop(_ item: Item, ctx: ScanContext) async -> StopResult {
+        calls.withLock { $0.stopped.append(item.id); $0.contexts.append(ctx) }
+        order.withLock { $0.append(item.id) }
+        return results.withLock { $0.isEmpty ? .stopped(nil) : $0.removeFirst() }
+    }
+
+    func undo(_ token: UndoToken) async -> Bool {
+        calls.withLock { $0.undone.append(token) }
+        return !undoFailing.contains(token.identity)
+    }
+}
+
+/// A module whose scan never comes back in time (and ignores cancellation). The first
+/// `answeredScans` scans answer normally with `items`.
+struct HangingModule: CategoryModule {
+    let id: CategoryID
+    let items: [Item]
+    private let answered: OSAllocatedUnfairLock<Int>
+
+    init(id: CategoryID, items: [Item] = [], answeredScans: Int = 0) {
+        self.id = id
+        self.items = items
+        self.answered = OSAllocatedUnfairLock(initialState: answeredScans)
+    }
+
+    func scan(_ ctx: ScanContext) async -> [Item] {
+        let answer = answered.withLock { left in
+            defer { left = max(0, left - 1) }
+            return left > 0
+        }
+        if answer { return items }
+        // Not cancellable: the scanner must give up on it, not wait for it.
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global().asyncAfter(deadline: .now() + 10) { continuation.resume(returning: []) }
+        }
+    }
+
+    func stop(_ item: Item, ctx: ScanContext) async -> StopResult { .failed(reason: "hanging") }
+    func undo(_ token: UndoToken) async -> Bool { false }
+}
+
+extension Item {
+    static func fixture(
+        _ id: ItemIdentity,
+        category: CategoryID,
+        name: String? = nil,
+        verdict: Verdict = .idle,
+        cores: Double = 0,
+        detail: [String: String] = [:]
+    ) -> Item {
+        Item(
+            id: id, category: category, name: name ?? id.rawValue, symbol: "circle",
+            judgement: Judgement(verdict: verdict, fact: verdict.rawValue, signals: []),
+            cores: cores, memoryBytes: 0, processes: [], detail: detail
+        )
+    }
+
+    static func fixtureContainer(
+        name: String = "evone-postgres",
+        verdict: Verdict = .idle,
+        cores: Double = 0,
+        engine: String? = "Docker Desktop"
+    ) -> Item {
+        var detail = ["image": "postgres:16"]
+        if let engine { detail["engine"] = engine }
+        return .fixture(.container(name: name), category: .containers, name: name, verdict: verdict, cores: cores, detail: detail)
+    }
+
+    static func fixtureEngine(_ name: String = "Docker Desktop", verdict: Verdict = .idle, cores: Double = 0) -> Item {
+        .fixture(.engine(name: name), category: .containers, name: name, verdict: verdict, cores: cores)
+    }
+
+    static func fixtureSimulator(udid: String, name: String, verdict: Verdict, cores: Double) -> Item {
+        .fixture(.simulator(udid: udid), category: .simulators, name: name, verdict: verdict, cores: cores, detail: ["udid": udid])
+    }
+}
+
+extension BatteryReading {
+    /// The incident: 95 W drain, 35 minutes left.
+    static func incident(onBattery: Bool = true) -> BatteryReading {
+        BatteryReading(
+            onBattery: onBattery, percent: 40, drainWatts: onBattery ? 95 : nil,
+            minutesLeft: onBattery ? 35 : nil, healthPercent: 93, cycleCount: 221
+        )
+    }
+}
+
+extension Snapshot {
+    /// The real incident: 6 booted simulators (4 idle, 2 in use), 8 containers (7 idle, `evone-postgres`
+    /// in use) under Docker Desktop, Steam open, 95 W drain with 35 minutes left.
+    static func incident(onBattery: Bool = true, mood: Mood? = nil) -> Snapshot {
+        incident(onBattery: onBattery, mood: mood, postgresVerdict: .inUse)
+    }
+
+    /// The incident with `evone-postgres` idle too, so the Docker Desktop engine is idle.
+    static func incidentAllContainersIdle() -> Snapshot {
+        incident(onBattery: true, mood: nil, postgresVerdict: .idle)
+    }
+
+    private static func incident(onBattery: Bool, mood: Mood?, postgresVerdict: Verdict) -> Snapshot {
+        let simulators: [Item] = [
+            .fixtureSimulator(udid: "F92ECACE-D87E-40D2-93F3-32974DED72BF", name: "iPhone Duo", verdict: .idle, cores: 1.2),
+            .fixtureSimulator(udid: "1AC8D351-981F-439F-9A2D-AB2DF85DE448", name: "Orbit Duo Layout QA", verdict: .idle, cores: 1.1),
+            .fixtureSimulator(udid: "59D609E5-0299-44F7-98BF-A83CF9601F36", name: "Orbit iPhone Duo", verdict: .idle, cores: 1.0),
+            .fixtureSimulator(udid: "13CCBF93-1281-497A-B7F3-1B8D2D531B4F", name: "EVOne SE check", verdict: .idle, cores: 0.9),
+            .fixtureSimulator(udid: "10EBDE8C-B5D1-47E1-8B8A-5621F07127FA", name: "iPhone 18 Pro", verdict: .inUse, cores: 1.5),
+            .fixtureSimulator(udid: "31049A9E-927D-49D6-9304-E80B2D6514C3", name: "iPhone 17", verdict: .inUse, cores: 1.3),
+        ]
+        let idleContainers = [
+            "paorder-shop-postgres-1", "paorder-shop-s3-1", "pasab-ai-postgres-1",
+            "savio-finance-app-mailpit-1", "evone-pg-account-deletion", "evone-pg-dm17-int", "evone-routing",
+        ]
+        let containers: [Item] = idleContainers.map { Item.fixtureContainer(name: $0, cores: 0.1) }
+            + [.fixtureContainer(name: "evone-postgres", verdict: postgresVerdict, cores: 0.3)]
+        let engineVerdict = ContainersModule.engineJudgement(containerVerdicts: containers.map(\.judgement.verdict)).verdict
+        let engine = Item.fixtureEngine(verdict: engineVerdict, cores: 1.0)
+        let steam = Item.fixture(.app(bundleID: "com.valvesoftware.steam"), category: .apps, name: "Steam", verdict: .manual, cores: 0.6)
+
+        let categories = [
+            CategorySummary(id: .simulators, items: simulators),
+            CategorySummary(id: .containers, items: containers + [engine]),
+            CategorySummary(id: .apps, items: [steam]),
+        ]
+        let battery = BatteryReading.incident(onBattery: onBattery)
+        let coresBusy = 10.5
+        return Snapshot(
+            date: fixedNow, battery: battery, coresBusy: coresBusy,
+            swapUsedBytes: 0, swapTotalBytes: 0, uptime: .days(3), categories: categories,
+            mood: mood ?? StatusCalculator.mood(battery: battery, coresBusy: coresBusy, drainHistory: Array(repeating: 95, count: 5))
+        )
+    }
+
+    /// The item with this identity; fails the test when it isn't there.
+    func item(_ id: ItemIdentity) -> Item {
+        guard let item = categories.lazy.flatMap(\.items).first(where: { $0.id == id }) else {
+            Issue.record("no item \(id.rawValue) in snapshot")
+            return .fixture(id, category: .simulators)
+        }
+        return item
     }
 }

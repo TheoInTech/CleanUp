@@ -27,6 +27,6 @@ struct CleanUpButton: View {
         }
         .buttonStyle(.glassProminent)
         .controlSize(.large)
-        .disabled(count == 0 || model.isCleaning)
+        .disabled(count == 0 || model.isCleaning || model.cleanIdleInFlight)
     }
 }

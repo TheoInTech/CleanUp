@@ -36,7 +36,8 @@ struct MenuBarPopover: View {
         .padding(14)
         .frame(width: 290)
         .background(WindowVisibility { model.popoverVisible = $0 } onWindow: { panel = $0 })
-        .onAppear { model.popoverVisible = true }
+        // A MenuBarExtra builds its content at launch, before the panel is shown: trust the panel.
+        .onAppear { model.popoverVisible = panel?.isVisible ?? false }
         .onDisappear { model.popoverVisible = false }
     }
 

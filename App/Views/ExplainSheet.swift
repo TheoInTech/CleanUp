@@ -129,6 +129,22 @@ struct ExplainSheet: View {
                     Text("OK").frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.glassProminent)
+            case .inUse where item.isEngine:
+                // Quitting an engine stops everything in it, so it is never forced: no "Stop anyway".
+                VStack(alignment: .trailing, spacing: 8) {
+                    if item.category == .containers {
+                        Text("Stop its containers first")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    Button {
+                        model.keep(item)
+                        dismiss()
+                    } label: {
+                        Text("Keep").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.glass)
+                }
             case .idle, .inUse, .manual:
                 Button {
                     model.keep(item)
@@ -147,7 +163,7 @@ struct ExplainSheet: View {
                 }
                 .buttonStyle(.glassProminent)
                 .tint(verdict == .inUse ? Palette.red : nil)
-                .disabled(model.isCleaning)
+                .disabled(model.isCleaning || model.cleanIdleInFlight)
             }
         }
         .controlSize(.large)

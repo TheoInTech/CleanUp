@@ -22,6 +22,9 @@ final class AppModel {
     static let visibleInterval: TimeInterval = 5
     static let backgroundInterval: TimeInterval = 60
     static let externalInterval: TimeInterval = 30
+    /// WidgetKit may skip reloads; ask again at least this often so the widget never shows a false
+    /// "Open CleanUp" (it calls a snapshot older than 15 minutes stale).
+    static let widgetReloadInterval: TimeInterval = 10 * 60
 
     private(set) var snapshot: Snapshot = .empty
     /// False until the first scan lands.
@@ -38,13 +41,20 @@ final class AppModel {
     /// The item whose "?" sheet is open.
     var explaining: Item?
     /// The main window is on screen.
-    var windowVisible = false
+    var windowVisible = false {
+        didSet { if windowVisible != oldValue { wakeRefreshLoop() } }
+    }
     /// The menu bar popover is on screen.
-    var popoverVisible = false
+    var popoverVisible = false {
+        didSet { if popoverVisible != oldValue { wakeRefreshLoop() } }
+    }
     /// Either surface is on screen: refresh every 5 s instead of every 60 s. Tracked per surface so
     /// closing one never slows the refresh while the other is still open.
     var isVisible: Bool { windowVisible || popoverVisible }
     private(set) var isCleaning = false
+    /// A notification or widget cleanup is under way (it looks again before stopping anything);
+    /// nothing else may start one meanwhile, and no "Nothing idle" toast covers the real one.
+    private(set) var cleanIdleInFlight = false
     private(set) var keepList = KeepList(defaults: .standard)
     var useAI: Bool {
         didSet {
@@ -59,6 +69,8 @@ final class AppModel {
     @ObservationIgnored private var explainer: Explainer
     @ObservationIgnored private let groupID: String?
     @ObservationIgnored private var loop: Task<Void, Never>?
+    /// The refresh loop's wait until the next refresh is due; cancelled when visibility changes.
+    @ObservationIgnored private var sleeper: Task<Void, Never>?
     @ObservationIgnored private var scanTask: Task<Void, Never>?
     @ObservationIgnored private var lastRefresh: Date?
     @ObservationIgnored private var lastExternal: Date?
@@ -68,9 +80,21 @@ final class AppModel {
     @ObservationIgnored private var drainMonitor: DrainMonitor
     @ObservationIgnored private let notificationDelegate = NotificationDelegate()
     @ObservationIgnored private var signalToken: Int32 = NOTIFY_TOKEN_INVALID
+    @ObservationIgnored private var signalGate = CleanupSignalGate()
     @ObservationIgnored private var workspaceObservers: [any NSObjectProtocol] = []
-    /// Opens the main window; set by the menu bar label, the one view that always exists.
-    @ObservationIgnored var openMainWindow: (() -> Void)?
+    /// Snapshots for the widget, written in order by one consumer (newest wins).
+    @ObservationIgnored private var snapshotOutbox: AsyncStream<(Snapshot, Bool)>.Continuation?
+    @ObservationIgnored private var lastWidgetReload: Date?
+    /// Opens the main window; set by the menu bar label, the one view that always exists. "Show me"
+    /// tapped before it is set (a cold launch from the notification) opens the window once it is.
+    @ObservationIgnored var openMainWindow: (() -> Void)? {
+        didSet {
+            guard pendingMainWindow, let openMainWindow else { return }
+            pendingMainWindow = false
+            openMainWindow()
+        }
+    }
+    @ObservationIgnored private var pendingMainWindow = false
 
     private init() {
         let modules: [any CategoryModule] = [
@@ -103,21 +127,33 @@ final class AppModel {
     /// Starts the single refresh loop (idempotent): every 5 s while visible, every 60 s otherwise.
     func start() {
         guard loop == nil else { return }
+        startSnapshotSharing()
         startIntegrations()
         loop = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
                 await self.refresh()
-                // Wake every second so opening the window shortens the wait right away.
-                while !Task.isCancelled, !self.isDue { try? await Task.sleep(for: .seconds(1)) }
+                // Sleep until the next refresh is due. Opening or closing the window or popover cancels
+                // the sleep, and the wait is worked out again for the new interval.
+                while !Task.isCancelled, let wait = self.timeUntilDue, wait > 0 {
+                    let sleeper = Task<Void, Never> { try? await Task.sleep(for: .seconds(wait)) }
+                    self.sleeper = sleeper
+                    await sleeper.value
+                    self.sleeper = nil
+                }
             }
         }
     }
 
-    private var isDue: Bool {
-        guard let lastRefresh else { return true }
+    /// Seconds until the next refresh is due; nil before the first one.
+    private var timeUntilDue: TimeInterval? {
+        guard let lastRefresh else { return nil }
         let interval = isVisible ? Self.visibleInterval : Self.backgroundInterval
-        return Date().timeIntervalSince(lastRefresh) >= interval
+        return interval - Date().timeIntervalSince(lastRefresh)
+    }
+
+    private func wakeRefreshLoop() {
+        sleeper?.cancel()
     }
 
     func refresh() async {
@@ -154,28 +190,41 @@ final class AppModel {
         hasScanned = true
 
         let quick = quickSelection
+        let now = Date()
         let widgetChanged = fresh.mood != oldMood || quick.count != oldIdle
+            || lastWidgetReload.map { now.timeIntervalSince($0) >= Self.widgetReloadInterval } ?? true
+        if widgetChanged { lastWidgetReload = now }
         warnIfDrainingFast(fresh)
-        // The widget can't read the Always-kept list, so it gets the idle count from here.
+        // The widget can't read the Always-kept list, so it gets the idle count from here. It needs no
+        // item details or signals (command lines, paths), so they stay in the app.
         writeSnapshot(
-            fresh.withQuickSummary(idleCount: quick.count, freedCores: quick.freedCores(in: fresh)),
+            fresh.withQuickSummary(idleCount: quick.count, freedCores: quick.freedCores(in: fresh)).forWidget(),
             reloadWidgets: widgetChanged
         )
     }
 
-    /// Shares the snapshot with the widget; when `reloadWidgets`, asks WidgetKit to redraw only after
-    /// the file is written, so the widget never reads the previous snapshot.
-    private func writeSnapshot(_ s: Snapshot, reloadWidgets: Bool) {
-        guard let groupID, !groupID.hasPrefix(".") else { return }
+    /// One consumer writes the widget's snapshots in the order they were made (and never an older
+    /// one over a newer one); when asked, it reloads the widget only after the file is written, so
+    /// the widget never reads the previous snapshot.
+    private func startSnapshotSharing() {
+        guard let groupID, !groupID.hasPrefix("."), let url = SnapshotStore.url(groupID: groupID) else { return }
+        let (stream, outbox) = AsyncStream.makeStream(of: (Snapshot, Bool).self)
+        snapshotOutbox = outbox
+        let writer = SnapshotWriter(url: url)
         let log = self.log
         Task.detached(priority: .utility) {
-            do {
-                try SnapshotStore.write(s, groupID: groupID)
-                if reloadWidgets { WidgetCenter.shared.reloadAllTimelines() }
-            } catch {
-                log.error("Snapshot not shared: \(String(describing: error), privacy: .public)")
+            for await (snapshot, reload) in stream {
+                do {
+                    if try await writer.write(snapshot), reload { WidgetCenter.shared.reloadAllTimelines() }
+                } catch {
+                    log.error("Snapshot not shared: \(String(describing: error), privacy: .public)")
+                }
             }
         }
+    }
+
+    private func writeSnapshot(_ s: Snapshot, reloadWidgets: Bool) {
+        snapshotOutbox?.yield((s, reloadWidgets))
     }
 
     // MARK: Ticks
@@ -203,27 +252,33 @@ final class AppModel {
 
     // MARK: Actions
 
-    /// Stops every ticked item, reports it in a toast, then rescans. Pass a selection to clean exactly
-    /// that instead of what is ticked (the notification and the widget never touch the user's ticks).
+    /// The Clean up button (window and popover): stops every ticked item, reports it in a toast, then
+    /// rescans. A snapshot more than 10 s old is looked at again first; only what is still ticked and
+    /// tickable in the fresh one is stopped.
     @discardableResult
-    func cleanUp(_ selection: Selection? = nil) async -> CleanupReport? {
-        let chosen = selection ?? self.selection
-        let items = snapshot.allItems.filter { chosen.ticked.contains($0.id) }
-        return await stop(items)
+    func cleanUp() async -> CleanupReport? {
+        guard !isCleaning, !cleanIdleInFlight else { return nil }
+        isCleaning = true
+        if TickController.isStale(snapshot, now: Date()) {
+            await refresh(forceExternal: true)   // applying it reconciles the ticks with what is there now
+        }
+        return await perform(TickController.itemsToClean(ticks.selection, in: snapshot))
     }
 
     /// Stops one item from its "?" sheet. `force` is "Stop anyway" on an in-use item: the engine
-    /// skips its idle checks for this one item but keeps every safety guard.
+    /// skips its idle checks for this one item but keeps every safety guard. Engines are never forced.
     func stop(_ item: Item, force: Bool = false) async {
+        guard !isCleaning, !cleanIdleInFlight else { return }
+        isCleaning = true
         let current = snapshot.item(withID: item.id) ?? item
-        await stop([current], forced: force ? [current.id] : [])
+        await perform([current], forced: force && !current.isEngine ? [current.id] : [])
     }
 
+    /// Runs with `isCleaning` already set, and clears it when done.
     @discardableResult
-    private func stop(_ items: [Item], forced: Set<ItemIdentity> = []) async -> CleanupReport? {
-        guard !items.isEmpty, !isCleaning else { return nil }
-        isCleaning = true
+    private func perform(_ items: [Item], forced: Set<ItemIdentity> = []) async -> CleanupReport? {
         defer { isCleaning = false }
+        guard !items.isEmpty else { return nil }
 
         let report = await clean(items, forced: forced)
         lastUndo = report.undo
@@ -309,11 +364,20 @@ final class AppModel {
         Task { await Notifications.requestAuthorization() }
         LoginItem.setUpOnFirstLaunch()
 
+        Notifications.registerDrainCategory(idleCount: nil)
+
         // The widget's "Clean up" button posts this; it does exactly what the notification button does.
         signalToken = CleanupSignal.observe {
-            Task { @MainActor in await AppModel.shared.cleanIdle() }
+            Task { @MainActor in AppModel.shared.handleCleanupSignal() }
         }
         if signalToken == NOTIFY_TOKEN_INVALID { log.error("Couldn't listen for the widget's clean signal") }
+
+        // Time asleep wasn't watched: no observation window may count it as quiet.
+        workspaceObservers.append(NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { _ in
+            Task { @MainActor in await AppModel.shared.scanner.restartObservation() }
+        })
 
         // Apps are judged idle by when they were last in front, so stamp on both edges: activation
         // (now in front) and deactivation (just left the front).
@@ -351,26 +415,44 @@ final class AppModel {
         }
     }
 
+    /// The Darwin signal is unauthenticated (anything can post it): act only on a fresh request the
+    /// widget wrote into the App Group, newer than the last one handled, at most every 30 s.
+    private func handleCleanupSignal() {
+        let requestedAt = groupID
+            .flatMap { $0.hasPrefix(".") ? nil : CleanupRequest.url(groupID: $0) }
+            .flatMap(CleanupRequest.read(from:))
+        guard signalGate.accept(requestedAt: requestedAt, now: Date()) else {
+            log.notice("Ignored a clean signal without a fresh widget request")
+            return
+        }
+        Task { await cleanIdle() }
+    }
+
     /// "Clean up N idle" from the notification or the widget. Looks again first and decides from the
     /// fresh scan, never from the numbers in the notification, which may be minutes old. Quick select
     /// only: never forced, never apps, and the user's own ticks stay as they were.
     func cleanIdle() async {
-        guard !isCleaning else { return }
+        guard !isCleaning, !cleanIdleInFlight else { return }
+        cleanIdleInFlight = true
+        defer { cleanIdleInFlight = false }
         await refresh(forceExternal: true)
         let quick = TickController.cleanIdleSelection(snapshot, keep: keepList)
-        guard quick.count > 0 else {
-            show(ToastState("Nothing idle"), for: .seconds(4))
-            if !isVisible { await Notifications.postResult("Nothing idle to stop") }
+        guard quick.count > 0, !isCleaning else {
+            if quick.count == 0 {
+                show(ToastState("Nothing idle"), for: .seconds(4))
+                if !isVisible { await Notifications.postResult("Nothing idle to stop") }
+            }
             return
         }
-        guard let report = await cleanUp(quick) else { return }
+        isCleaning = true
+        guard let report = await perform(TickController.itemsToClean(quick, in: snapshot)) else { return }
         // With no window or popover open the toast is invisible, so say it in a quiet notification.
         if !isVisible { await Notifications.postResult(Self.summary(of: report).joined(separator: " · ")) }
     }
 
     func showMainWindow() {
         NSApp.activate()
-        openMainWindow?()
+        if let openMainWindow { openMainWindow() } else { pendingMainWindow = true }
     }
 
     #if DEBUG

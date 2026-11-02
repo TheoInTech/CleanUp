@@ -24,16 +24,23 @@ enum Notifications {
         }
     }
 
+    /// The warning's two buttons. Registered at launch too, so a warning delivered before this run
+    /// (or tapped on a cold launch) still has them; `idleCount` nil → "Clean up idle".
+    static func registerDrainCategory(idleCount: Int?) {
+        let title = idleCount.map { DrainWarning(summary: "", idleCount: $0, minutesLeft: nil).actionTitle } ?? "Clean up idle"
+        let clean = UNNotificationAction(identifier: cleanAction, title: title, options: [])
+        let show = UNNotificationAction(identifier: showAction, title: "Show me", options: [.foreground])
+        UNUserNotificationCenter.current().setNotificationCategories([
+            UNNotificationCategory(identifier: categoryID, actions: [clean, show], intentIdentifiers: [], options: []),
+        ])
+    }
+
     /// "Battery draining fast · 35 min left" with the idle culprits as the body and two buttons.
     /// The category is registered again before every post so "Clean up N idle" carries the current N.
     static func postDrainWarning(minutesLeft: Int?, idleSummary: String, idleCount: Int) async {
         let center = UNUserNotificationCenter.current()
         let warning = DrainWarning(summary: idleSummary, idleCount: idleCount, minutesLeft: minutesLeft)
-        let clean = UNNotificationAction(identifier: cleanAction, title: warning.actionTitle, options: [])
-        let show = UNNotificationAction(identifier: showAction, title: "Show me", options: [.foreground])
-        center.setNotificationCategories([
-            UNNotificationCategory(identifier: categoryID, actions: [clean, show], intentIdentifiers: [], options: []),
-        ])
+        registerDrainCategory(idleCount: idleCount)
 
         let content = UNMutableNotificationContent()
         content.title = warning.title
@@ -45,12 +52,13 @@ enum Notifications {
     }
 
     /// The result of a cleanup started from the notification or the widget while no CleanUp window is
-    /// open, so the user still sees what happened. Quiet: no sound.
+    /// open, so the user still sees what happened. Shown as a banner (`.active`; `.passive` can stay
+    /// hidden in Notification Center), but quiet: no sound.
     static func postResult(_ text: String) async {
         let content = UNMutableNotificationContent()
         content.title = text
         content.sound = nil
-        content.interruptionLevel = .passive
+        content.interruptionLevel = .active
         await add(content, id: "cleanup-result", to: UNUserNotificationCenter.current())
     }
 

@@ -69,7 +69,7 @@ struct MainView: View {
         HStack(spacing: 6) {
             Text(model.snapshot.mood.label)
                 .font(.title3.weight(.semibold))
-            if let battery = model.snapshot.battery {
+            if let battery = model.snapshot.battery, let health = battery.healthPercent {
                 Button { showsBattery.toggle() } label: {
                     Image(systemName: "info.circle")
                         .foregroundStyle(.secondary)
@@ -79,8 +79,8 @@ struct MainView: View {
                 .accessibilityLabel("Battery health")
                 .popover(isPresented: $showsBattery, arrowEdge: .bottom) {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("Battery health \(battery.healthPercent)% · \(battery.cycleCount) cycles")
-                        if battery.healthPercent >= 80 {
+                        Text(battery.cycleCount.map { "Battery health \(health)% · \($0) cycles" } ?? "Battery health \(health)%")
+                        if health >= 80 {
                             Text("It's not your battery.").foregroundStyle(.secondary)
                         }
                     }

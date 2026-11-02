@@ -32,21 +32,23 @@ extension ScanContext {
 
 extension ProcessInfoRecord {
     static func fixture(
-        pid: Int32,
+        pid: Int32 = 100,
         ppid: Int32 = 1,
         uid: uid_t = getuid(),
-        name: String,
+        name: String? = nil,
         path: String = "",
         arguments: [String] = [],
         cwd: String? = nil,
         startedAgo: TimeInterval = .hours(1),
+        start: Date? = nil,
         residentBytes: UInt64 = 0
     ) -> ProcessInfoRecord {
-        ProcessInfoRecord(
+        let name = name ?? (path as NSString).lastPathComponent
+        return ProcessInfoRecord(
             pid: pid, ppid: ppid, pgid: pid, uid: uid, name: name,
             path: path.isEmpty ? name : path,
             arguments: arguments.isEmpty ? [name] : arguments,
-            cwd: cwd, startTime: now.addingTimeInterval(-startedAgo),
+            cwd: cwd, startTime: start ?? now.addingTimeInterval(-startedAgo),
             cpuTimeNanos: 0, residentBytes: residentBytes
         )
     }
@@ -92,6 +94,48 @@ extension ContainerFacts {
         ContainerFacts(
             name: name, image: image, startedAt: now.addingTimeInterval(-age), cpuPercent: cpu,
             publishedPorts: ports, clientConnections: clients, netBytesDelta: net
+        )
+    }
+}
+
+extension DevServerFacts {
+    static func fixture(
+        age: TimeInterval = .days(18),
+        established: Int = 0,
+        cpu: Double = 0,
+        orphaned: Bool = false,
+        lastSeenAgo: TimeInterval? = nil,
+        observedFor: TimeInterval = .hours(1),
+        command: String = "expo start",
+        ports: [Int] = [8081]
+    ) -> DevServerFacts {
+        DevServerFacts(
+            ref: ProcessRef(pid: 86_037, startTime: now.addingTimeInterval(-age)),
+            command: command,
+            projectName: "evone/apps/mobile",
+            cwd: "/Users/u/Projects/evone/apps/mobile",
+            ports: ports,
+            establishedNow: established,
+            lastConnectionSeen: lastSeenAgo.map { now.addingTimeInterval(-$0) },
+            cpuPercent: cpu,
+            orphaned: orphaned,
+            observedFor: observedFor
+        )
+    }
+}
+
+extension Item {
+    static func fixtureDevServer(ref: ProcessRef, verdict: Verdict = .idle, ports: [Int] = [8081]) -> Item {
+        Item(
+            id: .devServer(cwd: "/Users/u/Projects/evone/apps/mobile", command: "expo start :8081"),
+            category: .devServers,
+            name: "expo start :8081",
+            symbol: "server.rack",
+            judgement: Judgement(verdict: verdict, fact: "running 18 days", signals: []),
+            cores: 0,
+            memoryBytes: 0,
+            processes: [ref],
+            detail: ["command": "node expo start", "ports": ports.map(String.init).joined(separator: ",")]
         )
     }
 }

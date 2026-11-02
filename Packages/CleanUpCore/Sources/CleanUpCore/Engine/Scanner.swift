@@ -73,10 +73,12 @@ public actor Scanner {
     private let probe: SystemProbe
     private let sampler = CPUSampler()
 
-    /// Last items each module (by index) answered with in time.
+    /// Last items each module (by index) answered with, possibly from an older context.
     private var lastGood: [Int: [Item]] = [:]
-    /// Scans that haven't answered yet; reused instead of piling up another call to a stuck module.
-    private var inFlight: [Int: Task<[Item], Never>] = [:]
+    /// Scans that haven't answered yet, with the scan generation whose context they judge; reused
+    /// instead of piling up another call to a stuck module.
+    private var inFlight: [Int: (generation: Int, task: Task<[Item], Never>)] = [:]
+    private var generation = 0
     private var drainSamples: [(date: Date, watts: Double)] = []
 
     public init(modules: [any CategoryModule], categoryTimeout: Duration = .seconds(25), probe: SystemProbe = .live) {
@@ -91,12 +93,16 @@ public actor Scanner {
         let cpu = await sampler.sample(table, at: now)
         let ctx = await probe.context(now: now, processes: table, cpu: cpu, runExternal: runExternal)
 
-        let fresh = await runModules(ctx)
-        for (index, items) in fresh { lastGood[index] = items }
+        generation += 1
+        let (fresh, late) = await runModules(ctx, generation: generation)
+        for (index, items) in fresh.merging(late, uniquingKeysWith: { a, _ in a }) { lastGood[index] = items }
 
+        // Only answers judged against this scan's context count. Anything older stays visible but
+        // can't be idle: nothing may be stopped on the strength of a stale judgement.
         var byCategory: [CategoryID: [Item]] = [:]
         for index in modules.indices {
-            byCategory[modules[index].id, default: []] += fresh[index] ?? lastGood[index] ?? []
+            let items = fresh[index] ?? (lastGood[index] ?? []).map(Self.unchecked)
+            byCategory[modules[index].id, default: []] += items
         }
         let categories = CategoryID.allCases.compactMap { id -> CategorySummary? in
             var items = byCategory[id] ?? []
@@ -122,18 +128,19 @@ public actor Scanner {
 
     // MARK: Modules
 
-    /// Items per module index, for the modules that answered within the timeout.
-    private func runModules(_ ctx: ScanContext) async -> [Int: [Item]] {
-        var tasks: [(Int, Task<[Item], Never>)] = []
+    /// `fresh`: answers judged against `ctx`, within the timeout. `late`: answers that arrived now
+    /// from scans started by an earlier refresh (judged against an older context).
+    private func runModules(_ ctx: ScanContext, generation: Int) async -> (fresh: [Int: [Item]], late: [Int: [Item]]) {
+        var tasks: [(index: Int, generation: Int, task: Task<[Item], Never>)] = []
         for (index, module) in modules.enumerated() {
-            let task = inFlight[index] ?? Task.detached { await module.scan(ctx) }
-            inFlight[index] = task
-            tasks.append((index, task))
+            let running = inFlight[index] ?? (generation, Task.detached { await module.scan(ctx) })
+            inFlight[index] = running
+            tasks.append((index, running.generation, running.task))
         }
         let timeout = categoryTimeout
         let answered = await withTaskGroup(of: (Int, [Item]?).self) { group in
-            for (index, task) in tasks {
-                group.addTask { (index, await Self.value(of: task, within: timeout)) }
+            for entry in tasks {
+                group.addTask { (entry.index, await withTimeout(entry.task, timeout)) }
             }
             var answered: [Int: [Item]] = [:]
             for await (index, items) in group {
@@ -141,31 +148,25 @@ public actor Scanner {
             }
             return answered
         }
-        for index in answered.keys { inFlight[index] = nil }
-        return answered
+        var fresh: [Int: [Item]] = [:], late: [Int: [Item]] = [:]
+        for entry in tasks {
+            guard let items = answered[entry.index] else { continue }
+            inFlight[entry.index] = nil
+            if entry.generation == generation { fresh[entry.index] = items } else { late[entry.index] = items }
+        }
+        return (fresh, late)
     }
 
-    /// The task's value, or nil if it takes longer than `timeout`. Never waits past the timeout, even
-    /// for a task that ignores cancellation.
-    private static func value(of task: Task<[Item], Never>, within timeout: Duration) async -> [Item]? {
-        let pending = OSAllocatedUnfairLock<CheckedContinuation<[Item]?, Never>?>(initialState: nil)
-        let finish: @Sendable ([Item]?) -> Void = { value in
-            pending.withLock { $0.take() }?.resume(returning: value)
-        }
-        return await withCheckedContinuation { continuation in
-            pending.withLock { $0 = continuation }
-            let timer = Task.detached {
-                do {
-                    try await Task.sleep(for: timeout)
-                    finish(nil)
-                } catch {}
-            }
-            Task.detached {
-                let items = await task.value
-                finish(items)
-                timer.cancel()
-            }
-        }
+    static let uncheckedSignal = Signal(kind: .neutral, text: "Couldn't check just now")
+
+    /// An item from an older context: shown, but an idle verdict is downgraded so it's never pre-ticked or stopped.
+    static func unchecked(_ item: Item) -> Item {
+        guard item.judgement.verdict == .idle else { return item }
+        return Item(
+            id: item.id, category: item.category, name: item.name, symbol: item.symbol,
+            judgement: Judgement(verdict: .inUse, fact: "couldn't check", signals: item.judgement.signals + [uncheckedSignal]),
+            cores: item.cores, memoryBytes: item.memoryBytes, processes: item.processes, detail: item.detail
+        )
     }
 
     // MARK: Drain
@@ -183,5 +184,28 @@ public actor Scanner {
     private func sustainedDrain(at now: Date) -> [Double] {
         guard let oldest = drainSamples.first, now.timeIntervalSince(oldest.date) >= Self.drainCoverage else { return [] }
         return drainSamples.map(\.watts)
+    }
+}
+
+/// The task's value, or nil if it takes longer than `timeout`. Never waits past the timeout, even for
+/// a task that ignores cancellation (the task keeps running; its value is simply not waited for).
+func withTimeout<T: Sendable>(_ task: Task<T, Never>, _ timeout: Duration) async -> T? {
+    let pending = OSAllocatedUnfairLock<CheckedContinuation<T?, Never>?>(initialState: nil)
+    let finish: @Sendable (T?) -> Void = { value in
+        pending.withLock { $0.take() }?.resume(returning: value)
+    }
+    return await withCheckedContinuation { continuation in
+        pending.withLock { $0 = continuation }
+        let timer = Task.detached {
+            do {
+                try await Task.sleep(for: timeout)
+                finish(nil)
+            } catch {}
+        }
+        Task.detached {
+            let value = await task.value
+            finish(value)
+            timer.cancel()
+        }
     }
 }

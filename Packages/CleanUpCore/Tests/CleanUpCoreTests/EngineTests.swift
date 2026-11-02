@@ -176,6 +176,35 @@ extension EngineTests {
             #expect(sel.state(of: .devServers, in: s) == .none)
         }
 
+        @Test func reconcileUnticksTheEngineWhenANewContainerAppears() {
+            let before = Snapshot.incidentAllContainersIdle()
+            var sel = Selection.quick(before, keep: .empty)
+            #expect(sel.ticked.contains(.engine(name: "Docker Desktop")))
+            let containers = before.categories.first { $0.id == .containers }!.items + [.fixtureContainer(name: "brand-new", cores: 0.2)]
+            let after = Snapshot.with(before.categories.map { $0.id == .containers ? CategorySummary(id: .containers, items: containers) : $0 })
+            sel.reconcile(with: after)
+            #expect(!sel.ticked.contains(.engine(name: "Docker Desktop")))
+            #expect(sel.ticked.contains(.container(name: "evone-routing")))
+        }
+
+        @Test func reconcileDropsGoneAndNowInUseTicks() {
+            let before = Snapshot.incident()
+            var sel = Selection.quick(before, keep: .empty)
+            #expect(sel.count == 11)
+            // Two idle simulators: one shut down, one now in use.
+            let sims: [Item] = before.categories[0].items
+                .filter { $0.id != .simulator(udid: "F92ECACE-D87E-40D2-93F3-32974DED72BF") }
+                .map { $0.id == .simulator(udid: "1AC8D351-981F-439F-9A2D-AB2DF85DE448")
+                    ? .fixtureSimulator(udid: "1AC8D351-981F-439F-9A2D-AB2DF85DE448", name: "Orbit Duo Layout QA", verdict: .inUse, cores: 1.1) : $0 }
+            let after = Snapshot.with([CategorySummary(id: .simulators, items: sims)] + before.categories.dropFirst())
+            sel.reconcile(with: after)
+            #expect(sel.count == 9)
+            #expect(!sel.ticked.contains(.simulator(udid: "F92ECACE-D87E-40D2-93F3-32974DED72BF")))
+            #expect(!sel.ticked.contains(.simulator(udid: "1AC8D351-981F-439F-9A2D-AB2DF85DE448")))
+            #expect(abs(sel.freedCores(in: after) - (1.0 + 0.9 + 0.7)) < 1e-9)
+            #expect(sel.count == after.allItems.filter { sel.ticked.contains($0.id) }.count)
+        }
+
         @Test func freedCoresIgnoresTicksNotInTheSnapshot() {
             let s = Snapshot.incident()
             let sel = Selection(ticked: [.simulator(udid: "F92ECACE-D87E-40D2-93F3-32974DED72BF"), .container(name: "gone")])
@@ -204,6 +233,18 @@ extension EngineTests {
             #expect(KeepList(defaults: defaults).contains(.simulator(udid: "X")))
         }
 
+        @Test func copiesDoNotClobberEachOther() {
+            let defaults = UserDefaults.ephemeral()
+            var app = KeepList(defaults: defaults)
+            var menu = KeepList(defaults: defaults)     // loaded before the app's addition
+            app.add(.container(name: "a"), name: "a")
+            menu.add(.container(name: "b"), name: "b")
+            #expect(KeepList(defaults: defaults).entries.map(\.name) == ["a", "b"])
+            app.remove(.container(name: "a"))
+            #expect(KeepList(defaults: defaults).entries.map(\.name) == ["b"])
+            #expect(menu.contains(.container(name: "a")))   // a copy's in-memory view refreshes on its next write
+        }
+
         @Test func emptyIsInMemory() {
             var keep = KeepList.empty
             keep.add(.app(bundleID: "a"), name: "A")
@@ -230,7 +271,8 @@ extension EngineTests {
             #expect(StatusCalculator.mood(battery: plenty, coresBusy: 1, drainHistory: Array(repeating: 30, count: 5)) == .allGood)
             let low = BatteryReading(onBattery: true, percent: 20, drainWatts: 30, minutesLeft: 119, healthPercent: 93, cycleCount: 1)
             #expect(StatusCalculator.mood(battery: low, coresBusy: 1, drainHistory: Array(repeating: 20, count: 5)) == .drainingFast)
-            #expect(StatusCalculator.mood(battery: low, coresBusy: 1, drainHistory: Array(repeating: 30, count: 4)) == .allGood)
+            #expect(StatusCalculator.mood(battery: low, coresBusy: 1, drainHistory: [30]) == .allGood)      // one reading isn't sustained
+            #expect(StatusCalculator.mood(battery: low, coresBusy: 1, drainHistory: [30, 30]) == .drainingFast)   // coverage is the caller's job
             #expect(StatusCalculator.mood(battery: low, coresBusy: 1, drainHistory: Array(repeating: 19.9, count: 5)) == .allGood)
             let unknown = BatteryReading(onBattery: true, percent: 20, drainWatts: 30, minutesLeft: nil, healthPercent: 93, cycleCount: 1)
             #expect(StatusCalculator.mood(battery: unknown, coresBusy: 1, drainHistory: Array(repeating: 30, count: 5)) == .allGood)
@@ -253,7 +295,7 @@ extension EngineTests {
             #expect(snap.categories.map(\.id) == [.devServers])
         }
 
-        @Test func timedOutCategoryKeepsItsPreviousItems() async {
+        @Test func timedOutCategoryKeepsItsPreviousItems() async throws {
             let machine = FakeMachine()
             let sim = Item.fixtureSimulator(udid: "F92ECACE-D87E-40D2-93F3-32974DED72BF", name: "iPhone Duo", verdict: .idle, cores: 1)
             let scanner = Scanner(
@@ -267,7 +309,36 @@ extension EngineTests {
             let second = await scanner.scan(runExternal: true)
             #expect(clock.now - started < .seconds(3))
             #expect(second.categories.map(\.id) == [.simulators, .devServers])
-            #expect(second.categories.first?.items == [sim])
+            let stale = try #require(second.categories.first?.items.first)
+            #expect(stale.id == sim.id)
+            #expect(stale.judgement.verdict == .inUse)
+            #expect(stale.judgement.fact == "couldn't check")
+            #expect(stale.judgement.signals.last == Signal(kind: .neutral, text: "Couldn't check just now"))
+            #expect(Selection.quick(second, keep: .empty).ticked.isEmpty == false)        // the dev server is fresh
+            #expect(!Selection.quick(second, keep: .empty).ticked.contains(sim.id))       // the stale simulator isn't
+        }
+
+        @Test func lateResultFromAnOlderContextIsNotFresh() async throws {
+            let sim = Item.fixtureSimulator(udid: "U", name: "S", verdict: .idle, cores: 1)
+            let scanner = Scanner(
+                modules: [SlowModule(id: .simulators, items: [sim], delays: [0.3])],
+                categoryTimeout: .milliseconds(150), probe: FakeMachine().probe
+            )
+            let first = await scanner.scan(runExternal: true)          // times out, nothing earlier to show
+            #expect(first.categories.isEmpty)
+            try await Task.sleep(for: .milliseconds(300))               // the first scan's answer is in by now
+            let second = await scanner.scan(runExternal: true)
+            #expect(second.categories.first?.items.first?.judgement.verdict == .inUse)   // judged on scan 1's context
+            let third = await scanner.scan(runExternal: true)          // a fresh call for this context answers at once
+            #expect(third.categories.first?.items == [sim])
+        }
+
+        @Test func onlyIdleVerdictsAreDowngraded() {
+            let app = Item.fixture(.app(bundleID: "a"), category: .apps, verdict: .manual)
+            #expect(Scanner.unchecked(app) == app)
+            let idle = Item.fixtureContainer(name: "c")
+            #expect(Scanner.unchecked(idle).judgement.verdict == .inUse)
+            #expect(Scanner.unchecked(idle).detail == idle.detail)
         }
 
         @Test func emptyCategoriesAndUnadvisedRestartAreOmitted() async {
@@ -374,12 +445,12 @@ extension EngineTests {
 
         @Test func enginesStopAfterTheirContainers() async {
             let order = OSAllocatedUnfairLock<[ItemIdentity]>(initialState: [])
-            let containers = StubModule(id: .containers, order: order)
+            let containers = StubModule(id: .containers, items: [.fixtureEngine()], order: order)   // fresh listing: engine, no containers
             let sims = StubModule(id: .simulators, order: order)
             let services = Item.fixture(.engine(name: "simulator-services"), category: .simulators)
             let sim = Item.fixtureSimulator(udid: "U", name: "S", verdict: .idle, cores: 1)
             let items: [Item] = [.fixtureEngine(), services, .fixtureContainer(name: "a"), sim, .fixtureContainer(name: "b")]
-            let report = await Cleaner(modules: [containers, sims]).clean(items, ctx: .testContext())
+            let report = await Cleaner(modules: [containers, sims], probe: FakeMachine().probe).clean(items, ctx: .testContext())
 
             let stopped = order.withLock { $0 }
             let engine = stopped.firstIndex(of: .engine(name: "Docker Desktop"))!
@@ -400,10 +471,70 @@ extension EngineTests {
         }
 
         @Test func otherEnginesContainersDoNotHoldAnEngineBack() async {
-            let containers = StubModule(id: .containers, results: [.failed(reason: "x")])
-            let items: [Item] = [.fixtureContainer(name: "orb", engine: "OrbStack"), .fixtureEngine("Docker Desktop")]
-            let report = await Cleaner(modules: [containers]).clean(items, ctx: .testContext())
+            let orb = Item.fixtureContainer(name: "orb", engine: "OrbStack")
+            let containers = StubModule(id: .containers, items: [orb, .fixtureEngine("Docker Desktop")], results: [.failed(reason: "x")])
+            let items: [Item] = [orb, .fixtureEngine("Docker Desktop")]
+            let report = await Cleaner(modules: [containers], probe: FakeMachine().probe).clean(items, ctx: .testContext())
             #expect(report.stopped == [.engine(name: "Docker Desktop")])
+        }
+
+        // Quitting an engine stops every container in it, so the containers are listed afresh first.
+
+        @Test func directEngineStopIsSkippedWhileAContainerIsRunning() async throws {
+            let machine = FakeMachine()
+            machine.state.withLock { $0.now = fixedNow.addingTimeInterval(42) }
+            let running = Item.fixtureContainer(name: "evone-postgres", verdict: .inUse)
+            let containers = StubModule(id: .containers, items: [running, .fixtureEngine()])
+            let report = await Cleaner(modules: [containers], probe: machine.probe).clean([.fixtureEngine()], ctx: .testContext())
+            #expect(report.stopped.isEmpty)
+            #expect(report.skipped.map(\.0) == [.engine(name: "Docker Desktop")])
+            #expect(report.skipped.first?.1 == "a container is still running")
+            #expect(containers.log.stopped.isEmpty)
+            let listing = try #require(containers.log.contexts.first)
+            #expect(listing.runExternal)
+            #expect(listing.now == fixedNow.addingTimeInterval(42))   // a fresh context, not the one passed in
+        }
+
+        @Test func staleQuickSelectionCannotQuitTheEngine() async {
+            // The widget ticks from the stored snapshot; a container has started since.
+            let stale = Snapshot.incidentAllContainersIdle()
+            let ticked = Selection.quick(stale, keep: .empty)
+            let items = stale.allItems.filter { ticked.ticked.contains($0.id) && $0.category == .containers }
+            #expect(items.contains { $0.id == .engine(name: "Docker Desktop") })
+            let containers = StubModule(id: .containers, items: [.fixtureContainer(name: "brand-new", verdict: .inUse), .fixtureEngine()])
+            let report = await Cleaner(modules: [containers], probe: FakeMachine().probe).clean(items, ctx: .testContext())
+            #expect(report.stopped.count == 8)                                       // the containers in the batch
+            #expect(report.skipped.map(\.0) == [.engine(name: "Docker Desktop")])
+            #expect(!containers.log.stopped.contains(.engine(name: "Docker Desktop")))
+        }
+
+        @Test func containerWithoutEngineInTheListingBlocksTheEngine() async {
+            let containers = StubModule(id: .containers, items: [.fixtureContainer(name: "mystery", engine: nil), .fixtureEngine("OrbStack")])
+            let report = await Cleaner(modules: [containers], probe: FakeMachine().probe).clean([.fixtureEngine("OrbStack")], ctx: .testContext())
+            #expect(report.skipped.first?.1 == "a container is still running")
+        }
+
+        @Test func engineIsSkippedWhenContainersCantBeListed() async {
+            // docker didn't answer: the containers module claims nothing, not even the engine.
+            let silent = StubModule(id: .containers, items: [])
+            let report = await Cleaner(modules: [silent], probe: FakeMachine().probe).clean([.fixtureEngine()], ctx: .testContext())
+            #expect(report.skipped.first?.1 == "couldn't check containers")
+            #expect(silent.log.stopped.isEmpty)
+        }
+
+        @Test func engineIsSkippedWhenTheListingHangs() async {
+            let cleaner = Cleaner(modules: [HangingModule(id: .containers)], probe: FakeMachine().probe, engineCheckTimeout: .milliseconds(150))
+            let clock = ContinuousClock(), started = clock.now
+            let report = await cleaner.clean([.fixtureEngine()], ctx: .testContext())
+            #expect(clock.now - started < .seconds(3))
+            #expect(report.skipped.first?.1 == "couldn't check containers")
+        }
+
+        @Test func simulatorServicesNeedNoContainerListing() async {
+            let services = Item.fixture(.engine(name: "simulator-services"), category: .simulators)
+            let sims = StubModule(id: .simulators)
+            let report = await Cleaner(modules: [sims], probe: FakeMachine().probe).clean([services], ctx: .testContext())
+            #expect(report.stopped == [services.id])
         }
 
         @Test func collectsUndoTokensAndSkips() async {

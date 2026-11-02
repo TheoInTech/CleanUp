@@ -13,7 +13,7 @@ public struct KeepList: Sendable {
 
     public init(defaults: UserDefaults) {
         self.defaults = defaults
-        self.store = defaults.dictionary(forKey: Self.defaultsKey) as? [String: String] ?? [:]
+        self.store = Self.load(defaults)
     }
 
     private init(store: [String: String], defaults: UserDefaults?) {
@@ -24,13 +24,11 @@ public struct KeepList: Sendable {
     public func contains(_ id: ItemIdentity) -> Bool { store[id.rawValue] != nil }
 
     public mutating func add(_ id: ItemIdentity, name: String) {
-        store[id.rawValue] = name
-        save()
+        update { $0[id.rawValue] = name }
     }
 
     public mutating func remove(_ id: ItemIdentity) {
-        store[id.rawValue] = nil
-        save()
+        update { $0[id.rawValue] = nil }
     }
 
     /// Sorted by name (then identity) for a stable list.
@@ -40,7 +38,15 @@ public struct KeepList: Sendable {
             .sorted { ($0.name, $0.id.rawValue) < ($1.name, $1.id.rawValue) }
     }
 
-    private func save() {
+    /// Re-reads the persisted list before changing it, so copies of a `KeepList` (the app's, the
+    /// menu's) never overwrite each other's additions.
+    private mutating func update(_ change: (inout [String: String]) -> Void) {
+        if let defaults { store = Self.load(defaults) }
+        change(&store)
         defaults?.set(store, forKey: Self.defaultsKey)
+    }
+
+    private static func load(_ defaults: UserDefaults) -> [String: String] {
+        defaults.dictionary(forKey: defaultsKey) as? [String: String] ?? [:]
     }
 }

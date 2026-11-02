@@ -408,3 +408,28 @@ extension Snapshot {
         return item
     }
 }
+
+/// A module whose scans take the given times in turn (not cancellable), then answer at once.
+struct SlowModule: CategoryModule {
+    let id: CategoryID
+    let items: [Item]
+    private let delays: OSAllocatedUnfairLock<[TimeInterval]>
+
+    init(id: CategoryID, items: [Item], delays: [TimeInterval]) {
+        self.id = id
+        self.items = items
+        self.delays = OSAllocatedUnfairLock(initialState: delays)
+    }
+
+    func scan(_ ctx: ScanContext) async -> [Item] {
+        let delay = delays.withLock { $0.isEmpty ? 0 : $0.removeFirst() }
+        guard delay > 0 else { return items }
+        let items = self.items
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) { continuation.resume(returning: items) }
+        }
+    }
+
+    func stop(_ item: Item, ctx: ScanContext) async -> StopResult { .failed(reason: "slow") }
+    func undo(_ token: UndoToken) async -> Bool { false }
+}

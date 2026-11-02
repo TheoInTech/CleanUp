@@ -4,8 +4,9 @@ public enum StatusCalculator {
     public static let heavyDrainWatts = 20.0
     /// "Draining fast" only below this much time left.
     public static let lowMinutesLeft = 120
-    /// The drain history must hold at least this many samples (one a minute over five minutes).
-    public static let minimumDrainSamples = 5
+    /// "Sustained" is about time coverage, which the caller guarantees (the samples reach back about
+    /// five minutes); this only rules out judging from a single reading.
+    public static let minimumDrainSamples = 2
     /// `.busy` from this many cores of load.
     public static let busyCores = 4.0
 

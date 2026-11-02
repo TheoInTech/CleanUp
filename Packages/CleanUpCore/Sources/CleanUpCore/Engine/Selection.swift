@@ -50,6 +50,15 @@ public struct Selection: Equatable, Sendable {
         ticked.insert(item.id)
     }
 
+    /// Brings ticks carried over from an older snapshot in line with `s`: drops ticks for items that
+    /// are gone or no longer tickable (e.g. now in use), then unticks any engine with a running
+    /// container that isn't ticked (a container that started since). Call it on every refresh.
+    public mutating func reconcile(with s: Snapshot) {
+        let tickable = Set(s.allItems.filter(Self.isTickable).map(\.id))
+        ticked.formIntersection(tickable)
+        untickBlockedEngines(in: s)
+    }
+
     public func state(of category: CategoryID, in s: Snapshot) -> TickState {
         let tickable = s.categories.filter { $0.id == category }.flatMap(\.items).filter(Self.isTickable)
         let on = tickable.filter { ticked.contains($0.id) }.count

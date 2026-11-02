@@ -21,27 +21,39 @@ public struct CleanupReport: Sendable {
 }
 
 /// Stops ticked items through their category modules. Every module re-verifies against a context
-/// built at clean time, so a stale snapshot can never stop something that has come back into use.
+/// built at clean time. Container engines get one more check: quitting an engine stops every
+/// container in it, so just before that the containers are listed again (`docker ps`), and the
+/// engine is skipped if any of its containers is still running, ticked or not.
 public actor Cleaner {
     private let modules: [CategoryID: any CategoryModule]
     private let probe: SystemProbe
     private let undoRetries: Int
     private let undoRetryDelay: Duration
+    private let engineCheckTimeout: Duration
 
     /// `undoRetries`/`undoRetryDelay`: after relaunching a container engine, container restarts that
-    /// fail are retried while the engine comes up.
+    /// fail are retried while the engine comes up. `engineCheckTimeout`: how long the container
+    /// re-listing before quitting an engine may take; past it the engine is skipped.
     public init(
         modules: [any CategoryModule],
         probe: SystemProbe = .live,
         undoRetries: Int = 12,
-        undoRetryDelay: Duration = .seconds(5)
+        undoRetryDelay: Duration = .seconds(5),
+        engineCheckTimeout: Duration = .seconds(30)
     ) {
         var byID: [CategoryID: any CategoryModule] = [:]
-        for module in modules where byID[module.id] == nil { byID[module.id] = module }
+        for module in modules {
+            if byID[module.id] != nil {
+                assertionFailure("Cleaner: more than one module for \(module.id); only the first is used")
+                continue
+            }
+            byID[module.id] = module
+        }
         self.modules = byID
         self.probe = probe
         self.undoRetries = undoRetries
         self.undoRetryDelay = undoRetryDelay
+        self.engineCheckTimeout = engineCheckTimeout
     }
 
     /// Cleans against a fresh context (new process table, sockets and frontmost app).
@@ -51,7 +63,8 @@ public actor Cleaner {
 
     /// Everything that isn't an engine first (categories in parallel, items within a category one by
     /// one), then the engines. A container engine is skipped if one of its containers in `items`
-    /// didn't stop: quitting the engine would stop that container anyway.
+    /// didn't stop, or if a fresh listing (new context, `runExternal: true`) still shows any running
+    /// container of that engine, or can't be had: quitting the engine would stop those containers.
     public func clean(_ items: [Item], ctx: ScanContext) async -> CleanupReport {
         var results = [StopResult?](repeating: nil, count: items.count)
         let isEngine = items.map { $0.id.rawValue.hasPrefix(Selection.enginePrefix) }
@@ -73,7 +86,28 @@ public actor Cleaner {
                 engines.append(index)
             }
         }
-        for (index, result) in await stop(engines, of: items, ctx: ctx) {
+        var engineCtx = ctx
+        let containerEngines = engines.filter { Selection.engineName(of: items[$0]) != nil }
+        if !containerEngines.isEmpty {
+            let fresh = await probe.freshContext()
+            engineCtx = fresh
+            let listed = await listContainers(ctx: fresh)
+            for index in containerEngines {
+                let engine = items[index]
+                let skip: String?
+                if let listed, listed.contains(where: { $0.id == engine.id }) {
+                    let running = listed.contains { Selection.isContainer($0) && Selection.container($0, belongsTo: engine) }
+                    skip = running ? "a container is still running" : nil
+                } else {
+                    skip = "couldn't check containers"   // docker didn't answer, timed out, or no longer sees the engine
+                }
+                if let skip {
+                    results[index] = .skipped(reason: skip)
+                    engines.removeAll { $0 == index }
+                }
+            }
+        }
+        for (index, result) in await stop(engines, of: items, ctx: engineCtx) {
             results[index] = result
         }
 
@@ -149,6 +183,13 @@ public actor Cleaner {
             for await part in group { all += part }
             return all
         }
+    }
+
+    /// The containers module's items for a fresh context; nil when there is no module or it doesn't
+    /// answer in time.
+    private func listContainers(ctx: ScanContext) async -> [Item]? {
+        guard let module = modules[.containers] else { return nil }
+        return await withTimeout(Task.detached { await module.scan(ctx) }, engineCheckTimeout)
     }
 
     private func undoOne(_ token: UndoToken) async -> Bool {

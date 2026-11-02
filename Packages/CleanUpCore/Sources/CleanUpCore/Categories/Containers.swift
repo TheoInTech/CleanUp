@@ -16,10 +16,14 @@ public struct ContainerFacts: Sendable {
     public let clientConnections: Int
     /// Exact bytes in + out over the observation window (at least 10 minutes); nil until a baseline that old exists, after a counter reset, or when the counter can't be read.
     public let netBytesDelta: Int64?
+    /// Processes on this Mac whose arguments name the container: `docker exec -it`, `docker attach`,
+    /// `docker compose exec`, a VS Code / Cursor dev container. They talk over the Docker socket, so
+    /// no port, CPU or traffic counter shows them.
+    public let attachedBy: [String]
 
     public init(
         name: String, image: String, startedAt: Date, cpuPercent: Double,
-        publishedPorts: [Int], clientConnections: Int, netBytesDelta: Int64?
+        publishedPorts: [Int], clientConnections: Int, netBytesDelta: Int64?, attachedBy: [String] = []
     ) {
         self.name = name
         self.image = image
@@ -28,6 +32,7 @@ public struct ContainerFacts: Sendable {
         self.publishedPorts = publishedPorts
         self.clientConnections = clientConnections
         self.netBytesDelta = netBytesDelta
+        self.attachedBy = attachedBy
     }
 }
 
@@ -42,6 +47,11 @@ public enum ContainerJudge {
     public static func judge(_ f: ContainerFacts, now: Date) -> Judgement {
         var signals: [Signal] = []
         var reasons: [String] = []   // in-use reasons, strongest first
+
+        if let user = f.attachedBy.first {
+            signals.append(Signal(kind: .inUse, text: "\(f.attachedBy.joined(separator: ", ")) has a session open in it"))
+            reasons.append("used by \(user)")
+        }
 
         if f.clientConnections == 0 {
             if f.publishedPorts.isEmpty {
@@ -242,7 +252,11 @@ public struct ContainersModule: CategoryModule {
 
     private struct Collected: Sendable {
         let name: String
+        /// Short (12-hex) container ID from `docker ps`.
+        let id: String
         let image: String
+        /// Compose service name, when the container belongs to a compose project.
+        let service: String?
         let startedAt: Date?
         let ports: [Int]?
         let cpuPercent: Double?
@@ -351,7 +365,7 @@ public struct ContainersModule: CategoryModule {
                 samples[row.name] = history
 
                 return Collected(
-                    name: row.name, image: row.image,
+                    name: row.name, id: row.id, image: row.image, service: inspected[row.name]?.service,
                     startedAt: inspected[row.name]?.startedAt, ports: inspected[row.name]?.ports,
                     cpuPercent: cpu, netBytesDelta: delta, lowCPUSince: lowCPU[row.name]
                 )
@@ -419,13 +433,15 @@ public struct ContainersModule: CategoryModule {
     private func buildItems(_ collected: [Collected], ctx: ScanContext) -> [Item] {
         let engines = Self.detectEngines(ctx.processes)
         let proxyPIDs = engines.reduce(into: Set<Int32>()) { $0.formUnion($1.allPIDs) }
+        let sessions = collected.isEmpty ? nil : SessionIndex(ctx.processes, ownPID: ctx.ownPID)
 
         var containerItems: [Item] = []
         var verdicts: [Verdict] = []
         var allPorts = Set<Int>()
         var containersCPU = 0.0
         for c in collected.sorted(by: { $0.name < $1.name }) {
-            let item = Self.containerItem(c, engine: engines.first?.engine, proxyPIDs: proxyPIDs, ctx: ctx)
+            let users = sessions?.users(name: c.name, id: c.id, service: c.service) ?? []
+            let item = Self.containerItem(c, engine: engines.first?.engine, proxyPIDs: proxyPIDs, attachedBy: users, ctx: ctx)
             containerItems.append(item)
             verdicts.append(item.judgement.verdict)
             allPorts.formUnion(c.ports ?? [])
@@ -513,8 +529,12 @@ public struct ContainersModule: CategoryModule {
         return .none
     }
 
-    private static func containerItem(_ c: Collected, engine: ContainerEngine?, proxyPIDs: Set<Int32>, ctx: ScanContext) -> Item {
-        var detail = ["image": c.image]
+    private static func containerItem(
+        _ c: Collected, engine: ContainerEngine?, proxyPIDs: Set<Int32>, attachedBy: [String], ctx: ScanContext
+    ) -> Item {
+        var detail = ["image": c.image, "id": c.id]
+        if let service = c.service { detail["service"] = service }
+        if !attachedBy.isEmpty { detail["usedBy"] = attachedBy.joined(separator: ", ") }
         if let ports = c.ports, !ports.isEmpty { detail["ports"] = ports.map(String.init).joined(separator: ",") }
         if let engine { detail["engine"] = engine.rawValue }
 
@@ -525,7 +545,7 @@ public struct ContainersModule: CategoryModule {
             let facts = ContainerFacts(
                 name: c.name, image: c.image, startedAt: startedAt, cpuPercent: cpu, publishedPorts: ports,
                 clientConnections: clientConnections(ports: ports, sockets: ctx.sockets, excluding: proxyPIDs),
-                netBytesDelta: c.netBytesDelta
+                netBytesDelta: c.netBytesDelta, attachedBy: attachedBy
             )
             judgement = requireSustainedLowCPU(ContainerJudge.judge(facts, now: ctx.now), since: c.lowCPUSince, now: ctx.now)
         } else {
@@ -685,7 +705,7 @@ public struct ContainersModule: CategoryModule {
 
     /// Prints only what we read, so container environment variables (passwords) never leave docker.
     static let inspectTemplate =
-        #"{"Name":{{json .Name}},"State":{"StartedAt":{{json .State.StartedAt}}},"NetworkSettings":{"Ports":{{json .NetworkSettings.Ports}}}}"#
+        #"{"Name":{{json .Name}},"State":{"StartedAt":{{json .State.StartedAt}}},"NetworkSettings":{"Ports":{{json .NetworkSettings.Ports}}},"Service":{{json (index .Config.Labels "com.docker.compose.service")}}}"#
 
     private static func jsonLines<T: Decodable>(_ output: String, as: T.Type) -> [T] {
         let decoder = JSONDecoder()
@@ -700,11 +720,12 @@ public struct ContainersModule: CategoryModule {
     }
 
     /// Running containers from `docker ps --format '{{json .}}'`.
-    public static func parsePS(_ out: String) -> [(name: String, image: String)] {
-        struct Row: Decodable { let Names: String; let Image: String }
+    public static func parsePS(_ out: String) -> [(name: String, image: String, id: String)] {
+        struct Row: Decodable { let Names: String; let Image: String; let ID: String? }
         return jsonLines(out, as: Row.self).compactMap { row in
             let name = row.Names.split(separator: ",").first.map(String.init) ?? ""
-            return isSafeName(name) ? (name: name, image: row.Image) : nil
+            let id = String((row.ID ?? "").lowercased().prefix(12))
+            return isSafeName(name) ? (name: name, image: row.Image, id: id) : nil
         }
     }
 
@@ -745,8 +766,8 @@ public struct ContainersModule: CategoryModule {
         return Int64((value * scale).rounded())
     }
 
-    /// Start time and published host ports per container, from `docker inspect`.
-    static func parseInspect(_ out: String) -> [String: (startedAt: Date, ports: [Int])] {
+    /// Start time, published host ports and compose service per container, from `docker inspect`.
+    static func parseInspect(_ out: String) -> [String: (startedAt: Date, ports: [Int], service: String?)] {
         struct Binding: Decodable { let HostPort: String? }
         struct Row: Decodable {
             struct State: Decodable { let StartedAt: String }
@@ -754,15 +775,17 @@ public struct ContainersModule: CategoryModule {
             let Name: String
             let State: State
             let NetworkSettings: Network
+            let Service: String?
         }
-        var result: [String: (startedAt: Date, ports: [Int])] = [:]
+        var result: [String: (startedAt: Date, ports: [Int], service: String?)] = [:]
         for row in jsonLines(out, as: Row.self) {
             // Docker's zero date means "never started"; treat it as unknown.
             guard let started = parseDate(row.State.StartedAt), started.timeIntervalSince1970 > 946_684_800 else { continue }
             let ports = (row.NetworkSettings.Ports ?? [:]).values
                 .flatMap { $0 ?? [] }
                 .compactMap { $0.HostPort.flatMap { Int($0) } }
-            result[row.Name.hasPrefix("/") ? String(row.Name.dropFirst()) : row.Name] = (started, Array(Set(ports)).sorted())
+            let service = row.Service.flatMap { $0.isEmpty ? nil : $0 }
+            result[row.Name.hasPrefix("/") ? String(row.Name.dropFirst()) : row.Name] = (started, Array(Set(ports)).sorted(), service)
         }
         return result
     }
@@ -790,6 +813,11 @@ public struct ContainersModule: CategoryModule {
             let clients = Self.clientConnections(ports: ports, sockets: ctx.sockets, excluding: proxyPIDs)
             guard clients == 0 else {
                 return .skipped(reason: "\(item.name) now has \(clients) connection\(clients == 1 ? "" : "s")")
+            }
+            // A shell, `docker attach` or dev container may have opened since the scan.
+            if !isEngine, let user = SessionIndex(ctx.processes, ownPID: ctx.ownPID)
+                .users(name: item.name, id: item.detail["id"], service: item.detail["service"]).first {
+                return .skipped(reason: "\(item.name) is used by \(user)")
             }
         }
         if isEngine {
@@ -883,5 +911,91 @@ public struct ContainersModule: CategoryModule {
     private static func defaultLaunch(_ appPath: String) async -> Bool {
         let url = URL(fileURLWithPath: appPath)
         return (try? await NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())) != nil
+    }
+}
+
+// MARK: - Sessions into containers
+
+/// Who mentions a container on their command line. `docker exec -it`, `docker attach`, `docker
+/// compose exec` and VS Code / Cursor dev containers all go through the Docker socket, invisible to
+/// ports, CPU and traffic, but they name the container (or its ID) in their arguments.
+struct SessionIndex {
+    private struct Entry {
+        let name: String
+        let tokens: Set<String>
+        /// 12-character prefixes of the long hex tokens (container IDs) in the arguments.
+        let idPrefixes: Set<String>
+        /// A docker client: a short ID prefix typed by hand (`docker exec -it 75be sh`) counts.
+        let isDockerClient: Bool
+        let isCompose: Bool
+    }
+
+    private let entries: [Entry]
+
+    /// Every process outside CleanUp's own tree.
+    init(_ table: [Int32: ProcessInfoRecord], ownPID: Int32) {
+        let own = ProcessTree.ownTree(ownPID, in: table)
+        entries = table.values.filter { !own.contains($0.pid) }.sorted { $0.pid < $1.pid }.compactMap { p in
+            var tokens = Set<String>()
+            for argument in p.arguments.dropFirst() {
+                tokens.formUnion(Self.tokens(argument))
+                for decoded in Self.remoteAuthorities(argument) { tokens.formUnion(Self.tokens(decoded)) }
+            }
+            guard !tokens.isEmpty else { return nil }
+            let leaf = ProcessTree.leaf(p)
+            let prefixes = Set(tokens.filter { $0.count >= 12 && Self.isHex($0) }.map { String($0.prefix(12)) })
+            return Entry(
+                name: p.name.isEmpty ? leaf : p.name, tokens: tokens, idPrefixes: prefixes,
+                isDockerClient: ContainersModule.clientNames.contains(leaf),
+                isCompose: leaf == "docker-compose" || tokens.contains("compose")
+            )
+        }
+    }
+
+    /// Names of the processes naming this container, sorted, without duplicates.
+    func users(name: String, id: String?, service: String?) -> [String] {
+        let id = id.map { $0.lowercased() }.flatMap { $0.count >= 12 && Self.isHex($0) ? String($0.prefix(12)) : nil }
+        var found = Set<String>()
+        for entry in entries {
+            var hit = entry.tokens.contains(name)
+            if !hit, let id {
+                hit = entry.idPrefixes.contains(id)
+                    || (entry.isDockerClient && entry.tokens.contains { $0.count >= 4 && $0.count < 12 && id.hasPrefix($0) })
+            }
+            if !hit, let service, entry.isCompose { hit = entry.tokens.contains(service) }
+            if hit { found.insert(entry.name) }
+        }
+        return found.sorted()
+    }
+
+    /// Runs of characters a container name or ID can contain.
+    private static func tokens(_ text: String) -> [String] {
+        text.split { !($0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_" || $0 == "." || $0 == "-")) }
+            .map(String.init)
+    }
+
+    /// `vscode-remote://attached-container+<hex JSON>/…` and `dev-container+<hex>`: the JSON inside
+    /// names the container.
+    private static func remoteAuthorities(_ argument: String) -> [String] {
+        guard argument.contains("container+") else { return [] }
+        var decoded: [String] = []
+        for part in argument.components(separatedBy: "container+").dropFirst() {
+            let hex = part.prefix { $0.isHexDigit }
+            guard hex.count >= 2, hex.count % 2 == 0 else { continue }
+            var bytes: [UInt8] = []
+            var index = hex.startIndex
+            while index < hex.endIndex {
+                let next = hex.index(index, offsetBy: 2)
+                guard let byte = UInt8(hex[index..<next], radix: 16) else { break }
+                bytes.append(byte)
+                index = next
+            }
+            decoded.append(String(decoding: bytes, as: UTF8.self))
+        }
+        return decoded
+    }
+
+    private static func isHex(_ text: String) -> Bool {
+        text.allSatisfy { $0.isHexDigit && ($0.isNumber || $0.isLowercase) }
     }
 }

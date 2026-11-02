@@ -77,6 +77,7 @@ import Testing
         let rows = ContainersModule.parsePS(out)
         #expect(rows.map(\.name) == ["evone-postgres", "evone-pg-api09"])
         #expect(rows.map(\.image) == ["postgres:16", "imresamu/postgis:17-3.5"])
+        #expect(rows.map(\.id) == ["75beec90ce2f", "59883c8ca072"])
     }
 
     @Test func psSkipsUnsafeNames() {
@@ -128,6 +129,9 @@ import Testing
         #expect(info["evone-pg-api09"]?.ports == [5495])
         #expect(info["no-ports"]?.ports == [])
         #expect(info["two"]?.ports == [8080, 8081])
+        #expect(info["evone-pg-api09"]?.service == nil)
+        let compose = ContainersModule.parseInspect(#"{"Name":"/shop-db-1","State":{"StartedAt":"2026-11-01T17:35:37Z"},"NetworkSettings":{"Ports":{}},"Service":"db"}"#)
+        #expect(compose["shop-db-1"]?.service == "db")
         let started = info["evone-pg-api09"]?.startedAt
         #expect(started != nil)
         let whole = ISO8601DateFormatter().date(from: "2026-11-01T17:35:37Z")
@@ -316,6 +320,16 @@ private struct Row {
     var api: Int64? = 407_000_000
     var port: Int? = 5432
     var age: TimeInterval = .days(12)
+    /// Full 64-hex container ID; nil → derived from the name.
+    var id: String? = nil
+    var service: String? = nil
+
+    var fullID: String { id ?? Self.hexID(name) }
+
+    static func hexID(_ name: String) -> String {
+        let hex = name.utf8.map { String(format: "%02x", $0) }.joined()
+        return String((hex + String(repeating: "0", count: 64)).prefix(64))
+    }
 }
 
 private func fakeDocker(_ rows: [Row]) -> FakeDocker {
@@ -325,11 +339,12 @@ private func fakeDocker(_ rows: [Row]) -> FakeDocker {
 }
 
 private func apply(_ rows: [Row], to s: inout FakeDocker.State) {
-    s.ps = rows.map { #"{"Image":"postgres:16","Names":"\#($0.name)","Status":"Up"}"# }.joined(separator: "\n")
+    s.ps = rows.map { #"{"ID":"\#($0.fullID.prefix(12))","Image":"postgres:16","Names":"\#($0.name)","Status":"Up"}"# }.joined(separator: "\n")
     s.stats = rows.map { #"{"Name":"\#($0.name)","CPUPerc":"\#($0.cpu)","NetIO":"\#($0.net)"}"# }.joined(separator: "\n")
     s.inspect = rows.map { r in
         let ports = r.port.map { #"{"5432/tcp":[{"HostIp":"0.0.0.0","HostPort":"\#($0)"}]}"# } ?? "{}"
-        return #"{"Name":"/\#(r.name)","State":{"StartedAt":"\#(isoDate(now.addingTimeInterval(-r.age)))"},"NetworkSettings":{"Ports":\#(ports)}}"#
+        let service = r.service.map { #""\#($0)""# } ?? #""""#
+        return #"{"Name":"/\#(r.name)","State":{"StartedAt":"\#(isoDate(now.addingTimeInterval(-r.age)))"},"NetworkSettings":{"Ports":\#(ports)},"Service":\#(service)}"#
     }.joined(separator: "\n")
     s.api = [:]
     for r in rows { if let api = r.api { s.api[r.name] = api } }
@@ -381,6 +396,96 @@ private func orbStackTable() -> [Int32: ProcessInfoRecord] {
 }
 
 private let quietOrbCPU: [Int32: Double] = [10: 1, 11: 1]
+
+// MARK: - Shells, attached sessions and dev containers
+
+private let postgresID = "75beec90ce2f8a1d1e0c9b8a7f6e5d4c3b2a1908f7e6d5c4b3a2918f7e6d5c4b"
+
+/// Hex of the JSON VS Code puts in `vscode-remote://attached-container+…`.
+private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02x", $0) }.joined() }
+
+@Suite struct AttachedContainerTests {
+    private func judged(_ rows: [Row], with p: ProcessInfoRecord, name: String = "evone-postgres") async -> Item? {
+        let m = module(fakeDocker(rows))
+        let items = await scanEveryMinute(m, to: 11, processes: processTable(p))
+        return items.first { $0.id == .container(name: name) }
+    }
+
+    @Test func dockerExecByNameIsInUse() async {
+        let shell = ProcessInfoRecord.fixture(pid: 600, ppid: 50, name: "docker", path: "/usr/local/bin/docker",
+                                              arguments: ["docker", "exec", "-it", "evone-postgres", "psql"])
+        let item = await judged([Row(name: "evone-postgres")], with: shell)
+        #expect(item?.judgement.verdict == .inUse)
+        #expect(item?.judgement.fact == "used by docker")
+        #expect(item?.detail["usedBy"] == "docker")
+    }
+
+    @Test func dockerAttachByIDIsInUse() async {
+        let attach = ProcessInfoRecord.fixture(pid: 600, ppid: 50, name: "docker", path: "/usr/local/bin/docker",
+                                               arguments: ["docker", "attach", String(postgresID.prefix(12))])
+        let item = await judged([Row(name: "evone-postgres", id: postgresID)], with: attach)
+        #expect(item?.judgement.verdict == .inUse)
+        #expect(item?.detail["id"] == String(postgresID.prefix(12)))
+    }
+
+    @Test func shortIDPrefixTypedIntoADockerCommandIsInUse() async {
+        let exec = ProcessInfoRecord.fixture(pid: 600, ppid: 50, name: "docker", path: "/usr/local/bin/docker",
+                                             arguments: ["docker", "exec", "-it", "75be", "sh"])
+        #expect(await judged([Row(name: "evone-postgres", id: postgresID)], with: exec)?.judgement.verdict == .inUse)
+    }
+
+    @Test func shortHexWordsInOtherProcessesDoNotMatch() async {
+        let other = ProcessInfoRecord.fixture(pid: 600, ppid: 50, name: "node", path: "/usr/local/bin/node", arguments: ["node", "75be"])
+        #expect(await judged([Row(name: "evone-postgres", id: postgresID)], with: other)?.judgement.verdict == .idle)
+    }
+
+    @Test func fullIDInAnyProcessIsInUse() async {
+        let tail = ProcessInfoRecord.fixture(pid: 600, ppid: 50, name: "tail", path: "/usr/bin/tail",
+                                             arguments: ["tail", "-f", "/var/lib/docker/containers/\(postgresID)/x-json.log"])
+        #expect(await judged([Row(name: "evone-postgres", id: postgresID)], with: tail)?.judgement.verdict == .inUse)
+    }
+
+    @Test func vsCodeAttachedContainerIsInUse() async {
+        let uri = "vscode-remote://attached-container+" + hex(#"{"containerName":"/evone-postgres"}"#) + "/workspace"
+        let code = ProcessInfoRecord.fixture(pid: 600, ppid: 50, name: "Code Helper (Plugin)",
+                                             path: "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)",
+                                             arguments: ["Code Helper (Plugin)", "--folder-uri", uri])
+        let item = await judged([Row(name: "evone-postgres")], with: code)
+        #expect(item?.judgement.verdict == .inUse)
+        #expect(item?.judgement.fact == "used by Code Helper (Plugin)")
+    }
+
+    @Test func composeExecByServiceIsInUse() async {
+        let exec = ProcessInfoRecord.fixture(pid: 600, ppid: 50, name: "docker", path: "/usr/local/bin/docker",
+                                             arguments: ["docker", "compose", "exec", "db", "bash"])
+        let item = await judged([Row(name: "shop-db-1", service: "db")], with: exec, name: "shop-db-1")
+        #expect(item?.judgement.verdict == .inUse)
+    }
+
+    @Test func aNameInsideAnotherWordDoesNotMatch() async {
+        let backup = ProcessInfoRecord.fixture(pid: 600, ppid: 50, name: "rsync", path: "/usr/bin/rsync",
+                                               arguments: ["rsync", "/data/evone-postgres-backup", "/Volumes/x"])
+        #expect(await judged([Row(name: "evone-postgres")], with: backup)?.judgement.verdict == .idle)
+    }
+
+    @Test func cleanUpsOwnCallsDoNotCount() async {
+        let mine = ProcessInfoRecord.fixture(pid: 600, ppid: getpid(), name: "curl", path: "/usr/bin/curl",
+                                             arguments: ["curl", "http://localhost/containers/evone-postgres/stats"])
+        #expect(await judged([Row(name: "evone-postgres")], with: mine)?.judgement.verdict == .idle)
+    }
+
+    @Test func stopChecksForSessionsAgain() async throws {
+        let d = fakeDocker([Row(name: "evone-postgres", id: postgresID)])
+        let m = module(d)
+        let item = try #require(await scanEveryMinute(m, to: 11).first)
+        #expect(item.judgement.verdict == .idle)
+        let shell = processTable(.fixture(pid: 600, ppid: 50, name: "docker", path: "/usr/local/bin/docker",
+                                          arguments: ["docker", "exec", "-it", "evone-postgres", "bash"]))
+        let result = await m.stop(item, ctx: ctx(11, processes: shell))
+        #expect(result == .skipped(reason: "evone-postgres is used by docker"))
+        #expect(d.count("stop") == 0)
+    }
+}
 
 // MARK: - Engine activity
 

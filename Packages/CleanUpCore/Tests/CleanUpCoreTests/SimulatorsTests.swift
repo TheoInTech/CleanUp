@@ -254,12 +254,9 @@ private func engineTable(cpu: Double) -> ([Int32: ProcessInfoRecord], [Int32: Do
 // MARK: - Signaling
 
 @Test func terminateSignalsOwnProcessOnlyWhenStartTimeMatches() async throws {
-    // System binaries are on the never-stop list, so run a copy from a temp directory.
-    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("cleanup-signal-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: dir) }
-    let copy = dir.appendingPathComponent("napper")
-    try FileManager.default.copyItem(at: URL(fileURLWithPath: "/bin/sleep"), to: copy)
+    // System binaries are on the never-stop list, so run a (re-signed) copy from a temp directory.
+    let copy = try throwawayCopy(of: "/bin/sleep", named: "napper")
+    defer { try? FileManager.default.removeItem(at: copy.deletingLastPathComponent()) }
     let child = Process()
     child.executableURL = copy
     child.arguments = ["60"]

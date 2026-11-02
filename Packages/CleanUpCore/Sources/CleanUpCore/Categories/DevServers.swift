@@ -305,13 +305,13 @@ public struct DevServersModule: CategoryModule {
         let ownUID = getuid()
         let table = ctx.processes
 
-        var children: [Int32: [Int32]] = [:]
-        for p in table.values where p.pid != p.ppid { children[p.ppid, default: []].append(p.pid) }
+        var childRecords: [Int32: [ProcessInfoRecord]] = [:]
+        for p in table.values where p.pid != p.ppid { childRecords[p.ppid, default: []].append(p) }
         func subtree(of root: Int32) -> Set<Int32> {
             var found: Set<Int32> = [root]
             var queue = [root]
             while let pid = queue.popLast() {
-                for child in children[pid] ?? [] where found.insert(child).inserted { queue.append(child) }
+                for child in childRecords[pid] ?? [] where found.insert(child.pid).inserted { queue.append(child.pid) }
             }
             return found
         }
@@ -329,6 +329,8 @@ public struct DevServersModule: CategoryModule {
             guard let p = table[pid], !ownDescendants.contains(pid), !ownAncestors.contains(pid),
                   Self.isCandidate(p, ownUID: ownUID, home: home) else { continue }
             let root = Self.treeRoot(of: p, table: table, ownAncestors: ownAncestors)
+            // A server started by a GUI app (MCP / language server of Claude, Cursor, VS Code, Raycast…) is that app's.
+            guard !Self.isLaunchedByApp(root, table: table) else { continue }
             groups[root.pid, default: Group(root: root)].listeners.append(p)
         }
 
@@ -337,15 +339,14 @@ public struct DevServersModule: CategoryModule {
             let pids = subtree(of: group.root.pid)
             // Never list or stop a tree CleanUp itself lives in.
             guard !pids.contains(ctx.ownPID) else { continue }
-            let members = pids.compactMap { table[$0] }
-                .filter { $0.uid == ownUID && !ProcessSignaler.isProtected(path: $0.path, name: $0.name) }
-                .sorted { $0.pid < $1.pid }
+            let members = Self.members(from: group.root, children: childRecords, uid: ownUID).sorted { $0.pid < $1.pid }
             guard !members.isEmpty else { continue }
+            let memberPIDs = Set(members.map(\.pid))
 
             // The youngest listener is the conservative choice for age.
             let primary = group.listeners.min { ($1.startTime, $0.pid) < ($0.startTime, $1.pid) }!
             let ports = Set(group.listeners.flatMap { listening[$0.pid] ?? [] }).sorted()
-            let established = Self.establishedCount(ports: ports, pids: pids, sockets: ctx.sockets)
+            let established = Self.establishedCount(ports: ports, pids: memberPIDs, sockets: ctx.sockets)
 
             let command = Self.shortCommand(primary)
             let name = Self.displayName(command: command, ports: ports)
@@ -406,18 +407,41 @@ public struct DevServersModule: CategoryModule {
 
     /// Highest ancestor reachable through launcher processes (node, npm, npx, yarn, pnpm, bun). Shells,
     /// `launchd`, terminals, coding agents, other users' processes and CleanUp's own lineage never join.
-    private static func treeRoot(of listener: ProcessInfoRecord, table: [Int32: ProcessInfoRecord], ownAncestors: Set<Int32>) -> ProcessInfoRecord {
+    static func treeRoot(of listener: ProcessInfoRecord, table: [Int32: ProcessInfoRecord], ownAncestors: Set<Int32>) -> ProcessInfoRecord {
         var root = listener
         var visited: Set<Int32> = [listener.pid]
         while let parent = table[root.ppid], parent.pid > 1, visited.insert(parent.pid).inserted,
               parent.uid == listener.uid,
               lowercasedNames(parent).contains(where: launcherNames.contains),
-              !isShellOrTerminal(parent), !isAgent(parent),
+              !isShellOrTerminal(parent), !isAgent(parent), !parent.path.contains(".app/"),
               !ProcessSignaler.isProtected(path: parent.path, name: parent.name),
               !ownAncestors.contains(parent.pid) {
             root = parent
         }
         return root
+    }
+
+    /// The first ancestor above the launcher chain owns the server when it is a GUI app's process.
+    /// Shells, terminal apps, `launchd` and a missing parent are fine: a terminal's integrated shell
+    /// has `.app` ancestors above the shell, and orphans stay allowed.
+    static func isLaunchedByApp(_ root: ProcessInfoRecord, table: [Int32: ProcessInfoRecord]) -> Bool {
+        guard let parent = table[root.ppid], parent.pid > 1 else { return false }
+        if isShellOrTerminal(parent) { return false }
+        return parent.path.contains(".app/")
+    }
+
+    /// The processes of a server's tree that CleanUp may list and signal: our own user's, not protected.
+    /// Shells, terminals and coding agents are dropped together with everything below them.
+    static func members(from root: ProcessInfoRecord, children: [Int32: [ProcessInfoRecord]], uid: uid_t) -> [ProcessInfoRecord] {
+        var result: [ProcessInfoRecord] = []
+        var seen: Set<Int32> = [root.pid]
+        var queue = [root]
+        while let current = queue.popLast() {
+            if isShellOrTerminal(current) || isAgent(current) { continue }
+            if current.uid == uid, !ProcessSignaler.isProtected(path: current.path, name: current.name) { result.append(current) }
+            for child in children[current.pid] ?? [] where seen.insert(child.pid).inserted { queue.append(child) }
+        }
+        return result
     }
 
     private static func isOrphaned(_ root: ProcessInfoRecord, table: [Int32: ProcessInfoRecord]) -> Bool {
@@ -458,16 +482,15 @@ public struct DevServersModule: CategoryModule {
             return .skipped(reason: "a connection arrived")
         }
 
-        // Children spawned after the scan belong to the same tree.
+        // Children spawned after the scan belong to the same tree, except shells, terminals and agents.
         var children: [Int32: [ProcessInfoRecord]] = [:]
         for p in ctx.processes.values where p.pid != p.ppid { children[p.ppid, default: []].append(p) }
         var refs = listed
         var known = pids
-        var queue = listed.map(\.pid)
-        while let pid = queue.popLast() {
-            for child in children[pid] ?? [] where known.insert(child.pid).inserted {
-                refs.append(child.ref)
-                queue.append(child.pid)
+        for pid in listed.map(\.pid) {
+            guard let record = ctx.processes[pid] else { continue }
+            for member in Self.members(from: record, children: children, uid: getuid()) where known.insert(member.pid).inserted {
+                refs.append(member.ref)
             }
         }
 

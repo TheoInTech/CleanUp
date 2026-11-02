@@ -401,6 +401,125 @@ private let expoListen = SocketInfo(pid: 86_037, state: .listen, localPort: 8081
     #expect(items[0].judgement.fact == "watching for 30 min")
 }
 
+// MARK: - Servers owned by GUI apps
+
+private func listen(_ pid: Int32, _ port: Int = 4000) -> SocketInfo { SocketInfo(pid: pid, state: .listen, localPort: port, remotePort: nil) }
+
+private func appProcess(_ pid: Int32, ppid: Int32 = 1, name: String, path: String) -> ProcessInfoRecord {
+    .fixture(pid: pid, ppid: ppid, name: name, path: path, startedAgo: .days(3))
+}
+
+@Test func nodeSpawnedByAGUIAppIsNotListed() async {
+    let claude = [
+        appProcess(300, name: "Claude", path: "/Applications/Claude.app/Contents/MacOS/Claude"),
+        .fixture(pid: 301, ppid: 300, name: "node", path: nvmNode, arguments: ["node", "mcp-server.js"], cwd: mobileCwd, startedAgo: .days(3)),
+    ]
+    #expect(await module().scan(context(claude, sockets: [listen(301)])).isEmpty)
+
+    let cursor = [
+        appProcess(330, name: "Cursor Helper (Plugin)", path: "/Applications/Cursor.app/Contents/Frameworks/Cursor Helper (Plugin).app/Contents/MacOS/Cursor Helper (Plugin)"),
+        .fixture(pid: 331, ppid: 330, name: "node", path: nvmNode, arguments: ["node", "language-server.js"], cwd: mobileCwd, startedAgo: .days(3)),
+    ]
+    #expect(await module().scan(context(cursor, sockets: [listen(331)])).isEmpty)
+}
+
+@Test func launcherChainBelowAGUIAppIsNotListed() async {
+    // The first ancestor above npm -> node is the app helper.
+    let procs = [
+        appProcess(330, name: "Raycast Helper", path: "/Applications/Raycast.app/Contents/Frameworks/Raycast Helper.app/Contents/MacOS/Raycast Helper"),
+        .fixture(pid: 331, ppid: 330, name: "npm", path: nvmNode, arguments: ["npm", "run", "serve"], cwd: mobileCwd, startedAgo: .days(3)),
+        .fixture(pid: 332, ppid: 331, name: "node", path: nvmNode, arguments: ["node", "serve.js"], cwd: mobileCwd, startedAgo: .days(3)),
+    ]
+    #expect(await module().scan(context(procs, sockets: [listen(332)])).isEmpty)
+}
+
+@Test func terminalAppsAndIntegratedTerminalsStayCandidates() async {
+    // Terminal.app -> zsh -> node
+    let terminal = [
+        appProcess(310, name: "Terminal", path: "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"),
+        .fixture(pid: 311, ppid: 310, name: "zsh", path: "/bin/zsh", startedAgo: .days(3)),
+        .fixture(pid: 312, ppid: 311, name: "node", path: nvmNode, arguments: ["node", "server.js"], cwd: mobileCwd, startedAgo: .days(3)),
+    ]
+    #expect(await module().scan(context(terminal, sockets: [listen(312)])).count == 1)
+
+    // VS Code -> zsh -> npm -> node: the app sits above the shell, so the server is still the user's.
+    let code = [
+        appProcess(320, name: "Electron", path: "/Applications/Visual Studio Code.app/Contents/MacOS/Electron"),
+        .fixture(pid: 321, ppid: 320, name: "zsh", path: "/bin/zsh", startedAgo: .days(3)),
+        .fixture(pid: 322, ppid: 321, name: "npm", path: nvmNode, arguments: ["npm", "run", "dev"], cwd: mobileCwd, startedAgo: .days(3)),
+        .fixture(pid: 323, ppid: 322, name: "node", path: nvmNode, arguments: ["node", "server.js"], cwd: mobileCwd, startedAgo: .days(3)),
+    ]
+    let items = await module().scan(context(code, sockets: [listen(323)]))
+    #expect(items.count == 1)
+    #expect(items[0].processes.map(\.pid) == [322, 323])
+
+    // A terminal app that is the direct parent is fine too.
+    let direct = [
+        appProcess(340, name: "iTerm2", path: "/Applications/iTerm.app/Contents/MacOS/iTerm2"),
+        .fixture(pid: 341, ppid: 340, name: "node", path: nvmNode, arguments: ["node", "server.js"], cwd: mobileCwd, startedAgo: .days(3)),
+    ]
+    #expect(await module().scan(context(direct, sockets: [listen(341)])).count == 1)
+}
+
+@Test func nodeInsideAnAppBundleIsNeverUsedAsTreeRoot() async {
+    let procs = [
+        appProcess(350, name: "node", path: "/Applications/Foo.app/Contents/Resources/node"),
+        .fixture(pid: 351, ppid: 350, name: "node", path: nvmNode, arguments: ["node", "server.js"], cwd: mobileCwd, startedAgo: .days(3)),
+    ]
+    #expect(DevServersModule.treeRoot(of: procs[1], table: table(procs), ownAncestors: []).pid == 351)
+    #expect(await module().scan(context(procs, sockets: [listen(351)])).isEmpty)
+}
+
+@Test func orphanedServersStayCandidates() async {
+    let procs: [ProcessInfoRecord] = [
+        .fixture(pid: 360, ppid: 99_999, name: "node", path: nvmNode, arguments: ["node", "server.js"], cwd: mobileCwd, startedAgo: .days(3)),
+        .fixture(pid: 361, ppid: 1, name: "node", path: nvmNode, arguments: ["node", "other.js"], cwd: mobileCwd, startedAgo: .days(3)),
+    ]
+    #expect(await module().scan(context(procs, sockets: [listen(360, 4000), listen(361, 4001)])).count == 2)
+}
+
+// MARK: - Shells and agents inside the tree
+
+@Test func scanDropsShellsAndAgentsWithTheirSubtrees() async {
+    let procs: [ProcessInfoRecord] = [
+        .fixture(pid: 70, ppid: 1, name: "npm", path: nvmNode, arguments: ["npm", "run", "dev"], cwd: mobileCwd),
+        .fixture(pid: 71, ppid: 70, name: "zsh", path: "/opt/homebrew/bin/zsh", cwd: mobileCwd),
+        .fixture(pid: 72, ppid: 71, name: "node", path: nvmNode, arguments: ["node", "under-a-shell.js"], cwd: mobileCwd),
+        .fixture(pid: 73, ppid: 70, name: "node", path: nvmNode,
+                 arguments: ["node", "/Users/u/.nvm/lib/node_modules/@anthropic-ai/claude-code/cli.js"], cwd: mobileCwd),
+        .fixture(pid: 74, ppid: 70, name: "node", path: nvmNode, arguments: ["node", "/p/node_modules/.bin/vite"], cwd: mobileCwd),
+        .fixture(pid: 75, ppid: 73, name: "node", path: nvmNode, arguments: ["node", "agent-child.js"], cwd: mobileCwd),
+    ]
+    let items = await module().scan(context(procs, sockets: [listen(74, 5173)]))
+    #expect(items.count == 1)
+    #expect(items[0].processes.map(\.pid) == [70, 74])
+}
+
+@Test func agentConnectionsToTheServerStillCountAsUse() async {
+    // An agent below the server's root curling the server is a real client.
+    let procs: [ProcessInfoRecord] = [
+        .fixture(pid: 70, ppid: 1, name: "npm", path: nvmNode, arguments: ["npm", "run", "dev"], cwd: mobileCwd),
+        .fixture(pid: 74, ppid: 70, name: "node", path: nvmNode, arguments: ["node", "/p/node_modules/.bin/vite"], cwd: mobileCwd),
+        .fixture(pid: 73, ppid: 70, name: "claude", path: "/Users/u/.local/bin/claude"),
+    ]
+    let client = SocketInfo(pid: 73, state: .established, localPort: 52_000, remotePort: 5173)
+    let items = await module().scan(context(procs, sockets: [listen(74, 5173), client]))
+    #expect(items[0].judgement.fact == "1 connection")
+}
+
+@Test func stopLeavesShellChildrenAddedSinceTheScanAlone() async throws {
+    let parent = try spawnSleeper()
+    defer { parent.dispose() }
+    let shell = try spawnSleeper(parent: parent.record.pid, named: "zsh")
+    defer { shell.dispose() }
+    let item = Item.fixtureDevServer(ref: parent.record.ref)
+    let ctx = ScanContext.testContext(processes: ProcessTable.snapshot().merging([shell.record.pid: shell.record]) { _, new in new })
+    #expect(await module().stop(item, ctx: ctx) == .stopped(nil))
+    parent.process.waitUntilExit()
+    #expect(!parent.process.isRunning)
+    #expect(shell.process.isRunning)
+}
+
 // MARK: - Stop
 
 @Test func stopSkipsReusedPID() async {
@@ -416,7 +535,7 @@ private let expoListen = SocketInfo(pid: 86_037, state: .listen, localPort: 8081
 
 @Test func stopRefusesItemsThatAreInUse() async throws {
     let child = try spawnSleeper()
-    defer { child.process.terminate() }
+    defer { child.dispose() }
     let item = Item.fixtureDevServer(ref: child.record.ref, verdict: .inUse)
     guard case .skipped = await module().stop(item, ctx: .testContext(processes: [child.record.pid: child.record])) else {
         Issue.record("expected skipped"); return
@@ -426,7 +545,7 @@ private let expoListen = SocketInfo(pid: 86_037, state: .listen, localPort: 8081
 
 @Test func stopSkipsWhenAClientConnectedSinceTheScan() async throws {
     let child = try spawnSleeper()
-    defer { child.process.terminate() }
+    defer { child.dispose() }
     let item = Item.fixtureDevServer(ref: child.record.ref)
     let sockets = [SocketInfo(pid: child.record.pid, state: .established, localPort: 8081, remotePort: 55_000)]
     let r = await module().stop(item, ctx: .testContext(processes: [child.record.pid: child.record], sockets: sockets))
@@ -444,7 +563,7 @@ private let expoListen = SocketInfo(pid: 86_037, state: .listen, localPort: 8081
 
 @Test func stopTerminatesTheWholeTreeThroughTheSignaler() async throws {
     let child = try spawnSleeper()
-    defer { if child.process.isRunning { child.process.terminate() } }
+    defer { child.dispose() }
     let item = Item.fixtureDevServer(ref: child.record.ref)
     let result = await module(grace: .seconds(5)).stop(item, ctx: .testContext(processes: ProcessTable.snapshot()))
     #expect(result == .stopped(nil))
@@ -455,7 +574,7 @@ private let expoListen = SocketInfo(pid: 86_037, state: .listen, localPort: 8081
 
 @Test func stopLeavesAReusedPIDAlone() async throws {
     let child = try spawnSleeper()
-    defer { child.process.terminate() }
+    defer { child.dispose() }
     let stale = ProcessRef(pid: child.record.pid, startTime: child.record.startTime.addingTimeInterval(-100))
     let r = await module().stop(Item.fixtureDevServer(ref: stale), ctx: .testContext(processes: ProcessTable.snapshot()))
     #expect(r == .skipped(reason: "already gone"))
@@ -464,7 +583,7 @@ private let expoListen = SocketInfo(pid: 86_037, state: .listen, localPort: 8081
 
 @Test func stopEscalatesToSIGKILLForProcessesThatIgnoreSIGTERM() async throws {
     let stubborn = try spawnStubborn()
-    defer { if stubborn.process.isRunning { stubborn.process.interrupt(); kill(stubborn.record.pid, SIGKILL) } }
+    defer { stubborn.dispose() }
     let item = Item.fixtureDevServer(ref: stubborn.record.ref)
     let clock = ContinuousClock()
     let started = clock.now
@@ -477,9 +596,10 @@ private let expoListen = SocketInfo(pid: 86_037, state: .listen, localPort: 8081
 
 @Test func stopAlsoTerminatesChildrenSpawnedAfterTheScan() async throws {
     let parent = try spawnSleeper()
-    defer { parent.process.terminate() }
+    defer { parent.dispose() }
     // A child of the item's process that the item doesn't list yet.
     let kid = try spawnSleeper(parent: parent.record.pid)
+    defer { kid.dispose() }
     let item = Item.fixtureDevServer(ref: parent.record.ref)
     let ctx = ScanContext.testContext(processes: ProcessTable.snapshot().merging([kid.record.pid: kid.record]) { _, new in new })
     _ = await module().stop(item, ctx: ctx)
@@ -496,27 +616,16 @@ private let expoListen = SocketInfo(pid: 86_037, state: .listen, localPort: 8081
 private struct Spawned {
     let process: Process
     let record: ProcessInfoRecord
+
+    /// Kills the throwaway (it may ignore SIGTERM) and removes its temp directory.
+    func dispose() {
+        if process.isRunning { kill(process.processIdentifier, SIGKILL); process.waitUntilExit() }
+        try? FileManager.default.removeItem(at: URL(fileURLWithPath: record.path).deletingLastPathComponent())
+    }
 }
 
-/// A copy of a system binary in a temp directory. macOS kills a copied platform binary as soon as it
-/// runs, so the copy is re-signed ad hoc first. Unprotected path, so the signaler treats it as user software.
-private func throwawayCopy(of source: String, named name: String) throws -> URL {
-    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("devserver-test-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    let copy = dir.appendingPathComponent(name)
-    try FileManager.default.copyItem(at: URL(fileURLWithPath: source), to: copy)
-    let sign = Process()
-    sign.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-    sign.arguments = ["-f", "-s", "-", copy.path]
-    sign.standardError = FileHandle.nullDevice
-    try sign.run()
-    sign.waitUntilExit()
-    try #require(sign.terminationStatus == 0)
-    return copy
-}
-
-private func spawnSleeper(parent: Int32? = nil) throws -> Spawned {
-    let copy = try throwawayCopy(of: "/bin/sleep", named: "fake-dev-server")
+private func spawnSleeper(parent: Int32? = nil, named name: String = "fake-dev-server") throws -> Spawned {
+    let copy = try throwawayCopy(of: "/bin/sleep", named: name)
     let process = Process()
     process.executableURL = copy
     process.arguments = ["120"]

@@ -140,6 +140,24 @@ extension Item {
     }
 }
 
+/// A copy of a system binary in a temp directory. macOS kills a copied platform binary as soon as it
+/// runs, so the copy is re-signed ad hoc first. Unprotected path, so the signaler treats it as user software.
+/// The caller removes `copy.deletingLastPathComponent()` when done.
+func throwawayCopy(of source: String, named name: String) throws -> URL {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("cleanup-test-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let copy = dir.appendingPathComponent(name)
+    try FileManager.default.copyItem(at: URL(fileURLWithPath: source), to: copy)
+    let sign = Process()
+    sign.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+    sign.arguments = ["-f", "-s", "-", copy.path]
+    sign.standardError = FileHandle.nullDevice
+    try sign.run()
+    sign.waitUntilExit()
+    try #require(sign.terminationStatus == 0)
+    return copy
+}
+
 func loadFixture(_ name: String) throws -> String {
     let url = try #require(Bundle.module.url(forResource: name, withExtension: "json", subdirectory: "Fixtures"))
     return try String(contentsOf: url, encoding: .utf8)

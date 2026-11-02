@@ -464,7 +464,7 @@ extension EngineTests {
         @Test func engineIsSkippedWhenOneOfItsContainersWasNotStopped() async {
             let containers = StubModule(id: .containers, results: [.stopped(nil), .skipped(reason: "now has 1 connection")])
             let items: [Item] = [.fixtureContainer(name: "a"), .fixtureContainer(name: "b"), .fixtureEngine()]
-            let report = await Cleaner(modules: [containers]).clean(items, ctx: .testContext())
+            let report = await Cleaner(modules: [containers], probe: FakeMachine().probe).clean(items, ctx: .testContext())
             #expect(report.stopped == [.container(name: "a")])
             #expect(report.skipped.map(\.0) == [.container(name: "b"), .engine(name: "Docker Desktop")])
             #expect(!containers.log.stopped.contains(.engine(name: "Docker Desktop")))
@@ -508,6 +508,30 @@ extension EngineTests {
             #expect(!containers.log.stopped.contains(.engine(name: "Docker Desktop")))
         }
 
+        @Test func secondEngineStartingBlocksTheIdleOne() async {
+            // Snapshot: only OrbStack, idle and ticked. Since then Docker Desktop launched and a container
+            // started on OrbStack; with two engines up the module tags it "Docker Desktop" and judges both in use.
+            let listing: [Item] = [
+                .fixtureContainer(name: "new-on-orbstack", engine: "Docker Desktop"),
+                .fixtureEngine("Docker Desktop", verdict: .inUse),
+                .fixtureEngine("OrbStack", verdict: .inUse),
+            ]
+            let containers = StubModule(id: .containers, items: listing)
+            let staleOrbStack = Item.fixtureEngine("OrbStack", verdict: .idle)
+            let report = await Cleaner(modules: [containers], probe: FakeMachine().probe).clean([staleOrbStack], ctx: .testContext())
+            #expect(report.stopped.isEmpty)
+            #expect(report.skipped.map(\.0) == [.engine(name: "OrbStack")])
+            #expect(report.skipped.first?.1 == "couldn't check containers")
+            #expect(containers.log.stopped.isEmpty)
+        }
+
+        @Test func freshlyInUseEngineIsSkippedEvenWithNoContainerListed() async {
+            let containers = StubModule(id: .containers, items: [.fixtureEngine(verdict: .inUse)])
+            let report = await Cleaner(modules: [containers], probe: FakeMachine().probe).clean([.fixtureEngine()], ctx: .testContext())
+            #expect(report.skipped.first?.1 == "a container is still running")
+            #expect(containers.log.stopped.isEmpty)
+        }
+
         @Test func containerWithoutEngineInTheListingBlocksTheEngine() async {
             let containers = StubModule(id: .containers, items: [.fixtureContainer(name: "mystery", engine: nil), .fixtureEngine("OrbStack")])
             let report = await Cleaner(modules: [containers], probe: FakeMachine().probe).clean([.fixtureEngine("OrbStack")], ctx: .testContext())
@@ -545,7 +569,7 @@ extension EngineTests {
                 .fixtureSimulator(udid: "V", name: "T", verdict: .idle, cores: 1),
                 .fixture(.devServer(cwd: "/p", command: "x"), category: .devServers),   // no module for it
             ]
-            let report = await Cleaner(modules: [sims]).clean(items, ctx: .testContext())
+            let report = await Cleaner(modules: [sims], probe: FakeMachine().probe).clean(items, ctx: .testContext())
             #expect(report.undo == [token])
             #expect(report.stopped == [.simulator(udid: "U")])
             #expect(report.skipped.map(\.0) == [.simulator(udid: "V")])
@@ -568,7 +592,7 @@ extension EngineTests {
 
         @Test func noRetryWhenNoEngineCameBack() async {
             let containers = StubModule(id: .containers, undoFailing: [.container(name: "a"), .engine(name: "Docker Desktop")])
-            let cleaner = Cleaner(modules: [containers], undoRetries: 2, undoRetryDelay: .milliseconds(10))
+            let cleaner = Cleaner(modules: [containers], probe: FakeMachine().probe, undoRetries: 2, undoRetryDelay: .milliseconds(10))
             let failed = await cleaner.undo([
                 UndoToken(identity: .container(name: "a"), action: "start", arguments: ["a"]),
                 UndoToken(identity: .engine(name: "Docker Desktop"), action: "launch", arguments: ["/Applications/Docker.app"]),
@@ -586,7 +610,7 @@ extension EngineTests {
                 UndoToken(identity: .simulator(udid: "U"), action: "boot", arguments: ["U"]),
                 UndoToken(identity: .engine(name: "Docker Desktop"), action: "launch", arguments: ["/Applications/Docker.app"]),
             ]
-            let failed = await Cleaner(modules: [containers, sims]).undo(tokens)
+            let failed = await Cleaner(modules: [containers, sims], probe: FakeMachine().probe).undo(tokens)
             #expect(failed.isEmpty)
             let undone = containers.log.undone.map(\.identity)
             #expect(undone == [.engine(name: "Docker Desktop"), .container(name: "a")])
@@ -595,7 +619,7 @@ extension EngineTests {
 
         @Test func failedContainerUndoIsRetriedWhileItsEngineStarts() async {
             let containers = StubModule(id: .containers, undoFailing: [.container(name: "a")])
-            let cleaner = Cleaner(modules: [containers], undoRetries: 2, undoRetryDelay: .milliseconds(10))
+            let cleaner = Cleaner(modules: [containers], probe: FakeMachine().probe, undoRetries: 2, undoRetryDelay: .milliseconds(10))
             let tokens = [
                 UndoToken(identity: .engine(name: "Docker Desktop"), action: "launch", arguments: ["/Applications/Docker.app"]),
                 UndoToken(identity: .container(name: "a"), action: "start", arguments: ["a"]),

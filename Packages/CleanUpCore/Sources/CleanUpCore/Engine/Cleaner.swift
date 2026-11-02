@@ -23,7 +23,7 @@ public struct CleanupReport: Sendable {
 /// Stops ticked items through their category modules. Every module re-verifies against a context
 /// built at clean time. Container engines get one more check: quitting an engine stops every
 /// container in it, so just before that the containers are listed again (`docker ps`), and the
-/// engine is skipped if any of its containers is still running, ticked or not.
+/// engine is skipped unless the fresh listing judges it idle and shows none of its containers.
 public actor Cleaner {
     private let modules: [CategoryID: any CategoryModule]
     private let probe: SystemProbe
@@ -63,8 +63,8 @@ public actor Cleaner {
 
     /// Everything that isn't an engine first (categories in parallel, items within a category one by
     /// one), then the engines. A container engine is skipped if one of its containers in `items`
-    /// didn't stop, or if a fresh listing (new context, `runExternal: true`) still shows any running
-    /// container of that engine, or can't be had: quitting the engine would stop those containers.
+    /// didn't stop, or unless a fresh listing (new context, `runExternal: true`) judges the engine idle
+    /// and shows no running container of it: quitting the engine would stop those containers.
     public func clean(_ items: [Item], ctx: ScanContext) async -> CleanupReport {
         var results = [StopResult?](repeating: nil, count: items.count)
         let isEngine = items.map { $0.id.rawValue.hasPrefix(Selection.enginePrefix) }
@@ -95,9 +95,16 @@ public actor Cleaner {
             for index in containerEngines {
                 let engine = items[index]
                 let skip: String?
-                if let listed, listed.contains(where: { $0.id == engine.id }) {
+                if let listed, let fresh = listed.first(where: { $0.id == engine.id }) {
                     let running = listed.contains { Selection.isContainer($0) && Selection.container($0, belongsTo: engine) }
-                    skip = running ? "a container is still running" : nil
+                    if fresh.judgement.verdict != .idle {
+                        // With several engines up, the module can't tell which hosts each container
+                        // (it tags them all with one) and judges every engine in use.
+                        let engineCount = listed.filter { Selection.engineName(of: $0) != nil }.count
+                        skip = engineCount > 1 ? "couldn't check containers" : "a container is still running"
+                    } else {
+                        skip = running ? "a container is still running" : nil
+                    }
                 } else {
                     skip = "couldn't check containers"   // docker didn't answer, timed out, or no longer sees the engine
                 }

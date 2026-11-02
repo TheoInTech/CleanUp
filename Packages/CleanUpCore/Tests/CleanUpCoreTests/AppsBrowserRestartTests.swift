@@ -95,6 +95,31 @@ private func appsModule(
         #expect(item.detail["pid"] == "10")
     }
 
+    @Test func containerEnginesAndTheSimulatorAreNotApps() async {
+        // Quitting them stops containers or simulators: they are judged as engines, with their guards.
+        let apps: [RunningAppInfo] = [
+            .fixture("com.docker.docker", name: "Docker Desktop", path: "/Applications/Docker.app", pid: 20),
+            .fixture("dev.kdrag0n.MacVirt", name: "OrbStack", path: "/Applications/OrbStack.app", pid: 21),
+            .fixture("com.apple.iphonesimulator", name: "Simulator", path: "/Applications/Xcode.app/Contents/Developer/Applications/Simulator.app", pid: 22),
+            .fixture("com.valvesoftware.steam", pid: 10),
+        ]
+        let items = await appsModule(apps).scan(.testContext())
+        #expect(items.map(\.id) == [.app(bundleID: "com.valvesoftware.steam")])
+    }
+
+    @Test func busyTabsListedOnTheirOwnAreNotCountedAgainInTheirBrowser() async throws {
+        let bundle = "/Applications/Brave Browser.app"
+        let main = ProcessInfoRecord.fixture(pid: 30, path: bundle + "/Contents/MacOS/Brave Browser")
+        let busyTab = ProcessInfoRecord.fixture(pid: 31, name: "Brave Browser Helper (Renderer)",
+                                                path: bundle + "/Contents/Frameworks/Brave Browser Framework.framework/Helpers/Brave Browser Helper (Renderer).app/Contents/MacOS/Brave Browser Helper (Renderer)")
+        let quietTab = ProcessInfoRecord.fixture(pid: 32, name: "Brave Browser Helper (Renderer)", path: busyTab.path)
+        let ctx = ScanContext.testContext(processes: processTable(main, busyTab, quietTab), cpu: [30: 10, 31: 140, 32: 20])
+        let tabs = await BrowserTabsModule().scan(ctx)
+        #expect(tabs.map(\.id) == [.browserTab(pid: 31)])
+        let brave = try #require(await appsModule([.fixture("com.brave.Browser", name: "Brave Browser", path: bundle, pid: 30)]).scan(ctx).first)
+        #expect(abs(brave.cores - 0.3) < 0.0001)   // the browser and its quiet tab; the busy tab is its own row
+    }
+
     // MARK: stop / undo
 
     private func steamItem(_ module: AppsModule) async throws -> Item {
@@ -141,7 +166,7 @@ private func appsModule(
     @Test func stopRefusesProtectedApps() async {
         let log = CallLog<AppTerminationRequest>()
         let module = appsModule([], terminator: { await log.add($0); return .quit })
-        for bundleID in ["com.apple.finder", "com.apple.dock", "io.cleanup.CleanUp"] {
+        for bundleID in ["com.apple.finder", "com.apple.dock", "io.cleanup.CleanUp", "com.docker.docker", "dev.kdrag0n.MacVirt", "com.apple.iphonesimulator"] {
             let item = Item(
                 id: .app(bundleID: bundleID), category: .apps, name: "X", symbol: "app",
                 judgement: Judgement(verdict: .manual, fact: "", signals: []), cores: 0, memoryBytes: 0,

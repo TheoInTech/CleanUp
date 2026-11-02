@@ -92,8 +92,12 @@ public typealias AppTerminator = @Sendable (AppTerminationRequest) async -> AppT
 public struct AppsModule: CategoryModule {
     public var id: CategoryID { .apps }
 
-    /// Never offered, whatever else is true.
-    static let neverOffered: Set<String> = ["com.apple.finder", "com.apple.dock", "io.cleanup.CleanUp"]
+    /// Never offered, whatever else is true. Docker Desktop, OrbStack and the Simulator are engines:
+    /// quitting one stops containers or simulators, so they are judged (and guarded) as engines only.
+    static let neverOffered: Set<String> = [
+        "com.apple.finder", "com.apple.dock", "io.cleanup.CleanUp",
+        "com.docker.docker", "dev.kdrag0n.MacVirt", "com.apple.iphonesimulator",
+    ]
     /// `launchDate` is set by LaunchServices a moment after the kernel starts the process.
     static let launchDateTolerance: TimeInterval = 30
 
@@ -145,6 +149,8 @@ public struct AppsModule: CategoryModule {
     private static func item(for app: RunningAppInfo, ctx: ScanContext, trackingSince: Date) -> Item {
         let prefix = app.bundlePath.hasSuffix("/") ? app.bundlePath : app.bundlePath + "/"
         let owned = ctx.processes.values.filter { $0.path.hasPrefix(prefix) }.sorted { $0.pid < $1.pid }
+        // A busy tab is its own Browser tabs row; counting it here too would show its cores twice.
+        let counted = owned.filter { !BrowserTabsModule.isListed($0, cpu: ctx.cpu) }
         let launched = ctx.processes[app.pid]?.startTime
 
         // The later of last-in-front and launch: an activation recorded before a relaunch is stale.
@@ -172,7 +178,7 @@ public struct AppsModule: CategoryModule {
                 fact: fact,
                 signals: [age, Signal(kind: .neutral, text: "Only you can say whether you still need it")]
             ),
-            cores: owned.reduce(0.0) { $0 + (ctx.cpu[$1.pid] ?? 0) } / 100,
+            cores: counted.reduce(0.0) { $0 + (ctx.cpu[$1.pid] ?? 0) } / 100,
             memoryBytes: owned.reduce(0) { $0 + $1.residentBytes },
             processes: owned.map(\.ref),
             detail: ["bundleID": app.bundleID, "bundlePath": app.bundlePath, "pid": String(app.pid)]

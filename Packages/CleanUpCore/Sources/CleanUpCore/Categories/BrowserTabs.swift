@@ -16,11 +16,16 @@ public struct BrowserTabsModule: CategoryModule {
 
     public init() {}
 
+    /// The process is listed as a tab item of its own: one of our renderers above the threshold.
+    static func isListed(_ process: ProcessInfoRecord, cpu: [Int32: Double]) -> Bool {
+        guard process.uid == getuid(), let usage = cpu[process.pid], usage > busyThreshold else { return false }
+        return browserName(for: process) != nil
+    }
+
     public func scan(_ ctx: ScanContext) async -> [Item] {
         var items: [Item] = []
-        for process in ctx.processes.values.sorted(by: { $0.pid < $1.pid }) where process.uid == getuid() {
-            guard let cpu = ctx.cpu[process.pid], cpu > Self.busyThreshold,
-                  let browser = Self.browserName(for: process) else { continue }
+        for process in ctx.processes.values.sorted(by: { $0.pid < $1.pid }) where Self.isListed(process, cpu: ctx.cpu) {
+            guard let cpu = ctx.cpu[process.pid], let browser = Self.browserName(for: process) else { continue }
             let cores = cpu / 100
             let usage = String(format: "%.1f", cores)
             let isWebKit = browser == Self.webKitName

@@ -1,0 +1,59 @@
+name: CleanUp
+options:
+  bundleIdPrefix: io.cleanup
+  deploymentTarget:
+    macOS: "26.0"
+configFiles:
+  Debug: Config/Team.xcconfig
+  Release: Config/Team.xcconfig
+settings:
+  base:
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+    SWIFT_VERSION: "6.0"
+    CODE_SIGN_STYLE: Automatic
+packages:
+  CleanUpCore:
+    path: Packages/CleanUpCore
+targets:
+  CleanUp:
+    type: application
+    platform: macOS
+    sources:
+      - App
+    dependencies:
+      - package: CleanUpCore
+      - target: CleanUpWidget
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.cleanup.CleanUp
+        INFOPLIST_FILE: App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: App/CleanUp.entitlements
+        ENABLE_APP_SANDBOX: NO
+        ENABLE_HARDENED_RUNTIME: YES
+        GENERATE_INFOPLIST_FILE: NO
+  CleanUpWidget:
+    type: app-extension
+    platform: macOS
+    sources:
+      - Widget
+    dependencies:
+      - package: CleanUpCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.cleanup.CleanUp.Widget
+        INFOPLIST_FILE: Widget/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Widget/CleanUpWidget.entitlements
+        ENABLE_APP_SANDBOX: YES
+        ENABLE_HARDENED_RUNTIME: YES
+        GENERATE_INFOPLIST_FILE: NO
+        SKIP_INSTALL: YES
+schemes:
+  CleanUp:
+    build:
+      targets:
+        CleanUp: all
+    run:
+      config: Debug
+    test:
+      config: Debug

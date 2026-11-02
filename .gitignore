@@ -1,1 +1,8 @@
 .superpowers/
+build/
+DerivedData/
+*.xcodeproj/xcuserdata
+.DS_Store
+Config/Team.xcconfig
+CleanUp.xcodeproj/
+.build/

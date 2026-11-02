@@ -1,0 +1,3 @@
+// Copy to Config/Team.xcconfig and set your Apple Developer Team ID.
+// Team.xcconfig is git-ignored; this is the only place the Team ID lives.
+DEVELOPMENT_TEAM = YOUR_TEAM_ID

@@ -69,3 +69,19 @@ import Testing
     let data = try JSONEncoder().encode([ItemIdentity.restart])
     #expect(String(decoding: data, as: UTF8.self) == "[\"restart\"]")
 }
+
+@Test func quickSummaryRoundTripsAndOldJSONReadsAsZero() throws {
+    let s = Snapshot.empty.withQuickSummary(idleCount: 15, freedCores: 6.1)
+    let decoded = try JSONDecoder().decode(Snapshot.self, from: JSONEncoder().encode(s))
+    #expect(decoded.idleCount == 15)
+    #expect(decoded.freedCores == 6.1)
+    #expect(decoded == s)
+
+    // JSON written before the two fields existed.
+    var object = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(s)) as? [String: Any])
+    object["idleCount"] = nil
+    object["freedCores"] = nil
+    let old = try JSONDecoder().decode(Snapshot.self, from: JSONSerialization.data(withJSONObject: object))
+    #expect(old.idleCount == 0)
+    #expect(old.freedCores == 0)
+}

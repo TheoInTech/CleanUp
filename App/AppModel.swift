@@ -162,19 +162,25 @@ final class AppModel {
         selection.reconcile(with: fresh)
         hasScanned = true
 
-        writeSnapshot(fresh)
+        let quick = quickSelection
+        let widgetChanged = fresh.mood != oldMood || quick.count != oldIdle
         warnIfDrainingFast(fresh)
-        if fresh.mood != oldMood || quickSelection.count != oldIdle {
-            WidgetCenter.shared.reloadAllTimelines()
-        }
+        // The widget can't read the Always-kept list, so it gets the idle count from here.
+        writeSnapshot(
+            fresh.withQuickSummary(idleCount: quick.count, freedCores: quick.freedCores(in: fresh)),
+            reloadWidgets: widgetChanged
+        )
     }
 
-    private func writeSnapshot(_ s: Snapshot) {
+    /// Shares the snapshot with the widget; when `reloadWidgets`, asks WidgetKit to redraw only after
+    /// the file is written, so the widget never reads the previous snapshot.
+    private func writeSnapshot(_ s: Snapshot, reloadWidgets: Bool) {
         guard let groupID, !groupID.hasPrefix(".") else { return }
         let log = self.log
         Task.detached(priority: .utility) {
             do {
                 try SnapshotStore.write(s, groupID: groupID)
+                if reloadWidgets { WidgetCenter.shared.reloadAllTimelines() }
             } catch {
                 log.error("Snapshot not shared: \(String(describing: error), privacy: .public)")
             }

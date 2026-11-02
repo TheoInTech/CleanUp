@@ -37,6 +37,8 @@ targets:
     platform: macOS
     sources:
       - Widget
+      - App/Views/RingView.swift
+      - App/Views/Palette.swift
     dependencies:
       - package: CleanUpCore
     settings:

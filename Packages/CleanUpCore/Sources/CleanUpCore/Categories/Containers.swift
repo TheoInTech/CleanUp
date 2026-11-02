@@ -1,0 +1,567 @@
+import AppKit
+import Darwin
+import Foundation
+import os
+
+// MARK: - Facts and judgement
+
+public struct ContainerFacts: Sendable {
+    public let name: String
+    public let image: String
+    public let startedAt: Date
+    /// Docker's figure: 100 = one full core.
+    public let cpuPercent: Double
+    public let publishedPorts: [Int]
+    /// Established TCP connections on this Mac to one of the published ports, engine proxies excluded.
+    public let clientConnections: Int
+    /// Bytes in + out since the previous scan; nil on the first scan or after a counter reset.
+    public let netBytesDelta: Int64?
+
+    public init(
+        name: String, image: String, startedAt: Date, cpuPercent: Double,
+        publishedPorts: [Int], clientConnections: Int, netBytesDelta: Int64?
+    ) {
+        self.name = name
+        self.image = image
+        self.startedAt = startedAt
+        self.cpuPercent = cpuPercent
+        self.publishedPorts = publishedPorts
+        self.clientConnections = clientConnections
+        self.netBytesDelta = netBytesDelta
+    }
+}
+
+public enum ContainerJudge {
+    /// A container must have been up this long before it counts as idle.
+    public static let minimumAge: TimeInterval = 6 * 3_600
+    public static let idleCPUPercent = 1.0
+    /// Keep-alives and health checks stay below this between two scans.
+    public static let idleNetBytes: Int64 = 4_096
+
+    /// Idle only when every condition holds; anything unknown is in use.
+    public static func judge(_ f: ContainerFacts, now: Date) -> Judgement {
+        var signals: [Signal] = []
+        var reasons: [String] = []   // in-use reasons, strongest first
+
+        if f.clientConnections == 0 {
+            signals.append(Signal(kind: .idle, text: "Nothing is connected to it"))
+        } else {
+            let text = f.clientConnections == 1 ? "1 connection" : "\(f.clientConnections) connections"
+            signals.append(Signal(kind: .inUse, text: "\(text) open to its ports"))
+            reasons.append(text)
+        }
+
+        let cpu = String(format: "%.1f", f.cpuPercent)
+        if f.cpuPercent < idleCPUPercent {
+            signals.append(Signal(kind: .idle, text: "Using \(cpu)% of a core"))
+        } else {
+            signals.append(Signal(kind: .inUse, text: "Using \(cpu)% of a core"))
+            reasons.append("busy")
+        }
+
+        switch f.netBytesDelta {
+        case .none:
+            signals.append(Signal(kind: .inUse, text: "Network traffic not measured yet"))
+            reasons.append("measuring traffic")
+        case let delta? where delta < idleNetBytes:
+            signals.append(Signal(kind: .idle, text: "No network traffic since the last check"))
+        case let delta?:
+            signals.append(Signal(kind: .inUse, text: "\(delta / 1_024) kB of network traffic since the last check"))
+            reasons.append("busy")
+        }
+
+        let age = now.timeIntervalSince(f.startedAt)
+        if age >= minimumAge {
+            signals.append(Signal(kind: .idle, text: "Running for \(RelativeAge.short(age))"))
+        } else {
+            signals.append(Signal(kind: .inUse, text: "Started \(RelativeAge.short(age)) ago"))
+            reasons.append("just started")
+        }
+
+        if let reason = reasons.first {
+            return Judgement(verdict: .inUse, fact: reason, signals: signals)
+        }
+        return Judgement(verdict: .idle, fact: "idle \(RelativeAge.short(age))", signals: signals)
+    }
+}
+
+// MARK: - Engines
+
+public enum ContainerEngine: String, Codable, Sendable, CaseIterable {
+    case dockerDesktop = "Docker Desktop"
+    case orbStack = "OrbStack"
+    case colima = "Colima"
+}
+
+/// A running container engine and the processes that belong to it.
+struct DetectedEngine: Sendable {
+    let engine: ContainerEngine
+    /// The engine's own processes (signal-able ones; never includes `vm`).
+    let processes: [ProcessInfoRecord]
+    /// The Virtualization.framework VM process that hosts the engine's Linux VM. It lives under
+    /// /System, so it counts toward the engine's CPU and memory but is never signalled.
+    let vm: [ProcessInfoRecord]
+    /// The `.app` bundle to quit; nil for Colima.
+    let appPath: String?
+
+    var allPIDs: Set<Int32> { Set((processes + vm).map(\.pid)) }
+}
+
+// MARK: - Module
+
+public struct ContainersModule: CategoryModule {
+    public var id: CategoryID { .containers }
+
+    public typealias Run = @Sendable (String, [String]) async -> CommandResult
+    /// Quits / relaunches the app bundle at the given path; true when the request was made.
+    public typealias AppAction = @Sendable (String) async -> Bool
+
+    static let engineIdentityPrefix = "engine:"
+
+    private let run: Run
+    private let quitApp: AppAction
+    private let launchApp: AppAction
+
+    private struct Collected: Sendable {
+        let name: String
+        let image: String
+        let startedAt: Date?
+        let ports: [Int]?
+        let cpuPercent: Double?
+        let netBytesDelta: Int64?
+    }
+
+    private struct Memory: Sendable {
+        /// nil → docker hasn't answered successfully (or has never been asked).
+        var collected: [Collected]?
+        /// Total NetIO bytes per container at the previous successful `docker stats`.
+        var lastNet: [String: Int64] = [:]
+    }
+
+    private let memory = OSAllocatedUnfairLock(initialState: Memory())
+
+    public init(run: Run? = nil, quitApp: AppAction? = nil, launchApp: AppAction? = nil) {
+        self.run = run ?? { await Self.defaultRun($0, $1) }
+        self.quitApp = quitApp ?? { await Self.defaultQuit($0) }
+        self.launchApp = launchApp ?? { await Self.defaultLaunch($0) }
+    }
+
+    // MARK: scan
+
+    public func scan(_ ctx: ScanContext) async -> [Item] {
+        let collected: [Collected]?
+        if ctx.runExternal {
+            collected = await collect()
+        } else {
+            collected = memory.withLock { $0.collected }
+        }
+        // Docker missing, daemon down, or never asked: claim nothing.
+        guard let collected else { return [] }
+        return Self.buildItems(collected, ctx: ctx)
+    }
+
+    /// Runs docker (3 commands) and remembers the answer. nil when the daemon doesn't answer.
+    private func collect() async -> [Collected]? {
+        let ps = await run("docker", ["ps", "--format", "{{json .}}"])
+        guard ps.status == 0, !ps.timedOut else {
+            memory.withLock { $0 = Memory() }
+            return nil
+        }
+        let running = Self.parsePS(ps.stdout)
+        guard !running.isEmpty else {
+            memory.withLock { $0 = Memory(collected: []) }
+            return []
+        }
+
+        async let statsResult = run("docker", ["stats", "--no-stream", "--format", "{{json .}}"])
+        async let inspectResult = run("docker", ["inspect", "--format", Self.inspectTemplate] + running.map(\.name))
+        let stats = await statsResult
+        let inspect = await inspectResult
+        let statsByName = (stats.status == 0 && !stats.timedOut) ? Self.parseStats(stats.stdout) : [:]
+        let inspected = (inspect.status == 0 && !inspect.timedOut) ? Self.parseInspect(inspect.stdout) : [:]
+
+        let result = memory.withLock { state -> [Collected] in
+            var net: [String: Int64] = [:]
+            let rows = running.map { row -> Collected in
+                let stat = statsByName[row.name]
+                var delta: Int64?
+                if let stat {
+                    net[row.name] = stat.netIOBytes
+                    if let before = state.lastNet[row.name], stat.netIOBytes >= before { delta = stat.netIOBytes - before }
+                }
+                return Collected(
+                    name: row.name, image: row.image,
+                    startedAt: inspected[row.name]?.startedAt, ports: inspected[row.name]?.ports,
+                    cpuPercent: stat?.cpu, netBytesDelta: delta
+                )
+            }
+            state.lastNet = net
+            state.collected = rows
+            return rows
+        }
+        return result
+    }
+
+    // MARK: items
+
+    private static func buildItems(_ collected: [Collected], ctx: ScanContext) -> [Item] {
+        let engines = detectEngines(ctx.processes)
+        let proxyPIDs = engines.reduce(into: Set<Int32>()) { $0.formUnion($1.allPIDs) }
+
+        var containerItems: [Item] = []
+        var verdicts: [Verdict] = []
+        var allPorts = Set<Int>()
+        for c in collected.sorted(by: { $0.name < $1.name }) {
+            let item = containerItem(c, engine: engines.first?.engine, proxyPIDs: proxyPIDs, ctx: ctx)
+            containerItems.append(item)
+            verdicts.append(item.judgement.verdict)
+            allPorts.formUnion(c.ports ?? [])
+        }
+
+        // Two engines can run at once but the docker CLI talks to only one of them, so we can't say
+        // whose containers these are, or whether the other engine hosts any: never offer to quit.
+        let engineItems = engines.map { engineItem($0, verdicts: verdicts, ambiguous: engines.count > 1, ports: allPorts, ctx: ctx) }
+        return containerItems + engineItems
+    }
+
+    private static func containerItem(_ c: Collected, engine: ContainerEngine?, proxyPIDs: Set<Int32>, ctx: ScanContext) -> Item {
+        var detail = ["image": c.image]
+        if let ports = c.ports, !ports.isEmpty { detail["ports"] = ports.map(String.init).joined(separator: ",") }
+        if let engine { detail["engine"] = engine.rawValue }
+
+        let judgement: Judgement
+        var cores = 0.0
+        if let startedAt = c.startedAt, let ports = c.ports, let cpu = c.cpuPercent {
+            cores = cpu / 100
+            let facts = ContainerFacts(
+                name: c.name, image: c.image, startedAt: startedAt, cpuPercent: cpu, publishedPorts: ports,
+                clientConnections: clientConnections(ports: ports, sockets: ctx.sockets, excluding: proxyPIDs),
+                netBytesDelta: c.netBytesDelta
+            )
+            judgement = ContainerJudge.judge(facts, now: ctx.now)
+        } else {
+            judgement = Judgement(
+                verdict: .inUse, fact: "can't read its state",
+                signals: [Signal(kind: .inUse, text: "Docker didn't report its start time, ports or usage")]
+            )
+        }
+        return Item(
+            id: .container(name: c.name), category: .containers, name: c.name, symbol: "shippingbox",
+            judgement: judgement, cores: cores, memoryBytes: 0, processes: [], detail: detail
+        )
+    }
+
+    private static func engineItem(_ e: DetectedEngine, verdicts: [Verdict], ambiguous: Bool, ports: Set<Int>, ctx: ScanContext) -> Item {
+        let judgement = ambiguous
+            ? Judgement(verdict: .inUse, fact: "another engine is running",
+                        signals: [Signal(kind: .inUse, text: "More than one container engine is running, so we can't tell which one hosts the containers")])
+            : engineJudgement(containerVerdicts: verdicts)
+        let all = e.processes + e.vm
+        var detail = ["containers": String(verdicts.count)]
+        if let appPath = e.appPath { detail["appPath"] = appPath }
+        if !ports.isEmpty { detail["ports"] = ports.sorted().map(String.init).joined(separator: ",") }
+        return Item(
+            id: .engine(name: e.engine.rawValue), category: .containers, name: e.engine.rawValue, symbol: "gearshape.2",
+            judgement: judgement,
+            cores: all.reduce(0.0) { $0 + (ctx.cpu[$1.pid] ?? 0) } / 100,
+            memoryBytes: all.reduce(0) { $0 + $1.residentBytes },
+            processes: e.processes.map(\.ref),
+            detail: detail
+        )
+    }
+
+    /// Idle iff no container is running or every running container is idle.
+    public static func engineJudgement(containerVerdicts: [Verdict]) -> Judgement {
+        let busy = containerVerdicts.filter { $0 != .idle }.count
+        if busy > 0 {
+            let text = busy == 1 ? "1 container in use" : "\(busy) containers in use"
+            return Judgement(verdict: .inUse, fact: text, signals: [Signal(kind: .inUse, text: "\(busy) of \(containerVerdicts.count) running containers are in use")])
+        }
+        let state = containerVerdicts.isEmpty
+            ? Signal(kind: .idle, text: "No containers are running")
+            : Signal(kind: .idle, text: "Every running container is idle")
+        return Judgement(
+            verdict: .idle, fact: "idle engine",
+            signals: [state, Signal(kind: .neutral, text: "Stopping it also stops its containers")]
+        )
+    }
+
+    /// Established connections to any of `ports` from anything but the engine's own proxy processes.
+    static func clientConnections(ports: [Int], sockets: [SocketInfo], excluding engine: Set<Int32>) -> Int {
+        let published = Set(ports)
+        guard !published.isEmpty else { return 0 }
+        return sockets.filter { socket in
+            guard socket.state == .established, !engine.contains(socket.pid), let remote = socket.remotePort else { return false }
+            return published.contains(remote)
+        }.count
+    }
+
+    // MARK: engine detection
+
+    private static let vmLeaf = "com.apple.Virtualization.VirtualMachine"
+    /// Longest gap between an engine starting its VM launcher and the VM process appearing.
+    private static let vmAttributionWindow: TimeInterval = 120
+
+    static func detectEngines(_ table: [Int32: ProcessInfoRecord]) -> [DetectedEngine] {
+        let uid = getuid()
+        var members: [ContainerEngine: [ProcessInfoRecord]] = [:]
+        var vms: [ProcessInfoRecord] = []
+        for p in table.values where p.uid == uid {
+            if p.path.contains(vmLeaf) || p.name.hasPrefix("com.apple.Virtualization.Virtual") {
+                vms.append(p)
+            } else if let engine = engine(of: p) {
+                members[engine, default: []].append(p)
+            }
+        }
+
+        // The VM process is spawned via XPC (its parent is launchd), so pair it with the engine whose
+        // VM launcher started closest before it.
+        var anchors: [(engine: ContainerEngine, start: Date)] = []
+        for (engine, processes) in members {
+            for p in processes where isVMLauncher(p, engine) { anchors.append((engine, p.startTime)) }
+        }
+        var vmByEngine: [ContainerEngine: [ProcessInfoRecord]] = [:]
+        for vm in vms {
+            let best = anchors
+                .map { (engine: $0.engine, gap: vm.startTime.timeIntervalSince($0.start)) }
+                .filter { $0.gap >= -2 && $0.gap <= vmAttributionWindow }
+                .min { $0.gap < $1.gap }
+            if let best { vmByEngine[best.engine, default: []].append(vm) }
+        }
+
+        return ContainerEngine.allCases.compactMap { engine in
+            guard let processes = members[engine], !processes.isEmpty else { return nil }
+            return DetectedEngine(
+                engine: engine,
+                processes: processes.sorted { $0.pid < $1.pid },
+                vm: (vmByEngine[engine] ?? []).sorted { $0.pid < $1.pid },
+                appPath: appBundle(of: processes, engine: engine)
+            )
+        }
+    }
+
+    private static func leaf(_ p: ProcessInfoRecord) -> String { (p.path as NSString).lastPathComponent }
+
+    private static func engine(of p: ProcessInfoRecord) -> ContainerEngine? {
+        if p.path.contains("/Docker.app/Contents/MacOS/") { return .dockerDesktop }
+        if p.path.contains("/OrbStack.app/") { return .orbStack }
+        let name = leaf(p)
+        guard name == "limactl" || name == "colima" || name.hasPrefix("qemu-system") else { return nil }
+        let args = p.arguments.joined(separator: " ")
+        if args.contains("/.colima/") || args.contains("_lima/colima") { return .colima }
+        if name == "colima", p.arguments.contains("daemon") { return .colima }
+        return nil
+    }
+
+    private static func isVMLauncher(_ p: ProcessInfoRecord, _ engine: ContainerEngine) -> Bool {
+        switch engine {
+        case .dockerDesktop: leaf(p) == "com.docker.virtualization"
+        case .colima: leaf(p) == "limactl" && p.arguments.contains("hostagent")
+        case .orbStack: false
+        }
+    }
+
+    private static func appBundle(of processes: [ProcessInfoRecord], engine: ContainerEngine) -> String? {
+        let bundle: String
+        switch engine {
+        case .dockerDesktop: bundle = "Docker.app"
+        case .orbStack: bundle = "OrbStack.app"
+        case .colima: return nil
+        }
+        for p in processes {
+            var components = (p.path as NSString).pathComponents
+            if let index = components.firstIndex(of: bundle) {
+                components = Array(components.prefix(index + 1))
+                return NSString.path(withComponents: components)
+            }
+        }
+        return nil
+    }
+
+    // MARK: parsing
+
+    /// Prints only what we read, so container environment variables (passwords) never leave docker.
+    static let inspectTemplate =
+        #"{"Name":{{json .Name}},"State":{"StartedAt":{{json .State.StartedAt}}},"NetworkSettings":{"Ports":{{json .NetworkSettings.Ports}}}}"#
+
+    private static func jsonLines<T: Decodable>(_ output: String, as: T.Type) -> [T] {
+        let decoder = JSONDecoder()
+        return output.split(whereSeparator: \.isNewline).compactMap { try? decoder.decode(T.self, from: Data($0.utf8)) }
+    }
+
+    /// Container names Docker accepts; anything else is never passed to a command line.
+    static func isSafeName(_ name: String) -> Bool {
+        guard let first = name.unicodeScalars.first, name.utf8.count <= 255,
+              CharacterSet.alphanumerics.contains(first), first.isASCII else { return false }
+        return name.unicodeScalars.allSatisfy { $0.isASCII && (CharacterSet.alphanumerics.contains($0) || "_.-".unicodeScalars.contains($0)) }
+    }
+
+    /// Running containers from `docker ps --format '{{json .}}'`.
+    public static func parsePS(_ out: String) -> [(name: String, image: String)] {
+        struct Row: Decodable { let Names: String; let Image: String }
+        return jsonLines(out, as: Row.self).compactMap { row in
+            let name = row.Names.split(separator: ",").first.map(String.init) ?? ""
+            return isSafeName(name) ? (name: name, image: row.Image) : nil
+        }
+    }
+
+    /// CPU % and total network bytes per container from `docker stats --no-stream --format '{{json .}}'`.
+    /// Rows docker couldn't measure (`--`) are left out.
+    public static func parseStats(_ out: String) -> [String: (cpu: Double, netIOBytes: Int64)] {
+        struct Row: Decodable { let Name: String; let CPUPerc: String; let NetIO: String }
+        var result: [String: (cpu: Double, netIOBytes: Int64)] = [:]
+        for row in jsonLines(out, as: Row.self) {
+            guard row.CPUPerc.hasSuffix("%"), let cpu = Double(row.CPUPerc.dropLast()), cpu.isFinite,
+                  let net = parseNetIO(row.NetIO) else { continue }
+            result[row.Name] = (cpu: cpu, netIOBytes: net)
+        }
+        return result
+    }
+
+    /// "1.2MB / 3.4MB" → bytes in + out. Docker prints decimal units (kB, MB, GB).
+    static func parseNetIO(_ text: String) -> Int64? {
+        let sides = text.split(separator: "/", omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespaces) }
+        guard sides.count == 2 else { return nil }
+        var total: Int64 = 0
+        for side in sides {
+            guard let bytes = parseSize(side) else { return nil }
+            total += bytes
+        }
+        return total
+    }
+
+    private static let sizeUnits: [String: Double] = [
+        "B": 1, "kB": 1e3, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12,
+        "KiB": 1_024, "MiB": 1_048_576, "GiB": 1_073_741_824, "TiB": 1_099_511_627_776,
+    ]
+
+    private static func parseSize(_ text: String) -> Int64? {
+        let number = text.prefix { $0.isNumber || $0 == "." }
+        let unit = text.dropFirst(number.count).trimmingCharacters(in: .whitespaces)
+        guard let value = Double(number), let scale = sizeUnits[unit] else { return nil }
+        return Int64((value * scale).rounded())
+    }
+
+    /// Start time and published host ports per container, from `docker inspect`.
+    static func parseInspect(_ out: String) -> [String: (startedAt: Date, ports: [Int])] {
+        struct Binding: Decodable { let HostPort: String? }
+        struct Row: Decodable {
+            struct State: Decodable { let StartedAt: String }
+            struct Network: Decodable { let Ports: [String: [Binding]?]? }
+            let Name: String
+            let State: State
+            let NetworkSettings: Network
+        }
+        var result: [String: (startedAt: Date, ports: [Int])] = [:]
+        for row in jsonLines(out, as: Row.self) {
+            // Docker's zero date means "never started"; treat it as unknown.
+            guard let started = parseDate(row.State.StartedAt), started.timeIntervalSince1970 > 946_684_800 else { continue }
+            let ports = (row.NetworkSettings.Ports ?? [:]).values
+                .flatMap { $0 ?? [] }
+                .compactMap { $0.HostPort.flatMap { Int($0) } }
+            result[row.Name.hasPrefix("/") ? String(row.Name.dropFirst()) : row.Name] = (started, Array(Set(ports)).sorted())
+        }
+        return result
+    }
+
+    private static func parseDate(_ text: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: text) { return date }
+        return ISO8601DateFormatter().date(from: text)
+    }
+
+    // MARK: stop / undo
+
+    public func stop(_ item: Item, ctx: ScanContext) async -> StopResult {
+        guard item.judgement.verdict == .idle else {
+            return .skipped(reason: "\(item.name) is in use")
+        }
+        // The item may come from a cached scan: look at the sockets again before stopping anything.
+        let ports = (item.detail["ports"] ?? "").split(separator: ",").compactMap { Int($0) }
+        let proxyPIDs = Self.detectEngines(ctx.processes).reduce(into: Set<Int32>()) { $0.formUnion($1.allPIDs) }
+        let clients = Self.clientConnections(ports: ports, sockets: ctx.sockets, excluding: proxyPIDs)
+        guard clients == 0 else {
+            return .skipped(reason: "\(item.name) now has \(clients) connection\(clients == 1 ? "" : "s")")
+        }
+        if item.id.rawValue.hasPrefix(Self.engineIdentityPrefix) {
+            return await stopEngine(item)
+        }
+        guard Self.isSafeName(item.name) else { return .failed(reason: "Unexpected container name") }
+        let result = await run("docker", ["stop", item.name])
+        if result.timedOut { return .failed(reason: "docker stop timed out") }
+        guard result.status == 0 else {
+            return .failed(reason: Self.firstLine(result.stderr, fallback: "docker stop failed (\(result.status))"))
+        }
+        return .stopped(UndoToken(identity: item.id, action: "start", arguments: [item.name]))
+    }
+
+    private func stopEngine(_ item: Item) async -> StopResult {
+        let rawName = String(item.id.rawValue.dropFirst(Self.engineIdentityPrefix.count))
+        guard let engine = ContainerEngine(rawValue: rawName) else { return .failed(reason: "Unknown container engine") }
+        switch engine {
+        case .colima:
+            let result = await run("colima", ["stop"])
+            if result.timedOut { return .failed(reason: "colima stop timed out") }
+            guard result.status == 0 else {
+                return .failed(reason: Self.firstLine(result.stderr, fallback: "colima stop failed (\(result.status))"))
+            }
+            return .stopped(UndoToken(identity: item.id, action: "colima-start", arguments: []))
+        case .dockerDesktop, .orbStack:
+            guard let path = item.detail["appPath"], Self.isEngineApp(path) else {
+                return .failed(reason: "Can't find the \(engine.rawValue) app")
+            }
+            guard await quitApp(path) else { return .failed(reason: "Couldn't quit \(engine.rawValue)") }
+            return .stopped(UndoToken(identity: item.id, action: "launch", arguments: [path]))
+        }
+    }
+
+    public func undo(_ token: UndoToken) async -> Bool {
+        switch (token.action, token.arguments.count) {
+        case ("start", 1):
+            guard let name = token.arguments.first, Self.isSafeName(name) else { return false }
+            let result = await run("docker", ["start", name])
+            return !result.timedOut && result.status == 0
+        case ("launch", 1):
+            guard let path = token.arguments.first, Self.isEngineApp(path) else { return false }
+            return await launchApp(path)
+        case ("colima-start", 0):
+            let result = await run("colima", ["start"])
+            return !result.timedOut && result.status == 0
+        default:
+            return false
+        }
+    }
+
+    /// Only the engine apps we know are ever quit or launched.
+    private static func isEngineApp(_ path: String) -> Bool {
+        ["Docker.app", "OrbStack.app"].contains((path as NSString).lastPathComponent)
+    }
+
+    private static func firstLine(_ text: String, fallback: String) -> String {
+        let line = text.split(whereSeparator: \.isNewline).first.map(String.init)
+        return (line?.isEmpty == false ? line : nil) ?? fallback
+    }
+
+    // MARK: defaults
+
+    private static func defaultRun(_ command: String, _ args: [String]) async -> CommandResult {
+        let slow = ["stop", "start"].contains(args.first ?? "")
+        return await CommandRunner.run(command, args, timeout: slow ? .seconds(60) : .seconds(15))
+    }
+
+    /// Asks every running app inside the bundle (Docker ships a nested app too) to quit.
+    private static func defaultQuit(_ appPath: String) async -> Bool {
+        let running = NSWorkspace.shared.runningApplications.filter {
+            guard let path = $0.bundleURL?.path else { return false }
+            return path == appPath || path.hasPrefix(appPath + "/")
+        }
+        guard !running.isEmpty else { return false }
+        return running.map { $0.terminate() }.contains(true)
+    }
+
+    private static func defaultLaunch(_ appPath: String) async -> Bool {
+        let url = URL(fileURLWithPath: appPath)
+        return (try? await NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())) != nil
+    }
+}

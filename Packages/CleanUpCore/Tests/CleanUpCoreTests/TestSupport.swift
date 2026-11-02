@@ -79,6 +79,23 @@ extension SimulatorFacts {
     }
 }
 
+extension ContainerFacts {
+    static func fixture(
+        name: String = "evone-postgres",
+        cpu: Double = 0,
+        clients: Int = 0,
+        net: Int64? = 0,
+        age: TimeInterval = .days(12),
+        image: String = "postgres:16",
+        ports: [Int] = [5432]
+    ) -> ContainerFacts {
+        ContainerFacts(
+            name: name, image: image, startedAt: now.addingTimeInterval(-age), cpuPercent: cpu,
+            publishedPorts: ports, clientConnections: clients, netBytesDelta: net
+        )
+    }
+}
+
 func loadFixture(_ name: String) throws -> String {
     let url = try #require(Bundle.module.url(forResource: name, withExtension: "json", subdirectory: "Fixtures"))
     return try String(contentsOf: url, encoding: .utf8)

@@ -1,8 +1,11 @@
 import AppKit
 import CleanUpCore
+import Darwin
+import notify
 import Observation
 import os
 import SwiftUI
+import UserNotifications
 import WidgetKit
 
 /// The app's single source of truth: the latest snapshot, what is ticked, and the refresh loop.
@@ -19,6 +22,7 @@ final class AppModel {
     }
 
     static let useAIKey = "useAppleIntelligence"
+    static let lastWarningKey = "drainMonitor.lastWarning"
     static let visibleInterval: TimeInterval = 5
     static let backgroundInterval: TimeInterval = 60
     static let externalInterval: TimeInterval = 30
@@ -65,6 +69,12 @@ final class AppModel {
     @ObservationIgnored private var lastQuickProposal: Set<ItemIdentity> = []
     @ObservationIgnored private var toastDismissal: Task<Void, Never>?
     @ObservationIgnored private let log = Logger(subsystem: "io.cleanup.CleanUp", category: "AppModel")
+    @ObservationIgnored private var drainMonitor: DrainMonitor
+    @ObservationIgnored private let notificationDelegate = NotificationDelegate()
+    @ObservationIgnored private var signalToken: Int32 = NOTIFY_TOKEN_INVALID
+    @ObservationIgnored private var workspaceObservers: [any NSObjectProtocol] = []
+    /// Opens the main window; set by the menu bar label, the one view that always exists.
+    @ObservationIgnored var openMainWindow: (() -> Void)?
 
     private init() {
         let modules: [any CategoryModule] = [
@@ -78,6 +88,9 @@ final class AppModel {
         self.useAI = useAI
         explainer = Explainer(useAI: useAI)
         groupID = Bundle.main.object(forInfoDictionaryKey: "CleanUpAppGroup") as? String
+        drainMonitor = DrainMonitor(
+            lastWarning: (UserDefaults.standard.object(forKey: Self.lastWarningKey) as? Double).map(Date.init(timeIntervalSince1970:))
+        )
     }
 
     // MARK: Derived
@@ -94,6 +107,7 @@ final class AppModel {
     /// Starts the single refresh loop (idempotent): every 5 s while visible, every 60 s otherwise.
     func start() {
         guard loop == nil else { return }
+        startIntegrations()
         loop = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
@@ -149,6 +163,7 @@ final class AppModel {
         hasScanned = true
 
         writeSnapshot(fresh)
+        warnIfDrainingFast(fresh)
         if fresh.mood != oldMood || quickSelection.count != oldIdle {
             WidgetCenter.shared.reloadAllTimelines()
         }
@@ -215,10 +230,13 @@ final class AppModel {
 
     // MARK: Actions
 
-    /// Stops every ticked item, reports it in a toast, then rescans.
-    func cleanUp() async {
-        let items = snapshot.allItems.filter(isTicked)
-        await stop(items)
+    /// Stops every ticked item, reports it in a toast, then rescans. Pass a selection to clean exactly
+    /// that instead of what is ticked (the notification and the widget never touch the user's ticks).
+    @discardableResult
+    func cleanUp(_ selection: Selection? = nil) async -> CleanupReport? {
+        let chosen = selection ?? self.selection
+        let items = snapshot.allItems.filter { chosen.ticked.contains($0.id) }
+        return await stop(items)
     }
 
     /// Stops one item from its "?" sheet. `force` is "Stop anyway" on an in-use item: the engine
@@ -228,24 +246,49 @@ final class AppModel {
         await stop([current], forced: force ? [current.id] : [])
     }
 
-    private func stop(_ items: [Item], forced: Set<ItemIdentity> = []) async {
-        guard !items.isEmpty, !isCleaning else { return }
+    @discardableResult
+    private func stop(_ items: [Item], forced: Set<ItemIdentity> = []) async -> CleanupReport? {
+        guard !items.isEmpty, !isCleaning else { return nil }
         isCleaning = true
         defer { isCleaning = false }
 
-        let report = await cleaner.clean(items, forced: forced)
+        let report = await clean(items, forced: forced)
         lastUndo = report.undo
         selection.ticked.subtract(report.stopped)
 
-        var parts: [String] = []
-        if !report.stopped.isEmpty { parts.append("Stopped \(report.stopped.count)") }
-        let notStopped = report.failed.count + report.skipped.count
-        if notStopped > 0 { parts.append("Couldn't stop \(notStopped)") }
+        let parts = Self.summary(of: report)
         show(ToastState(parts: parts, canUndo: !report.undo.isEmpty), for: .seconds(8))
         for (id, reason) in report.failed { log.info("Couldn't stop \(id.rawValue, privacy: .public): \(reason, privacy: .public)") }
         for (id, reason) in report.skipped { log.info("Skipped \(id.rawValue, privacy: .public): \(reason, privacy: .public)") }
 
         await refresh(forceExternal: true)
+        return report
+    }
+
+    /// The Cleaner, except in a debug build launched with `-dryRunCleanup`, which only logs what it
+    /// would have stopped (so testing the notification and the widget never stops real work).
+    private func clean(_ items: [Item], forced: Set<ItemIdentity>) async -> CleanupReport {
+        #if DEBUG
+        if Self.isDryRun {
+            for item in items { log.notice("DRY RUN would stop \(item.id.rawValue, privacy: .public)") }
+            return CleanupReport(
+                stopped: items.map(\.id), failed: [], skipped: [], undo: [], freedCores: items.reduce(0) { $0 + $1.cores }
+            )
+        }
+        #endif
+        return await cleaner.clean(items, forced: forced)
+    }
+
+    /// "Stopped 3", "Couldn't stop 1": the toast's segments and the follow-up notification's text.
+    private static func summary(of report: CleanupReport) -> [String] {
+        var parts: [String] = []
+        if !report.stopped.isEmpty { parts.append("Stopped \(report.stopped.count)") }
+        #if DEBUG
+        if isDryRun { parts.append("dry run") }
+        #endif
+        let notStopped = report.failed.count + report.skipped.count
+        if notStopped > 0 { parts.append("Couldn't stop \(notStopped)") }
+        return parts
     }
 
     func undoLast() async {
@@ -281,6 +324,132 @@ final class AppModel {
         }
     }
 
+    // MARK: Warning, widget trigger, activation
+
+    #if DEBUG
+    static var isDryRun: Bool { UserDefaults.standard.bool(forKey: "dryRunCleanup") }
+    #endif
+
+    /// Hooks the app to the outside world once: notification buttons, the widget's signal, the
+    /// activation log, and the first-launch setup (notification permission, open at login).
+    private func startIntegrations() {
+        UNUserNotificationCenter.current().delegate = notificationDelegate
+        Task { await Notifications.requestAuthorization() }
+        LoginItem.setUpOnFirstLaunch()
+
+        // The widget's "Clean up" button posts this; it does exactly what the notification button does.
+        signalToken = CleanupSignal.observe {
+            Task { @MainActor in await AppModel.shared.cleanIdle() }
+        }
+        if signalToken == NOTIFY_TOKEN_INVALID { log.error("Couldn't listen for the widget's clean signal") }
+
+        // Apps are judged idle by when they were last in front, so stamp on both edges: activation
+        // (now in front) and deactivation (just left the front).
+        let center = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didActivateApplicationNotification, NSWorkspace.didDeactivateApplicationNotification] {
+            workspaceObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { note in
+                let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+                guard let bundleID = app?.bundleIdentifier else { return }
+                let stamp = Date()
+                Task { await ActivationLog.shared.record(bundleID: bundleID, at: stamp) }
+            })
+        }
+        if let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier {
+            Task { await ActivationLog.shared.record(bundleID: front, at: Date()) }
+        }
+    }
+
+    /// Asks the monitor after every scan; it decides on mood, idle share and the 30-minute quiet period.
+    private func warnIfDrainingFast(_ fresh: Snapshot) {
+        let selection = Selection.quick(fresh, keep: keepList)
+        let share = DrainWarning.idleShare(of: selection, in: fresh)
+        guard drainMonitor.shouldWarn(snapshot: fresh, idleShare: share, now: Date()) else { return }
+        if let last = drainMonitor.lastWarning {
+            UserDefaults.standard.set(last.timeIntervalSince1970, forKey: Self.lastWarningKey)
+        }
+        guard let warning = DrainWarning.make(snapshot: fresh, selection: selection) else { return }
+        post(warning)
+    }
+
+    private func post(_ warning: DrainWarning) {
+        Task {
+            await Notifications.postDrainWarning(
+                minutesLeft: warning.minutesLeft, idleSummary: warning.summary, idleCount: warning.idleCount
+            )
+        }
+    }
+
+    /// "Clean up N idle" from the notification or the widget. Looks again first and decides from the
+    /// fresh scan, never from the numbers in the notification, which may be minutes old. Quick select
+    /// only: never forced, never apps, and the user's own ticks stay as they were.
+    func cleanIdle() async {
+        guard !isCleaning else { return }
+        await refresh(forceExternal: true)
+        let quick = Selection.quick(snapshot, keep: keepList)
+        guard quick.count > 0 else {
+            show(ToastState("Nothing idle"), for: .seconds(4))
+            if !isVisible { await Notifications.postResult("Nothing idle to stop") }
+            return
+        }
+        guard let report = await cleanUp(quick) else { return }
+        // With no window or popover open the toast is invisible, so say it in a quiet notification.
+        if !isVisible { await Notifications.postResult(Self.summary(of: report).joined(separator: " · ")) }
+    }
+
+    func showMainWindow() {
+        NSApp.activate()
+        openMainWindow?()
+    }
+
+    #if DEBUG
+    /// "Simulate drain warning": runs the real warning path on a `.drainingFast` copy of the current
+    /// snapshot (a demo set of idle items when nothing is idle right now), with a fresh monitor so the
+    /// 30-minute quiet period and the stored time are left alone.
+    func simulateDrainWarning() {
+        var fake = Snapshot.demo(categories: snapshot.categories)
+        let real = Selection.quick(fake, keep: keepList)
+        if DrainWarning.idleShare(of: real, in: fake) < DrainMonitor.minimumIdleShare {
+            fake = Snapshot.demo(categories: Self.demoCategories)
+        }
+        let selection = Selection.quick(fake, keep: keepList)
+        var monitor = DrainMonitor()
+        let share = DrainWarning.idleShare(of: selection, in: fake)
+        guard monitor.shouldWarn(snapshot: fake, idleShare: share, now: Date()),
+              let warning = DrainWarning.make(snapshot: fake, selection: selection) else {
+            log.error("Simulated warning not shown (idle share \(share))")
+            return
+        }
+        post(warning)
+    }
+
+    private static var demoCategories: [CategorySummary] {
+        func item(_ id: ItemIdentity, _ category: CategoryID, _ name: String, cores: Double) -> Item {
+            Item(id: id, category: category, name: name, symbol: "questionmark",
+                 judgement: Judgement(verdict: .idle, fact: "idle", signals: []),
+                 cores: cores, memoryBytes: 0, processes: [], detail: [:])
+        }
+        return [
+            CategorySummary(id: .simulators, items: (1...4).map {
+                item(.simulator(udid: "demo-\($0)"), .simulators, "Demo simulator \($0)", cores: 1)
+            }),
+            CategorySummary(id: .containers, items: (1...6).map {
+                item(.container(name: "demo-\($0)"), .containers, "demo-\($0)", cores: 0.2)
+            }),
+        ]
+    }
+
+    /// Register, read back, unregister: proves the real login item code works without leaving the
+    /// debug build in the user's login items. Launch with `-debugLoginItemCycle YES`.
+    func debugLoginItemCycle() {
+        func report(_ step: String) { log.notice("LOGIN ITEM \(step, privacy: .public): status \(String(describing: LoginItem.status), privacy: .public)") }
+        report("before")
+        do { try LoginItem.set(true) } catch { log.notice("LOGIN ITEM register threw: \(String(describing: error), privacy: .public)") }
+        report("after register")
+        do { try LoginItem.set(false) } catch { log.notice("LOGIN ITEM unregister threw: \(String(describing: error), privacy: .public)") }
+        report("after unregister")
+    }
+    #endif
+
     // MARK: Toast
 
     private func show(_ toast: ToastState, for duration: Duration) {
@@ -299,3 +468,17 @@ final class AppModel {
         withAnimation(.snappy) { toast = nil }
     }
 }
+
+#if DEBUG
+private extension Snapshot {
+    /// A `.drainingFast` snapshot on battery with 35 minutes left, for the simulated warning.
+    static func demo(categories: [CategorySummary]) -> Snapshot {
+        Snapshot(
+            date: Date(),
+            battery: BatteryReading(onBattery: true, percent: 40, drainWatts: 95, minutesLeft: 35, healthPercent: 93, cycleCount: 200),
+            coresBusy: max(categories.reduce(0) { $0 + $1.cores }, 1) * 1.5,
+            swapUsedBytes: 0, swapTotalBytes: 0, uptime: 0, categories: categories, mood: .drainingFast
+        )
+    }
+}
+#endif

@@ -770,3 +770,61 @@ private extension Snapshot {
         Snapshot(date: fixedNow, battery: nil, coresBusy: 0, swapUsedBytes: 0, swapTotalBytes: 0, uptime: 0, categories: categories, mood: .allGood)
     }
 }
+
+extension EngineTests {
+    @Suite struct DrainWarningTests {
+        @Test func incidentNamesTheTwoBiggestIdleGroups() throws {
+            let s = Snapshot.incident()
+            let sel = Selection.quick(s, keep: .empty)
+            let warning = try #require(DrainWarning.make(snapshot: s, selection: sel))
+            #expect(warning.summary == "4 idle simulators + 7 old containers")
+            #expect(warning.idleCount == 11)
+            #expect(warning.title == "Battery draining fast · 35 min left")
+            #expect(warning.actionTitle == "Clean up 11 idle")
+        }
+
+        @Test func engineAddsCoresButIsNotCountedAsAContainer() throws {
+            let s = Snapshot.incidentAllContainersIdle()
+            let sel = Selection.quick(s, keep: .empty)
+            #expect(sel.ticked.contains(.engine(name: "Docker Desktop")))
+            let warning = try #require(DrainWarning.make(snapshot: s, selection: sel))
+            // 8 containers, not 9: the engine's core counts toward the group but the engine is not a container.
+            #expect(warning.summary == "4 idle simulators + 8 old containers")
+            #expect(warning.idleCount == 13)
+        }
+
+        @Test func singularNouns() throws {
+            let sim = Item.fixtureSimulator(cores: 2)
+            let box = Item.fixtureContainer(name: "db", cores: 1, engine: nil)
+            let s = Snapshot.with([CategorySummary(id: .simulators, items: [sim]), CategorySummary(id: .containers, items: [box])])
+            let warning = try #require(DrainWarning.make(snapshot: s, selection: Selection.quick(s, keep: .empty)))
+            #expect(warning.summary == "1 idle simulator + 1 old container")
+        }
+
+        @Test func onlyTheTopTwoGroupsAreNamed() throws {
+            let s = Snapshot.with([
+                CategorySummary(id: .simulators, items: [.fixtureSimulator(cores: 1)]),
+                CategorySummary(id: .containers, items: [.fixtureContainer(name: "db", cores: 0.5, engine: nil)]),
+                CategorySummary(id: .devServers, items: [Item.fixture(.devServer(cwd: "/x", command: "vite"), category: .devServers, name: "vite", verdict: .idle, cores: 2)]),
+            ])
+            let warning = try #require(DrainWarning.make(snapshot: s, selection: Selection.quick(s, keep: .empty)))
+            #expect(warning.summary == "1 old dev server + 1 idle simulator")
+            #expect(warning.idleCount == 3)
+        }
+
+        @Test func nothingToOfferIsNil() {
+            #expect(DrainWarning.make(snapshot: .incident(), selection: Selection()) == nil)
+        }
+
+        @Test func titleWithoutMinutes() {
+            #expect(DrainWarning(summary: "x", idleCount: 1, minutesLeft: nil).title == "Battery draining fast")
+        }
+
+        @Test func idleShareIsFreedCoresOverBusyCores() {
+            let s = Snapshot.incident()
+            let sel = Selection.quick(s, keep: .empty)
+            #expect(abs(DrainWarning.idleShare(of: sel, in: s) - 4.9 / 10.5) < 1e-9)
+            #expect(DrainWarning.idleShare(of: Selection(), in: .empty) == 0)   // nothing busy: the 0.1 floor avoids dividing by zero
+        }
+    }
+}

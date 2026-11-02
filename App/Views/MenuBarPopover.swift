@@ -56,6 +56,11 @@ struct MenuBarPopover: View {
             }
             .buttonStyle(.plain)
             Spacer(minLength: 0)
+            #if DEBUG
+            iconButton("bell.badge", label: "Simulate drain warning", help: "Simulate drain warning") {
+                model.simulateDrainWarning()
+            }
+            #endif
             iconButton("gearshape", label: "Settings", help: "Settings") {
                 NSApp.activate()
                 openSettings()

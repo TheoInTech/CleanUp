@@ -6,12 +6,16 @@ import SwiftUI
 /// MenuBarExtra labels only render images and text, so the ring is drawn into an `NSImage`.
 struct MenuBarLabel: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         MenuBarLabelContent(
             mood: model.snapshot.mood,
             minutes: model.hasScanned ? Self.minutes(in: model.snapshot) : nil
         )
+        // The label is the one view that always exists, so it hands the model a way to open the
+        // window ("Show me" on the warning notification).
+        .onAppear { model.openMainWindow = { openWindow(id: "main") } }
     }
 
     /// "35m" on battery, nil when plugged in (or the estimate isn't known yet).

@@ -9,6 +9,13 @@ struct CleanUpApp: App {
         AppModel.shared.start()
         #if DEBUG
         DebugSnapshot.runIfRequested(AppModel.shared)
+        if UserDefaults.standard.bool(forKey: "debugLoginItemCycle") { AppModel.shared.debugLoginItemCycle() }
+        if UserDefaults.standard.bool(forKey: "debugSimulateWarning") {
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(3))
+                AppModel.shared.simulateDrainWarning()
+            }
+        }
         #endif
     }
 

@@ -4,8 +4,9 @@ import SwiftUI
 
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
-    /// Placeholder flag; wired to the login item later.
-    @AppStorage("openAtLogin") private var openAtLogin = true
+    /// Mirrors the system's real login item status, re-read whenever the pane appears.
+    @State private var openAtLogin = LoginItem.isEnabled
+    @State private var loginError: String?
 
     static let sponsorsURL = URL(string: "https://github.com/sponsors")!
 
@@ -13,7 +14,12 @@ struct SettingsView: View {
         @Bindable var model = model
         Form {
             Section {
-                Toggle("Open at login", isOn: $openAtLogin)
+                Toggle("Open at login", isOn: loginBinding)
+                if let loginError {
+                    Text(loginError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
                 Toggle("Use Apple Intelligence", isOn: $model.useAI)
             }
 
@@ -49,6 +55,35 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .frame(width: 420)
         .frame(minHeight: 320)
-        .onAppear { NSApp.activate() }
+        .onAppear {
+            NSApp.activate()
+            syncLoginItem()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            syncLoginItem()
+        }
+    }
+
+    /// Turning it on or off asks the system; if it refuses, the switch snaps back and says why.
+    private var loginBinding: Binding<Bool> {
+        Binding(
+            get: { openAtLogin },
+            set: { on in
+                do {
+                    try LoginItem.set(on)
+                    loginError = LoginItem.needsApproval ? LoginItem.approvalMessage : nil
+                } catch {
+                    loginError = LoginItem.message(for: error)
+                }
+                openAtLogin = LoginItem.isEnabled
+            }
+        )
+    }
+
+    /// The user can change it in System Settings too, so the switch follows the system.
+    private func syncLoginItem() {
+        openAtLogin = LoginItem.isEnabled
+        if LoginItem.needsApproval { loginError = LoginItem.approvalMessage }
+        else if loginError == LoginItem.approvalMessage { loginError = nil }
     }
 }

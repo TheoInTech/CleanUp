@@ -247,6 +247,7 @@ struct StubModule: CategoryModule {
         var forced: [ItemIdentity] = []
         var undone: [UndoToken] = []
         var contexts: [ScanContext] = []
+        var restarts = 0
     }
 
     let id: CategoryID
@@ -292,6 +293,10 @@ struct StubModule: CategoryModule {
     func undo(_ token: UndoToken) async -> Bool {
         calls.withLock { $0.undone.append(token) }
         return !undoFailing.contains(token.identity)
+    }
+
+    func restartObservation() {
+        calls.withLock { $0.restarts += 1 }
     }
 }
 

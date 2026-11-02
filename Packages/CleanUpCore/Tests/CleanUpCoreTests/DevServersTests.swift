@@ -127,6 +127,10 @@ private let home = "/Users/u"
     #expect(!candidate(.fixture(name: "node", path: "/Users/u/.nvm/bin/node",
                                 arguments: ["node", "/Users/u/.nvm/lib/node_modules/@anthropic-ai/claude-code/cli.js"])))
     #expect(!candidate(.fixture(name: "zsh", path: "/Users/u/bin/zsh")))
+    // Codex runs as node too.
+    #expect(!candidate(.fixture(name: "node", path: "/Users/u/.nvm/bin/node",
+                                arguments: ["node", "/Users/u/.nvm/lib/node_modules/@openai/codex/bin/codex.js"])))
+    #expect(!candidate(.fixture(name: "node", path: "/Users/u/.nvm/bin/node", arguments: ["node", "/opt/codex/codex.js", "--full-auto"])))
 }
 
 // MARK: - Display and project names
@@ -226,6 +230,21 @@ private func context(
 
 private let expoListen = SocketInfo(pid: 86_037, state: .listen, localPort: 8081, remotePort: nil)
 
+/// Scans once a minute from `from` to `to` minutes after `fixedNow` (inclusive), as the refresh loop
+/// does; returns the last scan.
+private func scanEveryMinute(
+    _ m: DevServersModule, _ records: [ProcessInfoRecord], from: Double = 0, to: Double,
+    sockets: [SocketInfo] = [expoListen], cpu: [Int32: Double]? = nil
+) async -> [Item] {
+    var last: [Item] = []
+    var minute = from
+    while minute <= to {
+        last = await m.scan(context(records, at: fixedNow + .minutes(minute), sockets: sockets, cpu: cpu))
+        minute += 1
+    }
+    return last
+}
+
 @Test func scanGroupsExpoUnderItsWrapperAndShowsProject() async {
     let items = await module().scan(context(expoProcesses(), sockets: [expoListen]))
     #expect(items.count == 1)
@@ -247,7 +266,7 @@ private let expoListen = SocketInfo(pid: 86_037, state: .listen, localPort: 8081
     #expect(first[0].judgement.verdict == .inUse)
     #expect(first[0].judgement.fact == "watching for 30 min")
 
-    let later = await m.scan(context(procs, at: fixedNow + .minutes(29), sockets: [expoListen]))
+    let later = await scanEveryMinute(m, procs, from: 1, to: 29)
     #expect(later[0].judgement.verdict == .inUse)
 
     let idle = await m.scan(context(procs, at: fixedNow + .minutes(30), sockets: [expoListen]))
@@ -259,14 +278,14 @@ private let expoListen = SocketInfo(pid: 86_037, state: .listen, localPort: 8081
     let m = module()
     let procs = expoProcesses()
     let client = SocketInfo(pid: 86_037, state: .established, localPort: 8081, remotePort: 52_000)
-    _ = await m.scan(context(procs, sockets: [expoListen]))                                        // t0 watching begins
+    _ = await scanEveryMinute(m, procs, to: 39)                                                    // t0 watching begins
     let connected = await m.scan(context(procs, at: fixedNow + .minutes(40), sockets: [expoListen, client]))
     #expect(connected[0].judgement.verdict == .inUse)
     #expect(connected[0].judgement.fact == "1 connection")
-    let after10 = await m.scan(context(procs, at: fixedNow + .minutes(50), sockets: [expoListen]))
+    let after10 = await scanEveryMinute(m, procs, from: 41, to: 50)
     #expect(after10[0].judgement.verdict == .inUse)
     #expect(after10[0].judgement.fact == "connection 10 min ago")
-    let after30 = await m.scan(context(procs, at: fixedNow + .minutes(70), sockets: [expoListen]))
+    let after30 = await scanEveryMinute(m, procs, from: 51, to: 70)
     #expect(after30[0].judgement.verdict == .idle)
 }
 
@@ -282,8 +301,7 @@ private let expoListen = SocketInfo(pid: 86_037, state: .listen, localPort: 8081
     // The wrapper talking to its own child is not a user.
     let server = SocketInfo(pid: 86_037, state: .established, localPort: 8081, remotePort: 53_000)
     let wrapperSide = SocketInfo(pid: 86_003, state: .established, localPort: 53_000, remotePort: 8081)
-    _ = await m.scan(context(expoProcesses(), sockets: [expoListen, server, wrapperSide]))
-    let items = await m.scan(context(expoProcesses(), at: fixedNow + .minutes(31), sockets: [expoListen, server, wrapperSide]))
+    let items = await scanEveryMinute(m, expoProcesses(), to: 31, sockets: [expoListen, server, wrapperSide])
     #expect(items[0].judgement.verdict == .idle)
 }
 
@@ -378,6 +396,26 @@ private let expoListen = SocketInfo(pid: 86_037, state: .listen, localPort: 8081
     let items = await module().scan(context(procs, sockets: [listen]))
     #expect(items[0].processes.map(\.pid) == [70, 72])
     #expect(items[0].name == "next dev :3001")
+}
+
+@Test func aGapBetweenScansStartsTheWatchOver() async {
+    // The Mac slept from minute 10 to 40: a connection then would have gone unseen.
+    let m = module()
+    let procs = expoProcesses()
+    _ = await scanEveryMinute(m, procs, to: 10)
+    let woke = await m.scan(context(procs, at: fixedNow + .minutes(40), sockets: [expoListen]))
+    #expect(woke[0].judgement.verdict == .inUse)
+    #expect(woke[0].judgement.fact == "watching for 30 min")
+    #expect(await scanEveryMinute(m, procs, from: 41, to: 69)[0].judgement.verdict == .inUse)
+    #expect(await m.scan(context(procs, at: fixedNow + .minutes(70), sockets: [expoListen]))[0].judgement.verdict == .idle)
+}
+
+@Test func restartObservationStartsTheWatchOver() async {
+    let m = module()
+    let procs = expoProcesses()
+    #expect(await scanEveryMinute(m, procs, to: 30)[0].judgement.verdict == .idle)
+    m.restartObservation()
+    #expect(await m.scan(context(procs, at: fixedNow + .minutes(31), sockets: [expoListen]))[0].judgement.verdict == .inUse)
 }
 
 @Test func scanForgetsServersThatDisappear() async {
@@ -548,6 +586,17 @@ private func appProcess(_ pid: Int32, ppid: Int32 = 1, name: String, path: Strin
     defer { child.dispose() }
     let item = Item.fixtureDevServer(ref: child.record.ref)
     let sockets = [SocketInfo(pid: child.record.pid, state: .established, localPort: 8081, remotePort: 55_000)]
+    let r = await module().stop(item, ctx: .testContext(processes: [child.record.pid: child.record], sockets: sockets))
+    #expect(r == .skipped(reason: "a connection arrived"))
+    #expect(child.process.isRunning)
+}
+
+@Test func stopSkipsWhenAnotherProcessConnectedSinceTheScan() async throws {
+    // Only the client's side of the connection is visible (say, the server's sockets can't be read).
+    let child = try spawnSleeper()
+    defer { child.dispose() }
+    let item = Item.fixtureDevServer(ref: child.record.ref)
+    let sockets = [SocketInfo(pid: 777, state: .established, localPort: 55_000, remotePort: 8081)]
     let r = await module().stop(item, ctx: .testContext(processes: [child.record.pid: child.record], sockets: sockets))
     #expect(r == .skipped(reason: "a connection arrived"))
     #expect(child.process.isRunning)

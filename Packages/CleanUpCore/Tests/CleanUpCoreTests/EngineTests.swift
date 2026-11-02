@@ -361,6 +361,14 @@ extension EngineTests {
             #expect(third.categories.first?.items == [sim])
         }
 
+        @Test func restartObservationReachesEveryModule() async {
+            let a = StubModule(id: .simulators), b = StubModule(id: .containers)
+            let scanner = Scanner(modules: [a, b], probe: FakeMachine().probe)
+            await scanner.restartObservation()
+            #expect(a.log.restarts == 1)
+            #expect(b.log.restarts == 1)
+        }
+
         @Test func onlyIdleVerdictsAreDowngraded() {
             let app = Item.fixture(.app(bundleID: "a"), category: .apps, verdict: .manual)
             #expect(Scanner.unchecked(app) == app)

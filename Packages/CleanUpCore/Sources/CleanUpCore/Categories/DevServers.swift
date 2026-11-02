@@ -129,6 +129,7 @@ public struct DevServersModule: CategoryModule {
     private struct Memory: Sendable {
         var watches: [ItemIdentity: Watch] = [:]
         var projectNames: [String: String] = [:]
+        var lastScan: Date?
     }
 
     private let memory = OSAllocatedUnfairLock(initialState: Memory())
@@ -198,8 +199,9 @@ public struct DevServersModule: CategoryModule {
         if lowercasedNames(p).contains(where: agentNames.contains) { return true }
         return p.arguments.prefix(4).contains { argument in
             let lower = argument.lowercased()
-            return lower.contains("claude-code") || lower.contains("@anthropic-ai")
-                || agentNames.contains((lower as NSString).lastPathComponent)
+            let leaf = (lower as NSString).lastPathComponent
+            return lower.contains("claude-code") || lower.contains("@anthropic-ai") || lower.contains("@openai/codex")
+                || agentNames.contains(leaf) || leaf == "codex.js"
         }
     }
 
@@ -301,9 +303,18 @@ public struct DevServersModule: CategoryModule {
         var listeners: [ProcessInfoRecord] = []
     }
 
+    public func restartObservation() {
+        memory.withLock { $0.watches = [:] }
+    }
+
     public func scan(_ ctx: ScanContext) async -> [Item] {
         let ownUID = getuid()
         let table = ctx.processes
+        // Time between two scans far apart (sleep, App Nap) wasn't watched: connections then went unseen.
+        memory.withLock { state in
+            if Observation.isGap(since: state.lastScan, now: ctx.now) { state.watches = [:] }
+            state.lastScan = max(state.lastScan ?? ctx.now, ctx.now)
+        }
 
         var childRecords: [Int32: [ProcessInfoRecord]] = [:]
         for p in table.values where p.pid != p.ppid { childRecords[p.ppid, default: []].append(p) }
@@ -475,12 +486,8 @@ public struct DevServersModule: CategoryModule {
         let listed = item.processes.filter { ctx.processes[$0.pid]?.startTime == $0.startTime }
         guard !listed.isEmpty else { return .skipped(reason: "already gone") }
 
-        // Something may have connected since the item was scanned.
         let ports = Set((item.detail["ports"] ?? "").split(separator: ",").compactMap { Int($0) })
         let pids = Set(listed.map(\.pid))
-        if !force, ctx.sockets.contains(where: { $0.state == .established && pids.contains($0.pid) && ports.contains($0.localPort) }) {
-            return .skipped(reason: "a connection arrived")
-        }
 
         // Children spawned after the scan belong to the same tree, except shells, terminals and agents.
         var children: [Int32: [ProcessInfoRecord]] = [:]
@@ -492,6 +499,16 @@ public struct DevServersModule: CategoryModule {
             for member in Self.members(from: record, children: children, uid: getuid()) where known.insert(member.pid).inserted {
                 refs.append(member.ref)
             }
+        }
+
+        // Something may have connected since the item was scanned: the server's side of a connection
+        // on one of its ports, or a client's side (another process, remote port = one of its ports).
+        if !force, ctx.sockets.contains(where: { socket in
+            guard socket.state == .established else { return false }
+            if known.contains(socket.pid) { return ports.contains(socket.localPort) }
+            return socket.remotePort.map(ports.contains) ?? false
+        }) {
+            return .skipped(reason: "a connection arrived")
         }
 
         // CleanUp must never signal itself or the processes that launched it.

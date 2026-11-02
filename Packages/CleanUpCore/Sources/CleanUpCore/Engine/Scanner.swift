@@ -139,6 +139,11 @@ public actor Scanner {
         )
     }
 
+    /// Every module forgets its observation windows (the Mac slept: that time wasn't watched).
+    public func restartObservation() {
+        for module in modules { module.restartObservation() }
+    }
+
     // MARK: Modules
 
     /// `fresh`: answers judged against `ctx`, within the timeout. `late`: answers that arrived now

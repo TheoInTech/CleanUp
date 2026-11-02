@@ -67,7 +67,11 @@ extension SimulatorFacts {
         app: String = "Orbit",
         referencedBy: [String] = [],
         frontmost: Bool = false,
-        cores: Double = 0
+        cores: Double = 0,
+        inFrontAgo: TimeInterval? = nil,
+        trackedFor: TimeInterval = .days(30),
+        appCPU: Double? = 0,
+        debuggedBy: [String] = []
     ) -> SimulatorFacts {
         SimulatorFacts(
             udid: "F92ECACE-D87E-40D2-93F3-32974DED72BF",
@@ -77,7 +81,11 @@ extension SimulatorFacts {
             lastAppName: lastLaunchAgo == nil ? nil : app,
             referencedBy: referencedBy,
             simulatorAppFrontmost: frontmost,
-            cores: cores
+            cores: cores,
+            simulatorLastInFront: inFrontAgo.map { now.addingTimeInterval(-$0) },
+            frontTrackedSince: now.addingTimeInterval(-trackedFor),
+            appCPUPercent: appCPU,
+            debuggedBy: debuggedBy
         )
     }
 }

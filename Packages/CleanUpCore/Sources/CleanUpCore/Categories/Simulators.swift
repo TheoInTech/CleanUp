@@ -15,10 +15,20 @@ public struct SimulatorFacts: Sendable {
     public let referencedBy: [String]
     public let simulatorAppFrontmost: Bool
     public let cores: Double
+    /// When the Simulator app was last in front (CleanUp's activation log); nil when never seen.
+    public let simulatorLastInFront: Date?
+    /// Since when CleanUp has been recording which app is in front.
+    public let frontTrackedSince: Date
+    /// CPU of the device's own apps (under its Containers/Bundle/Application), 100 = one core;
+    /// nil when one of them hasn't been measured yet.
+    public let appCPUPercent: Double?
+    /// Debuggers attached to one of the device's processes (`debugserver`, `lldb`, …).
+    public let debuggedBy: [String]
 
     public init(
         udid: String, name: String, bootedAt: Date?, lastAppLaunch: Date?, lastAppName: String?,
-        referencedBy: [String], simulatorAppFrontmost: Bool, cores: Double
+        referencedBy: [String], simulatorAppFrontmost: Bool, cores: Double,
+        simulatorLastInFront: Date?, frontTrackedSince: Date, appCPUPercent: Double?, debuggedBy: [String]
     ) {
         self.udid = udid
         self.name = name
@@ -28,12 +38,21 @@ public struct SimulatorFacts: Sendable {
         self.referencedBy = referencedBy
         self.simulatorAppFrontmost = simulatorAppFrontmost
         self.cores = cores
+        self.simulatorLastInFront = simulatorLastInFront
+        self.frontTrackedSince = frontTrackedSince
+        self.appCPUPercent = appCPUPercent
+        self.debuggedBy = debuggedBy
     }
 }
 
 public enum SimulatorJudge {
     /// A booted simulator must have been quiet for this long before it counts as idle.
     public static let quietPeriod: TimeInterval = 60 * 60
+    /// The Simulator app must not have been in front for this long. Opening CleanUp puts CleanUp in
+    /// front, so "not frontmost right now" alone means nothing.
+    public static let frontPeriod: TimeInterval = 30 * 60
+    /// The device's apps together must stay below this (100 = one core).
+    public static let idleAppCPUPercent = 5.0
 
     /// Idle only when every condition holds; anything unknown is in use.
     public static func judge(_ f: SimulatorFacts, now: Date) -> Judgement {
@@ -48,11 +67,39 @@ public enum SimulatorJudge {
             reasons.append("used by \(names)")
         }
 
+        if let debugger = f.debuggedBy.first {
+            signals.append(Signal(kind: .inUse, text: "\(f.debuggedBy.joined(separator: ", ")) is attached to it"))
+            reasons.append("debugged by \(debugger)")
+        }
+
         if f.simulatorAppFrontmost {
             signals.append(Signal(kind: .inUse, text: "The Simulator app is in front"))
             reasons.append("Simulator is in front")
+        } else if let front = f.simulatorLastInFront, now.timeIntervalSince(front) < frontPeriod {
+            let ago = RelativeAge.short(now.timeIntervalSince(front))
+            signals.append(Signal(kind: .inUse, text: "The Simulator app was in front \(ago) ago"))
+            reasons.append("Simulator was in front \(ago) ago")
+        } else if f.simulatorLastInFront == nil, now.timeIntervalSince(f.frontTrackedSince) < frontPeriod {
+            let window = RelativeAge.short(frontPeriod)
+            signals.append(Signal(kind: .inUse, text: "CleanUp just started: can't tell yet when the Simulator app was last used"))
+            reasons.append("watching for \(window)")
         } else {
-            signals.append(Signal(kind: .idle, text: "The Simulator app is in the background"))
+            let text = f.simulatorLastInFront.map { "The Simulator app was last in front \(RelativeAge.short(now.timeIntervalSince($0))) ago" }
+                ?? "The Simulator app is in the background"
+            signals.append(Signal(kind: .idle, text: text))
+        }
+
+        if let cpu = f.appCPUPercent {
+            let text = String(format: "Its apps use %.1f%% of a core", cpu)
+            if cpu < idleAppCPUPercent {
+                signals.append(Signal(kind: .idle, text: text))
+            } else {
+                signals.append(Signal(kind: .inUse, text: text))
+                reasons.append("busy")
+            }
+        } else {
+            signals.append(Signal(kind: .inUse, text: "CPU use not measured yet"))
+            reasons.append("measuring CPU")
         }
 
         if let launch = f.lastAppLaunch {
@@ -108,9 +155,38 @@ public struct SimulatorsModule: CategoryModule {
     /// Runs an external command with a timeout; injectable for tests.
     public typealias Run = @Sendable (String, [String], Duration) async -> CommandResult
     private let run: Run
+    private let lastInFront: @Sendable (String) async -> Date?
+    private let trackingSince: @Sendable () async -> Date
 
-    public init(run: Run? = nil) {
+    /// When the Simulator app was last in front, and since when that has been recorded.
+    public struct FrontHistory: Sendable {
+        public let lastInFront: Date?
+        public let trackingSince: Date
+
+        public init(lastInFront: Date?, trackingSince: Date) {
+            self.lastInFront = lastInFront
+            self.trackingSince = trackingSince
+        }
+
+        /// Recorded forever, never seen in front.
+        public static let never = FrontHistory(lastInFront: nil, trackingSince: .distantPast)
+    }
+
+    /// - Parameters:
+    ///   - lastInFront: when an app (by bundle ID) was last in front; defaults to CleanUp's activation log.
+    ///   - trackingSince: since when that log has been recording.
+    public init(
+        run: Run? = nil,
+        lastInFront: (@Sendable (String) async -> Date?)? = nil,
+        trackingSince: (@Sendable () async -> Date)? = nil
+    ) {
         self.run = run ?? { await CommandRunner.run($0, $1, timeout: $2) }
+        self.lastInFront = lastInFront ?? { await ActivationLog.shared.lastActivated($0) }
+        self.trackingSince = trackingSince ?? { ActivationLog.shared.trackingSince }
+    }
+
+    private func frontHistory() async -> FrontHistory {
+        FrontHistory(lastInFront: await lastInFront(Self.simulatorBundleID), trackingSince: await trackingSince())
     }
 
     // MARK: scan
@@ -125,7 +201,7 @@ public struct SimulatorsModule: CategoryModule {
         }
         // simctl failed or never ran: we don't know what is booted, so claim nothing.
         guard let devices else { return [] }
-        return Self.buildItems(devices: devices, ctx: ctx)
+        return Self.buildItems(devices: devices, ctx: ctx, front: await frontHistory())
     }
 
     private static func listBooted() async -> [BootedDevice]? {
@@ -149,15 +225,15 @@ public struct SimulatorsModule: CategoryModule {
 
     // MARK: items
 
-    static func buildItems(devices: [BootedDevice], ctx: ScanContext) -> [Item] {
-        var items = devices.map { item(udid: $0.udid, name: $0.name, ctx: ctx) }
+    static func buildItems(devices: [BootedDevice], ctx: ScanContext, front: FrontHistory = .never) -> [Item] {
+        var items = devices.map { item(udid: $0.udid, name: $0.name, ctx: ctx, front: front) }
         if devices.isEmpty, !simulatorLauncherExists(ctx.processes), let engine = engineItem(ctx: ctx) { items.append(engine) }
         return items
     }
 
-    private static func item(udid: String, name: String, ctx: ScanContext) -> Item {
+    private static func item(udid: String, name: String, ctx: ScanContext, front: FrontHistory) -> Item {
         let owned = deviceProcesses(udid: udid, in: ctx.processes)
-        let facts = Self.facts(udid: udid, name: name, ctx: ctx)
+        let facts = Self.facts(udid: udid, name: name, ctx: ctx, front: front)
         var detail = ["udid": udid]
         if let app = facts.lastAppName { detail["lastApp"] = app }
         if !facts.referencedBy.isEmpty { detail["usedBy"] = facts.referencedBy.joined(separator: ", ") }
@@ -174,12 +250,14 @@ public struct SimulatorsModule: CategoryModule {
         )
     }
 
-    static func facts(udid: String, name: String, ctx: ScanContext) -> SimulatorFacts {
+    static func facts(udid: String, name: String, ctx: ScanContext, front: FrontHistory = .never) -> SimulatorFacts {
         let owned = deviceProcesses(udid: udid, in: ctx.processes)
         let ownedPIDs = Set(owned.map(\.pid))
         let launches = owned.filter { $0.path.contains("/data/Containers/Bundle/Application/") }
         let lastLaunch = launches.max { $0.startTime < $1.startTime }
         let cores = owned.reduce(0.0) { $0 + (ctx.cpu[$1.pid] ?? 0) } / 100
+        let appCPU = launches.map { ctx.cpu[$0.pid] }
+        let appCPUPercent: Double? = appCPU.contains { $0 == nil } ? nil : appCPU.reduce(0.0) { $0 + ($1 ?? 0) }
 
         let ownDescendants = descendants(of: [ctx.ownPID], in: ctx.processes)
         let referencing = ctx.processes.values.filter { process in
@@ -198,8 +276,33 @@ public struct SimulatorsModule: CategoryModule {
             lastAppName: lastLaunch.map(appName),
             referencedBy: names.sorted(),
             simulatorAppFrontmost: ctx.frontmostBundleID == simulatorBundleID,
-            cores: cores
+            cores: cores,
+            simulatorLastInFront: front.lastInFront,
+            frontTrackedSince: front.trackingSince,
+            appCPUPercent: appCPUPercent,
+            debuggedBy: debuggers(of: owned, in: ctx.processes)
         )
+    }
+
+    private static let debuggerNames: Set<String> = ["debugserver", "lldb", "lldb-rpc-server", "lldb-server"]
+
+    /// A debugger is attached to one of the device's processes: the process is traced, its parent is
+    /// a debugger (launched under debugserver), or a debugger names its pid (`lldb -p 1234`).
+    private static func debuggers(of owned: [ProcessInfoRecord], in table: [Int32: ProcessInfoRecord]) -> [String] {
+        let pids = Set(owned.map(\.pid))
+        let pidStrings = Set(pids.map(String.init))
+        var found = Set<String>()
+        if owned.contains(where: \.isTraced) { found.insert("a debugger") }
+        for p in table.values {
+            let name = ProcessTree.leaf(p)
+            guard debuggerNames.contains(name) || debuggerNames.contains(p.name) else { continue }
+            let parentOfDevice = owned.contains { $0.ppid == p.pid }
+            let namesAPID = p.arguments.dropFirst().contains { argument in
+                argument.split { !$0.isNumber }.contains { pidStrings.contains(String($0)) }
+            }
+            if parentOfDevice || namesAPID { found.insert(name) }
+        }
+        return found.sorted()
     }
 
     // MARK: attribution
@@ -305,6 +408,13 @@ public struct SimulatorsModule: CategoryModule {
         }
         guard let udid = item.detail["udid"], UUID(uuidString: udid) != nil else {
             return .failed(reason: "Missing or malformed simulator id")
+        }
+        // The item may come from an old scan: judge the device again from the fresh context.
+        if !force {
+            let facts = Self.facts(udid: udid, name: item.name, ctx: ctx, front: await frontHistory())
+            guard SimulatorJudge.judge(facts, now: ctx.now).verdict == .idle else {
+                return .skipped(reason: "\(item.name) is in use now")
+            }
         }
         let result = await run("xcrun", ["simctl", "shutdown", udid], Self.simctlTimeout)
         if result.timedOut { return .failed(reason: "simctl shutdown timed out") }

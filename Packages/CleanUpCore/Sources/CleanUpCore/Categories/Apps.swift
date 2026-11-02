@@ -104,7 +104,7 @@ public struct AppsModule: CategoryModule {
 
     public init(
         apps: @escaping @Sendable () async -> [RunningAppInfo] = AppsModule.runningApps,
-        trackingSince: @escaping @Sendable () async -> Date = { await ActivationLog.shared.trackingSince },
+        trackingSince: @escaping @Sendable () async -> Date = { ActivationLog.shared.trackingSince },
         terminator: @escaping AppTerminator = AppsModule.nativeTerminator(),
         opener: @escaping @Sendable (URL) async -> Bool = AppsModule.nativeOpener
     ) {

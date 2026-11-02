@@ -15,12 +15,15 @@ public struct ProcessInfoRecord: Sendable, Hashable {
     public let startTime: Date
     public let cpuTimeNanos: UInt64
     public let residentBytes: UInt64
+    /// A debugger is attached (`P_TRACED`).
+    public let isTraced: Bool
 
     public var ref: ProcessRef { ProcessRef(pid: pid, startTime: startTime) }
 
     public init(
         pid: Int32, ppid: Int32, pgid: Int32, uid: uid_t, name: String, path: String,
-        arguments: [String], cwd: String?, startTime: Date, cpuTimeNanos: UInt64, residentBytes: UInt64
+        arguments: [String], cwd: String?, startTime: Date, cpuTimeNanos: UInt64, residentBytes: UInt64,
+        isTraced: Bool = false
     ) {
         self.pid = pid
         self.ppid = ppid
@@ -33,6 +36,7 @@ public struct ProcessInfoRecord: Sendable, Hashable {
         self.startTime = startTime
         self.cpuTimeNanos = cpuTimeNanos
         self.residentBytes = residentBytes
+        self.isTraced = isTraced
     }
 }
 
@@ -109,7 +113,8 @@ public enum ProcessTable {
             cwd: currentDirectory(for: pid),
             startTime: Date(timeIntervalSince1970: started),
             cpuTimeNanos: cpuNanos,
-            residentBytes: resident
+            residentBytes: resident,
+            isTraced: bsd.pbi_flags & UInt32(PROC_FLAG_TRACED) != 0
         )
     }
 

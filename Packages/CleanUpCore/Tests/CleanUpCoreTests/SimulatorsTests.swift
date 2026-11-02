@@ -44,6 +44,33 @@ import Testing
     #expect(j.signals.contains { $0.kind == .inUse })
 }
 
+// MARK: - Judge: CleanUp in front, CPU, debuggers
+
+@Test func simulatorAppInFrontRecentlyIsInUse() {
+    // Opening CleanUp puts it in front; the Simulator was in front 10 minutes ago.
+    let j = SimulatorJudge.judge(.fixture(bootedAgo: .days(2), inFrontAgo: .minutes(10)), now: now)
+    #expect(j.verdict == .inUse); #expect(j.fact == "Simulator was in front 10 min ago")
+    #expect(SimulatorJudge.judge(.fixture(bootedAgo: .days(2), inFrontAgo: .minutes(31)), now: now).verdict == .idle)
+}
+@Test func noFrontHistoryRightAfterCleanUpStartsIsInUse() {
+    let j = SimulatorJudge.judge(.fixture(bootedAgo: .days(2), trackedFor: .minutes(5)), now: now)
+    #expect(j.verdict == .inUse); #expect(j.fact == "watching for 30 min")
+    #expect(SimulatorJudge.judge(.fixture(bootedAgo: .days(2), trackedFor: .minutes(30)), now: now).verdict == .idle)
+}
+@Test func busyDeviceAppsAreInUse() {
+    let j = SimulatorJudge.judge(.fixture(bootedAgo: .days(2), appCPU: 5.1), now: now)
+    #expect(j.verdict == .inUse); #expect(j.fact == "busy")
+    #expect(SimulatorJudge.judge(.fixture(bootedAgo: .days(2), appCPU: 4.9), now: now).verdict == .idle)
+}
+@Test func unmeasuredAppCPUIsInUse() {
+    let j = SimulatorJudge.judge(.fixture(bootedAgo: .days(2), appCPU: nil), now: now)
+    #expect(j.verdict == .inUse); #expect(j.fact == "measuring CPU")
+}
+@Test func debuggedDeviceIsInUse() {
+    let j = SimulatorJudge.judge(.fixture(bootedAgo: .days(2), debuggedBy: ["debugserver"]), now: now)
+    #expect(j.verdict == .inUse); #expect(j.fact == "debugged by debugserver")
+}
+
 @Test func relativeAgeFormats() {
     #expect(RelativeAge.short(.minutes(13)) == "13 min")
     #expect(RelativeAge.short(.hours(3)) == "3 h")
@@ -140,6 +167,115 @@ private func simTable() -> [Int32: ProcessInfoRecord] {
     )
     let items = SimulatorsModule.buildItems(devices: [(udid: udidA, name: "iPhone 18 Pro")], ctx: .testContext(processes: table))
     #expect(items.first?.judgement.verdict == .idle); #expect(items.first?.judgement.fact == "idle 2 days")
+}
+
+// MARK: - CPU, debuggers and the front history (facts)
+
+@Test func appCPUCountsOnlyTheDevicesOwnApps() {
+    // backboardd (101) is busy but is the runtime, not an app; Orbit (103) is the app.
+    let f = SimulatorsModule.facts(udid: udidA, name: "x", ctx: .testContext(processes: simTable(), cpu: [100: 0, 101: 80, 102: 0, 103: 7]))
+    #expect(f.appCPUPercent == 7)
+    let unmeasured = SimulatorsModule.facts(udid: udidA, name: "x", ctx: .testContext(processes: simTable(), cpu: [101: 0]))
+    #expect(unmeasured.appCPUPercent == nil)
+    let noApps = SimulatorsModule.facts(udid: udidB, name: "y", ctx: .testContext(processes: simTable()))
+    #expect(noApps.appCPUPercent == 0)
+}
+
+@Test func debuggerAttachedToADeviceProcessIsFound() {
+    var parent = simTable()
+    // Xcode launched Orbit under debugserver.
+    parent[103] = .fixture(pid: 103, ppid: 800, name: "Orbit", path: home + udidA + "/data/Containers/Bundle/Application/AAAA/Orbit.app/Orbit", startedAgo: .hours(5))
+    parent[800] = .fixture(pid: 800, name: "debugserver", path: "/Applications/Xcode.app/Contents/SharedFrameworks/LLDB.framework/Versions/A/Resources/debugserver")
+    #expect(SimulatorsModule.facts(udid: udidA, name: "x", ctx: .testContext(processes: parent)).debuggedBy == ["debugserver"])
+
+    var byPID = simTable()
+    byPID[801] = .fixture(pid: 801, name: "lldb", path: "/usr/bin/lldb", arguments: ["lldb", "-p", "103"])
+    #expect(SimulatorsModule.facts(udid: udidA, name: "x", ctx: .testContext(processes: byPID)).debuggedBy == ["lldb"])
+    #expect(SimulatorsModule.facts(udid: udidB, name: "y", ctx: .testContext(processes: byPID)).debuggedBy.isEmpty)
+
+    var traced = simTable()
+    let orbit = traced[103]!
+    traced[103] = ProcessInfoRecord(
+        pid: orbit.pid, ppid: orbit.ppid, pgid: orbit.pgid, uid: orbit.uid, name: orbit.name, path: orbit.path,
+        arguments: orbit.arguments, cwd: nil, startTime: orbit.startTime, cpuTimeNanos: 0, residentBytes: 0, isTraced: true
+    )
+    #expect(SimulatorsModule.facts(udid: udidA, name: "x", ctx: .testContext(processes: traced)).debuggedBy == ["a debugger"])
+}
+
+@Test func frontHistoryReachesTheFacts() {
+    let front = SimulatorsModule.FrontHistory(lastInFront: now.addingTimeInterval(-.minutes(3)), trackingSince: now.addingTimeInterval(-.days(1)))
+    let f = SimulatorsModule.facts(udid: udidA, name: "x", ctx: .testContext(processes: simTable()), front: front)
+    #expect(f.simulatorLastInFront == now.addingTimeInterval(-.minutes(3)))
+    #expect(f.frontTrackedSince == now.addingTimeInterval(-.days(1)))
+}
+
+// MARK: - Stop re-checks against the fresh context
+
+/// Device A, booted two days ago, its app last opened five hours ago: idle when nothing else happens.
+private func staleTable() -> [Int32: ProcessInfoRecord] {
+    processTable(
+        .fixture(pid: 100, name: "launchd_sim", path: runtimeRoot + "/sbin/launchd_sim",
+                 arguments: ["launchd_sim", home + udidA + "/data/var/run/launchd_bootstrap.plist"], startedAgo: .days(2)),
+        .fixture(pid: 101, ppid: 100, name: "backboardd", path: runtimeRoot + "/usr/libexec/backboardd", startedAgo: .days(2)),
+        .fixture(pid: 103, ppid: 100, name: "Orbit", path: home + udidA + "/data/Containers/Bundle/Application/AAAA/Orbit.app/Orbit", startedAgo: .hours(5))
+    )
+}
+private let quietCPU: [Int32: Double] = [100: 0, 101: 0.5, 103: 0.2]
+private let longAgo = SimulatorsModule.FrontHistory(lastInFront: nil, trackingSince: now.addingTimeInterval(-.days(30)))
+
+private func recordingModule(front: SimulatorsModule.FrontHistory = longAgo) -> (SimulatorsModule, OSAllocatedUnfairLock<[[String]]>) {
+    let calls = OSAllocatedUnfairLock<[[String]]>(initialState: [])
+    let module = SimulatorsModule(
+        run: { cmd, args, _ in
+            calls.withLock { $0.append([cmd] + args) }
+            return CommandResult(status: 0, stdout: "", stderr: "", timedOut: false)
+        },
+        lastInFront: { _ in front.lastInFront }, trackingSince: { front.trackingSince }
+    )
+    return (module, calls)
+}
+
+private func idleItem() -> Item {
+    let items = SimulatorsModule.buildItems(devices: [(udid: udidA, name: "iPhone 18 Pro")], ctx: .testContext(processes: staleTable(), cpu: quietCPU), front: longAgo)
+    return items[0]
+}
+
+@Test func stopShutsDownWhenTheFreshContextStillLooksIdle() async {
+    let item = idleItem()
+    #expect(item.judgement.verdict == .idle)
+    let (module, calls) = recordingModule()
+    #expect(await module.stop(item, ctx: .testContext(processes: staleTable(), cpu: quietCPU)) == .stopped(UndoToken(identity: item.id, action: "boot", arguments: [udidA])))
+    #expect(calls.withLock { $0 } == [["xcrun", "simctl", "shutdown", udidA]])
+}
+
+@Test func stopSkipsWhenItsAppIsBusyNow() async {
+    let (module, calls) = recordingModule()
+    let result = await module.stop(idleItem(), ctx: .testContext(processes: staleTable(), cpu: [100: 0, 101: 0, 103: 40]))
+    #expect(result == .skipped(reason: "iPhone 18 Pro is in use now"))
+    #expect(calls.withLock { $0 }.isEmpty)
+}
+
+@Test func stopSkipsWhenTheSimulatorIsInFrontNow() async {
+    let (module, calls) = recordingModule()
+    let result = await module.stop(idleItem(), ctx: .testContext(processes: staleTable(), cpu: quietCPU, frontmost: "com.apple.iphonesimulator"))
+    #expect(result == .skipped(reason: "iPhone 18 Pro is in use now"))
+    #expect(calls.withLock { $0 }.isEmpty)
+}
+
+@Test func stopSkipsWhenTheSimulatorWasInFrontMomentsAgo() async {
+    // The window was opened from the menu bar, so CleanUp is in front now.
+    let (module, calls) = recordingModule(front: .init(lastInFront: now.addingTimeInterval(-20), trackingSince: now.addingTimeInterval(-.days(30))))
+    let result = await module.stop(idleItem(), ctx: .testContext(processes: staleTable(), cpu: quietCPU, frontmost: "io.cleanup.CleanUp"))
+    #expect(result == .skipped(reason: "iPhone 18 Pro is in use now"))
+    #expect(calls.withLock { $0 }.isEmpty)
+}
+
+@Test func stopSkipsWhenABuildTargetsItNow() async {
+    var table = staleTable()
+    table[300] = .fixture(pid: 300, name: "xcodebuild", path: "/usr/bin/xcodebuild", arguments: ["xcodebuild", "-destination", "id=" + udidA, "test"])
+    let (module, calls) = recordingModule()
+    #expect(await module.stop(idleItem(), ctx: .testContext(processes: table, cpu: quietCPU.merging([300: 0]) { $1 })) == .skipped(reason: "iPhone 18 Pro is in use now"))
+    #expect(calls.withLock { $0 }.isEmpty)
 }
 
 // MARK: - Referencing processes

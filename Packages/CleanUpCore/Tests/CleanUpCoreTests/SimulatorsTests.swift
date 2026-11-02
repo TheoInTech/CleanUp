@@ -141,6 +141,45 @@ private func simTable() -> [Int32: ProcessInfoRecord] {
     #expect(items.first?.judgement.verdict == .idle); #expect(items.first?.judgement.fact == "idle 2 days")
 }
 
+// MARK: - Referencing processes
+
+private let frameworkBin = "/Library/Developer/PrivateFrameworks/CoreSimulator.framework/Versions/A/Resources/bin/simctl"
+
+@Test func simctlSpawnAtFrameworkPathMarksDeviceInUse() {
+    // Terminal-run `simctl spawn <UDID> log stream` has no wrapper process; the real simctl lives
+    // inside CoreSimulator.framework and must still count as a consumer.
+    let table = simTable().merging(processTable(
+        .fixture(pid: 600, name: "simctl", path: frameworkBin, arguments: ["simctl", "spawn", udidA, "log", "stream"])
+    )) { $1 }
+    let ctx = ScanContext.testContext(processes: table)
+    #expect(SimulatorsModule.facts(udid: udidA, name: "x", ctx: ctx).referencedBy == ["simctl"])
+    let item = SimulatorsModule.buildItems(devices: devices, ctx: ctx).first { $0.id == .simulator(udid: udidA) }
+    #expect(item?.judgement.verdict == .inUse)
+}
+
+@Test func simulatorServicesMentioningUDIDDoNotCount() {
+    let table = simTable().merging(processTable(
+        .fixture(pid: 601, name: "com.apple.CoreSimulator.CoreSimulatorService",
+                 path: "/Library/Developer/PrivateFrameworks/CoreSimulator.framework/Versions/A/XPCServices/com.apple.CoreSimulator.CoreSimulatorService.xpc/Contents/MacOS/com.apple.CoreSimulator.CoreSimulatorService",
+                 arguments: ["CoreSimulatorService", udidA]),
+        .fixture(pid: 602, name: "SimLaunchHost.arm64", path: "/Library/Developer/CoreSimulator/SimLaunchHost.arm64",
+                 arguments: ["SimLaunchHost.arm64", udidA])
+    )) { $1 }
+    let ctx = ScanContext.testContext(processes: table)
+    #expect(SimulatorsModule.facts(udid: udidA, name: "x", ctx: ctx).referencedBy.isEmpty)
+}
+
+@Test func ourOwnDescendantsMentioningUDIDAreIgnored() {
+    let me = getpid()
+    let table = simTable().merging(processTable(
+        .fixture(pid: me, name: "xctest"),
+        .fixture(pid: 700, ppid: me, name: "simctl", path: frameworkBin, arguments: ["simctl", "list", udidA]),
+        .fixture(pid: 701, ppid: 700, name: "helper", arguments: ["helper", udidA])
+    )) { $1 }
+    let ctx = ScanContext.testContext(processes: table)
+    #expect(SimulatorsModule.facts(udid: udidA, name: "x", ctx: ctx).referencedBy.isEmpty)
+}
+
 // MARK: - Engine item
 
 private func engineTable(cpu: Double) -> ([Int32: ProcessInfoRecord], [Int32: Double]) {
@@ -175,6 +214,22 @@ private func engineTable(cpu: Double) -> ([Int32: ProcessInfoRecord], [Int32: Do
     #expect(SimulatorsModule.buildItems(devices: [], ctx: .testContext(processes: procs, cpu: [501: 100])).isEmpty)
 }
 
+@Test func engineItemWithheldWhileALauncherExists() {
+    var (procs, cpu) = engineTable(cpu: 0.5)
+    procs[900] = .fixture(pid: 900, name: "launchd_sim", arguments: ["launchd_sim", home + udidA + "/data/var/run/x.plist"], startedAgo: 5)
+    cpu[900] = 0
+    #expect(SimulatorsModule.buildItems(devices: [], ctx: .testContext(processes: procs, cpu: cpu)).isEmpty)
+}
+@Test func stopEngineSkipsWhenASimulatorIsStarting() async {
+    let (procs, cpu) = engineTable(cpu: 0.5)
+    let items = SimulatorsModule.buildItems(devices: [], ctx: .testContext(processes: procs, cpu: cpu))
+    let engine = try! #require(items.first)
+    var starting = procs
+    starting[900] = .fixture(pid: 900, name: "launchd_sim", arguments: ["launchd_sim", home + udidA + "/data/var/run/x.plist"], startedAgo: 5)
+    let result = await SimulatorsModule().stop(engine, ctx: .testContext(processes: starting))
+    #expect(result == .skipped(reason: "a simulator is starting"))
+}
+
 // MARK: - Stop guard
 
 @Test func stopSkipsAnythingNotIdle() async {
@@ -199,8 +254,14 @@ private func engineTable(cpu: Double) -> ([Int32: ProcessInfoRecord], [Int32: Do
 // MARK: - Signaling
 
 @Test func terminateSignalsOwnProcessOnlyWhenStartTimeMatches() async throws {
+    // System binaries are on the never-stop list, so run a copy from a temp directory.
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("cleanup-signal-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let copy = dir.appendingPathComponent("napper")
+    try FileManager.default.copyItem(at: URL(fileURLWithPath: "/bin/sleep"), to: copy)
     let child = Process()
-    child.executableURL = URL(fileURLWithPath: "/bin/sleep")
+    child.executableURL = copy
     child.arguments = ["60"]
     try child.run()
     defer { if child.isRunning { child.terminate() } }
@@ -220,4 +281,27 @@ private func engineTable(cpu: Double) -> ([Int32: ProcessInfoRecord], [Int32: Do
     let me = table[getpid()]!.ref
     #expect(ProcessSignaler.terminate([me]).refused == [getpid()])
     if let launchd = table[1] { #expect(ProcessSignaler.terminate([launchd.ref]).signalled.isEmpty) }
+}
+
+@Test func signalerRefusesSystemSoftwareAndCoreUI() throws {
+    #expect(ProcessSignaler.isProtected(path: "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder", name: "Finder"))
+    #expect(ProcessSignaler.isProtected(path: "/usr/libexec/something", name: "something"))
+    #expect(ProcessSignaler.isProtected(path: "/bin/sleep", name: "sleep"))
+    #expect(ProcessSignaler.isProtected(path: "/sbin/launchd", name: "launchd"))
+    #expect(ProcessSignaler.isProtected(path: "/Library/Apple/System/Library/x", name: "x"))
+    #expect(ProcessSignaler.isProtected(path: "/Applications/Whatever", name: "Dock"))
+    #expect(ProcessSignaler.isProtected(path: "/odd/place/WindowServer", name: "WindowServer"))
+    #expect(!ProcessSignaler.isProtected(path: "/usr/local/bin/node", name: "node"))
+    #expect(!ProcessSignaler.isProtected(path: "/opt/homebrew/bin/node", name: "node"))
+    #expect(!ProcessSignaler.isProtected(path: "/Users/me/app/server", name: "server"))
+
+    // End to end: a live process running a protected binary is refused, not signalled.
+    let child = Process()
+    child.executableURL = URL(fileURLWithPath: "/bin/sleep")
+    child.arguments = ["60"]
+    try child.run()
+    defer { if child.isRunning { child.terminate() } }
+    let real = try #require(ProcessTable.snapshot()[child.processIdentifier])
+    let outcome = ProcessSignaler.terminate([real.ref])
+    #expect(outcome.refused == [real.pid]); #expect(child.isRunning)
 }

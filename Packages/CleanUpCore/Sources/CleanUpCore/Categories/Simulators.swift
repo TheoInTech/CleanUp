@@ -145,7 +145,7 @@ public struct SimulatorsModule: CategoryModule {
 
     static func buildItems(devices: [BootedDevice], ctx: ScanContext) -> [Item] {
         var items = devices.map { item(udid: $0.udid, name: $0.name, ctx: ctx) }
-        if devices.isEmpty, let engine = engineItem(ctx: ctx) { items.append(engine) }
+        if devices.isEmpty, !simulatorLauncherExists(ctx.processes), let engine = engineItem(ctx: ctx) { items.append(engine) }
         return items
     }
 
@@ -222,9 +222,20 @@ public struct SimulatorsModule: CategoryModule {
     }
 
     /// CoreSimulator's own services and the Simulator app never count as "something using" a device.
+    /// Matched by exact executable name, never by path: the real `simctl` also lives inside
+    /// CoreSimulator.framework and must stay a referencer.
     private static func isSimulatorInfrastructure(_ p: ProcessInfoRecord) -> Bool {
-        p.path.contains("/CoreSimulator") || p.path.contains("/Simulator.app/")
-            || p.name.hasPrefix("com.apple.CoreSimulator") || p.name == "Simulator"
+        let leaf = (p.path as NSString).lastPathComponent
+        return [p.name, leaf].contains { name in
+            name == "Simulator" || name == "launchd_sim" || name == "SimMetalHost" || name == "SimRenderServer"
+                || name.hasPrefix("SimLaunchHost") || name.hasPrefix("SimulatorTrampoline")
+                || name.hasSuffix("CoreSimulatorService")
+        } || p.name.hasPrefix("com.apple.CoreSimulator.CoreSim")   // the kernel truncates long names
+    }
+
+    /// A `launchd_sim` exists, so some simulator is booting or booted, whatever the cached device list says.
+    private static func simulatorLauncherExists(_ table: [Int32: ProcessInfoRecord]) -> Bool {
+        table.values.contains { $0.name == "launchd_sim" || ($0.path as NSString).lastPathComponent == "launchd_sim" }
     }
 
     private static func mentions(_ arguments: [String], _ needle: String) -> Bool {
@@ -282,7 +293,7 @@ public struct SimulatorsModule: CategoryModule {
             return .skipped(reason: "\(item.name) is in use")
         }
         if item.id == Self.engineIdentity {
-            return Self.stopEngine(item)
+            return Self.stopEngine(item, ctx: ctx)
         }
         guard let udid = item.detail["udid"], UUID(uuidString: udid) != nil else {
             return .failed(reason: "Missing or malformed simulator id")
@@ -296,7 +307,9 @@ public struct SimulatorsModule: CategoryModule {
         return .stopped(UndoToken(identity: item.id, action: "boot", arguments: [udid]))
     }
 
-    private static func stopEngine(_ item: Item) -> StopResult {
+    private static func stopEngine(_ item: Item, ctx: ScanContext) -> StopResult {
+        // The item may be from a cached scan; never kill the services under a simulator that is starting.
+        if simulatorLauncherExists(ctx.processes) { return .skipped(reason: "a simulator is starting") }
         let outcome = ProcessSignaler.terminate(item.processes)
         if !outcome.refused.isEmpty {
             return .failed(reason: "Couldn't stop \(outcome.refused.count) simulator service process(es)")

@@ -59,8 +59,21 @@ public protocol CategoryModule: Sendable {
 }
 
 /// Signals processes with the guard rails every module shares: only our own user's processes, only
-/// when pid *and* start time still match (a recycled pid is never hit), never ourselves.
+/// when pid *and* start time still match (a recycled pid is never hit), never ourselves, and never
+/// anything on the global never-stop list (system software, Finder, Dock, WindowServer).
 public enum ProcessSignaler {
+    private static let protectedPrefixes = ["/System/", "/usr/", "/bin/", "/sbin/", "/Library/Apple/"]
+    /// Third-party tools installed under /usr/local are ordinary user software, not system software.
+    private static let unprotectedPrefixes = ["/usr/local/"]
+    private static let protectedNames: Set<String> = ["Finder", "Dock", "WindowServer"]
+
+    /// The global never-stop list.
+    public static func isProtected(path: String, name: String) -> Bool {
+        if protectedNames.contains(name) || protectedNames.contains((path as NSString).lastPathComponent) { return true }
+        if unprotectedPrefixes.contains(where: path.hasPrefix) { return false }
+        return protectedPrefixes.contains(where: path.hasPrefix)
+    }
+
     public struct Outcome: Sendable, Equatable {
         /// Signalled now.
         public var signalled: [Int32] = []
@@ -78,7 +91,8 @@ public enum ProcessSignaler {
                 outcome.gone.append(ref.pid)
                 continue
             }
-            guard current.uid == getuid(), ref.pid != getpid(), ref.pid > 1 else {
+            guard current.uid == getuid(), ref.pid != getpid(), ref.pid > 1,
+                  !isProtected(path: current.path, name: current.name) else {
                 outcome.refused.append(ref.pid)
                 continue
             }

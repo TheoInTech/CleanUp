@@ -14,7 +14,7 @@ public struct ContainerFacts: Sendable {
     public let publishedPorts: [Int]
     /// Established TCP connections on this Mac to one of the published ports, engine proxies excluded.
     public let clientConnections: Int
-    /// Bytes in + out since the previous scan; nil on the first scan or after a counter reset.
+    /// Exact bytes in + out over the observation window (at least 10 minutes); nil until a baseline that old exists, after a counter reset, or when the counter can't be read.
     public let netBytesDelta: Int64?
 
     public init(
@@ -44,7 +44,12 @@ public enum ContainerJudge {
         var reasons: [String] = []   // in-use reasons, strongest first
 
         if f.clientConnections == 0 {
-            signals.append(Signal(kind: .idle, text: "Nothing is connected to it"))
+            if f.publishedPorts.isEmpty {
+                // Nothing on this Mac can connect, and traffic from other containers is seen only through the byte counters.
+                signals.append(Signal(kind: .neutral, text: "No ports published"))
+            } else {
+                signals.append(Signal(kind: .idle, text: "Nothing is connected to its ports"))
+            }
         } else {
             let text = f.clientConnections == 1 ? "1 connection" : "\(f.clientConnections) connections"
             signals.append(Signal(kind: .inUse, text: "\(text) open to its ports"))
@@ -61,12 +66,12 @@ public enum ContainerJudge {
 
         switch f.netBytesDelta {
         case .none:
-            signals.append(Signal(kind: .inUse, text: "Network traffic not measured yet"))
+            signals.append(Signal(kind: .inUse, text: "Network traffic not measured over a long enough window yet"))
             reasons.append("measuring traffic")
         case let delta? where delta < idleNetBytes:
-            signals.append(Signal(kind: .idle, text: "No network traffic since the last check"))
+            signals.append(Signal(kind: .idle, text: "Almost no network traffic recently"))
         case let delta?:
-            signals.append(Signal(kind: .inUse, text: "\(delta / 1_024) kB of network traffic since the last check"))
+            signals.append(Signal(kind: .inUse, text: "\(delta / 1_024) kB of network traffic recently"))
             reasons.append("busy")
         }
 
@@ -129,14 +134,29 @@ public struct ContainersModule: CategoryModule {
         let ports: [Int]?
         let cpuPercent: Double?
         let netBytesDelta: Int64?
+        /// Since when CPU has been continuously below the idle threshold; nil when it isn't.
+        let lowCPUSince: Date?
+    }
+
+    private struct NetSample: Sendable {
+        let at: Date
+        let bytes: Int64
     }
 
     private struct Memory: Sendable {
         /// nil → docker hasn't answered successfully (or has never been asked).
         var collected: [Collected]?
-        /// Total NetIO bytes per container at the previous successful `docker stats`.
-        var lastNet: [String: Int64] = [:]
+        /// Exact network byte counters per container, oldest first: the newest sample at least
+        /// `observationWindow` old (the baseline) and everything after it.
+        var samples: [String: [NetSample]] = [:]
+        var lowCPUSince: [String: Date] = [:]
+        /// Docker Engine API socket, discovered once.
+        var socketPath: String?
     }
+
+    /// Idleness has to hold for this long: low CPU the whole time, and traffic measured against a
+    /// baseline at least this old. One quiet sample proves nothing about a database queried every few minutes.
+    static let observationWindow: TimeInterval = 10 * 60
 
     private let memory = OSAllocatedUnfairLock(initialState: Memory())
 
@@ -151,7 +171,7 @@ public struct ContainersModule: CategoryModule {
     public func scan(_ ctx: ScanContext) async -> [Item] {
         let collected: [Collected]?
         if ctx.runExternal {
-            collected = await collect()
+            collected = await collect(now: ctx.now)
         } else {
             collected = memory.withLock { $0.collected }
         }
@@ -160,8 +180,8 @@ public struct ContainersModule: CategoryModule {
         return Self.buildItems(collected, ctx: ctx)
     }
 
-    /// Runs docker (3 commands) and remembers the answer. nil when the daemon doesn't answer.
-    private func collect() async -> [Collected]? {
+    /// Runs docker and remembers the answer. nil when the daemon doesn't answer.
+    private func collect(now: Date) async -> [Collected]? {
         let ps = await run("docker", ["ps", "--format", "{{json .}}"])
         guard ps.status == 0, !ps.timedOut else {
             memory.withLock { $0 = Memory() }
@@ -169,37 +189,103 @@ public struct ContainersModule: CategoryModule {
         }
         let running = Self.parsePS(ps.stdout)
         guard !running.isEmpty else {
-            memory.withLock { $0 = Memory(collected: []) }
+            memory.withLock { state in state = Memory(collected: [], socketPath: state.socketPath) }
             return []
         }
 
         async let statsResult = run("docker", ["stats", "--no-stream", "--format", "{{json .}}"])
         async let inspectResult = run("docker", ["inspect", "--format", Self.inspectTemplate] + running.map(\.name))
+        let socket = await engineSocket()
+        let counters = await networkBytes(of: running.map(\.name), socket: socket)
         let stats = await statsResult
         let inspect = await inspectResult
+        // `docker stats` supplies CPU only: its NetIO is rounded to 3 significant figures.
         let statsByName = (stats.status == 0 && !stats.timedOut) ? Self.parseStats(stats.stdout) : [:]
         let inspected = (inspect.status == 0 && !inspect.timedOut) ? Self.parseInspect(inspect.stdout) : [:]
 
-        let result = memory.withLock { state -> [Collected] in
-            var net: [String: Int64] = [:]
+        return memory.withLock { state -> [Collected] in
+            var samples: [String: [NetSample]] = [:]
+            var lowCPU: [String: Date] = [:]
             let rows = running.map { row -> Collected in
-                let stat = statsByName[row.name]
+                let cpu = statsByName[row.name]?.cpu
+                if let cpu, cpu < ContainerJudge.idleCPUPercent { lowCPU[row.name] = state.lowCPUSince[row.name] ?? now }
+
+                var history = state.samples[row.name] ?? []
                 var delta: Int64?
-                if let stat {
-                    net[row.name] = stat.netIOBytes
-                    if let before = state.lastNet[row.name], stat.netIOBytes >= before { delta = stat.netIOBytes - before }
+                if let bytes = counters[row.name] {
+                    let baseline = history.last { now.timeIntervalSince($0.at) >= Self.observationWindow }
+                    if let baseline {
+                        if bytes >= baseline.bytes { delta = bytes - baseline.bytes } else { history = [] }   // counter reset
+                    }
+                    history.append(NetSample(at: now, bytes: bytes))
+                    if let baseline, let index = history.firstIndex(where: { $0.at == baseline.at }) { history.removeFirst(index) }
+                } else {
+                    history = []   // can't read the counter: start over rather than guess
                 }
+                samples[row.name] = history
+
                 return Collected(
                     name: row.name, image: row.image,
                     startedAt: inspected[row.name]?.startedAt, ports: inspected[row.name]?.ports,
-                    cpuPercent: stat?.cpu, netBytesDelta: delta
+                    cpuPercent: cpu, netBytesDelta: delta, lowCPUSince: lowCPU[row.name]
                 )
             }
-            state.lastNet = net
+            state.samples = samples
+            state.lowCPUSince = lowCPU
             state.collected = rows
             return rows
         }
-        return result
+    }
+
+    // MARK: Docker Engine API
+
+    /// The engine's unix socket from the current docker context, e.g. `~/.docker/run/docker.sock`.
+    private func engineSocket() async -> String? {
+        if let known = memory.withLock({ $0.socketPath }) { return known }
+        let result = await run("docker", ["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"])
+        guard result.status == 0, !result.timedOut else { return nil }
+        let host = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard host.hasPrefix("unix://") else { return nil }
+        let path = String(host.dropFirst("unix://".count))
+        guard path.hasPrefix("/") else { return nil }
+        memory.withLock { $0.socketPath = path }
+        return path
+    }
+
+    /// Exact rx + tx bytes per container from the Engine API, fetched concurrently (each call has a
+    /// 10 s cap). Containers whose counter can't be read are absent.
+    private func networkBytes(of names: [String], socket: String?) async -> [String: Int64] {
+        guard let socket else { return [:] }
+        return await withTaskGroup(of: (String, Int64?).self) { group in
+            for name in names {
+                group.addTask { (name, await self.apiNetworkBytes(name: name, socket: socket)) }
+            }
+            var found: [String: Int64] = [:]
+            for await (name, bytes) in group { if let bytes { found[name] = bytes } }
+            return found
+        }
+    }
+
+    private func apiNetworkBytes(name: String, socket: String) async -> Int64? {
+        guard Self.isSafeName(name) else { return nil }
+        let result = await run("/usr/bin/curl", [
+            "--silent", "--max-time", "10", "--unix-socket", socket,
+            "http://localhost/containers/\(name)/stats?stream=false&one-shot=true",
+        ])
+        guard result.status == 0, !result.timedOut else { return nil }
+        return Self.parseAPINetworkBytes(result.stdout)
+    }
+
+    /// Sum of `networks.*.rx_bytes + tx_bytes` from a `/containers/<id>/stats` response.
+    /// nil when there are no network counters (host/none networking): unknown, not zero.
+    static func parseAPINetworkBytes(_ json: String) -> Int64? {
+        struct Stats: Decodable {
+            struct Net: Decodable { let rx_bytes: Int64; let tx_bytes: Int64 }
+            let networks: [String: Net]?
+        }
+        guard let stats = try? JSONDecoder().decode(Stats.self, from: Data(json.utf8)),
+              let networks = stats.networks, !networks.isEmpty else { return nil }
+        return networks.values.reduce(0) { $0 + $1.rx_bytes + $1.tx_bytes }
     }
 
     // MARK: items
@@ -238,7 +324,7 @@ public struct ContainersModule: CategoryModule {
                 clientConnections: clientConnections(ports: ports, sockets: ctx.sockets, excluding: proxyPIDs),
                 netBytesDelta: c.netBytesDelta
             )
-            judgement = ContainerJudge.judge(facts, now: ctx.now)
+            judgement = requireSustainedLowCPU(ContainerJudge.judge(facts, now: ctx.now), since: c.lowCPUSince, now: ctx.now)
         } else {
             judgement = Judgement(
                 verdict: .inUse, fact: "can't read its state",
@@ -249,6 +335,14 @@ public struct ContainersModule: CategoryModule {
             id: .container(name: c.name), category: .containers, name: c.name, symbol: "shippingbox",
             judgement: judgement, cores: cores, memoryBytes: 0, processes: [], detail: detail
         )
+    }
+
+    /// A single low CPU sample is not idleness: CPU has to have stayed low for the whole observation window.
+    private static func requireSustainedLowCPU(_ judgement: Judgement, since: Date?, now: Date) -> Judgement {
+        guard judgement.verdict == .idle else { return judgement }
+        if let since, now.timeIntervalSince(since) >= observationWindow { return judgement }
+        let text = since.map { "CPU has been low for only \(RelativeAge.short(now.timeIntervalSince($0)))" } ?? "CPU use not observed yet"
+        return Judgement(verdict: .inUse, fact: "measuring activity", signals: judgement.signals + [Signal(kind: .inUse, text: text)])
     }
 
     private static func engineItem(_ e: DetectedEngine, verdicts: [Verdict], ambiguous: Bool, ports: Set<Int>, ctx: ScanContext) -> Item {
@@ -286,14 +380,23 @@ public struct ContainersModule: CategoryModule {
         )
     }
 
-    /// Established connections to any of `ports` from anything but the engine's own proxy processes.
+    /// Distinct established connections involving any of `ports`:
+    /// - client side: a socket on this Mac whose remote port is a published port (the engine's own
+    ///   outbound sockets excluded);
+    /// - server side: any socket, the engine proxy included, whose local port is a published port.
+    ///   That is how LAN/VPN clients and containers calling `host.docker.internal:<port>` show up.
+    /// A local client appears on both sides, so connections are counted once per port pair.
     static func clientConnections(ports: [Int], sockets: [SocketInfo], excluding engine: Set<Int32>) -> Int {
         let published = Set(ports)
         guard !published.isEmpty else { return 0 }
-        return sockets.filter { socket in
-            guard socket.state == .established, !engine.contains(socket.pid), let remote = socket.remotePort else { return false }
-            return published.contains(remote)
-        }.count
+        var connections = Set<[Int]>()
+        for socket in sockets where socket.state == .established {
+            guard let remote = socket.remotePort else { continue }
+            let clientSide = published.contains(remote) && !engine.contains(socket.pid)
+            let serverSide = published.contains(socket.localPort)
+            if clientSide || serverSide { connections.insert([min(socket.localPort, remote), max(socket.localPort, remote)]) }
+        }
+        return connections.count
     }
 
     // MARK: engine detection
@@ -488,6 +591,14 @@ public struct ContainersModule: CategoryModule {
             return await stopEngine(item)
         }
         guard Self.isSafeName(item.name) else { return .failed(reason: "Unexpected container name") }
+        // Traffic since the last scan (moments ago) must still be negligible, measured exactly.
+        let (last, socket) = memory.withLock { ($0.samples[item.name]?.last, $0.socketPath) }
+        if let last {
+            guard let socket, let bytes = await apiNetworkBytes(name: item.name, socket: socket),
+                  bytes >= last.bytes, bytes - last.bytes < ContainerJudge.idleNetBytes else {
+                return .skipped(reason: "\(item.name) has network traffic, or it couldn't be checked")
+            }
+        }
         let result = await run("docker", ["stop", item.name])
         if result.timedOut { return .failed(reason: "docker stop timed out") }
         guard result.status == 0 else {

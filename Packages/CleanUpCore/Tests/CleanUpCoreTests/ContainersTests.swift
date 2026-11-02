@@ -47,6 +47,14 @@ import Testing
         #expect(ContainerJudge.judge(.fixture(age: .hours(6)), now: now).verdict == .idle)
     }
 
+    @Test func noPublishedPortsDoesNotClaimNothingIsConnected() {
+        let j = ContainerJudge.judge(.fixture(ports: []), now: now)
+        #expect(j.signals.contains(Signal(kind: .neutral, text: "No ports published")))
+        #expect(!j.signals.contains { $0.text.contains("connected") })
+        let withPorts = ContainerJudge.judge(.fixture(ports: [5432]), now: now)
+        #expect(withPorts.signals.contains { $0.kind == .idle && $0.text.contains("connected") })
+    }
+
     @Test func conditionsCombineWithAnd() {
         // Each single failing condition is enough to be in use.
         #expect(ContainerJudge.judge(.fixture(cpu: 5), now: now).verdict == .inUse)
@@ -90,6 +98,15 @@ import Testing
         #expect(ContainersModule.parseNetIO("garbage") == nil)
         #expect(ContainersModule.parseNetIO("1.2MB") == nil)
         #expect(ContainersModule.parseNetIO("1.2XB / 1B") == nil)
+    }
+
+    @Test func parsesExactNetworkBytesFromEngineAPI() {
+        let json = #"{"id":"x","networks":{"eth0":{"rx_bytes":15748332,"rx_packets":1,"tx_bytes":5905274,"tx_packets":2},"eth1":{"rx_bytes":10,"tx_bytes":5}}}"#
+        #expect(ContainersModule.parseAPINetworkBytes(json) == Int64(15_748_332 + 5_905_274 + 15))
+        #expect(ContainersModule.parseAPINetworkBytes(#"{"id":"x"}"#) == nil)          // host networking: unknown, not zero
+        #expect(ContainersModule.parseAPINetworkBytes(#"{"networks":{}}"#) == nil)
+        #expect(ContainersModule.parseAPINetworkBytes(#"{"message":"No such container"}"#) == nil)
+        #expect(ContainersModule.parseAPINetworkBytes("not json") == nil)
     }
 
     @Test func statsIgnoreRowsItCannotRead() {
@@ -214,15 +231,27 @@ private func dockerTable(vmStartedAgo: TimeInterval = .days(1) - 3) -> [Int32: P
         let sockets = [
             SocketInfo(pid: 900, state: .established, localPort: 51_000, remotePort: 5432),   // psql client
             SocketInfo(pid: 901, state: .established, localPort: 51_001, remotePort: 5432),   // another client
-            SocketInfo(pid: 100, state: .established, localPort: 51_002, remotePort: 5432),   // the engine's own proxy
+            SocketInfo(pid: 100, state: .established, localPort: 51_002, remotePort: 5432),   // the engine's own outbound socket
             SocketInfo(pid: 100, state: .listen, localPort: 5432, remotePort: nil),
-            SocketInfo(pid: 100, state: .established, localPort: 5432, remotePort: 51_000),
+            SocketInfo(pid: 100, state: .established, localPort: 5432, remotePort: 51_000),   // proxy side of psql: same connection
             SocketInfo(pid: 902, state: .established, localPort: 51_003, remotePort: 6379),   // other port
             SocketInfo(pid: 903, state: .listen, localPort: 7000, remotePort: nil),
         ]
         #expect(ContainersModule.clientConnections(ports: [5432], sockets: sockets, excluding: [100, 101]) == 2)
         #expect(ContainersModule.clientConnections(ports: [], sockets: sockets, excluding: []) == 0)
         #expect(ContainersModule.clientConnections(ports: [5432, 6379], sockets: sockets, excluding: [100]) == 3)
+    }
+
+    @Test func clientsReachingTheProxyFromOutsideAreCounted() {
+        // A LAN/VPN client, or a container calling host.docker.internal:5432, shows up only as a
+        // socket accepted by the engine proxy with local port == published port.
+        let sockets = [
+            SocketInfo(pid: 100, state: .established, localPort: 5432, remotePort: 60_000),
+            SocketInfo(pid: 100, state: .established, localPort: 5432, remotePort: 60_001),
+            SocketInfo(pid: 100, state: .listen, localPort: 5432, remotePort: nil),
+        ]
+        #expect(ContainersModule.clientConnections(ports: [5432], sockets: sockets, excluding: [100]) == 2)
+        #expect(ContainersModule.clientConnections(ports: [5433], sockets: sockets, excluding: [100]) == 0)
     }
 }
 
@@ -234,6 +263,9 @@ private final class FakeDocker: Sendable {
         var stats = ""
         var inspect = ""
         var psStatus: Int32 = 0
+        /// Exact byte counters served by the (fake) Engine API; a missing name → API error.
+        var api: [String: Int64] = [:]
+        var socketOK = true
         var calls: [[String]] = []
     }
     let state = Mutex(State())
@@ -242,14 +274,22 @@ private final class FakeDocker: Sendable {
         { [self] cmd, args in
             state.withLock { $0.calls.append([cmd] + args) }
             let s = state.withLock { $0 }
+            func ok(_ out: String) -> CommandResult { CommandResult(status: 0, stdout: out, stderr: "", timedOut: false) }
             switch (cmd, args.first) {
             case ("docker", "ps"):
                 return s.psStatus == 0
-                    ? CommandResult(status: 0, stdout: s.ps, stderr: "", timedOut: false)
+                    ? ok(s.ps)
                     : CommandResult(status: 1, stdout: "", stderr: "Cannot connect to the Docker daemon", timedOut: false)
-            case ("docker", "stats"): return CommandResult(status: 0, stdout: s.stats, stderr: "", timedOut: false)
-            case ("docker", "inspect"): return CommandResult(status: 0, stdout: s.inspect, stderr: "", timedOut: false)
-            default: return CommandResult(status: 0, stdout: "", stderr: "", timedOut: false)
+            case ("docker", "stats"): return ok(s.stats)
+            case ("docker", "inspect"): return ok(s.inspect)
+            case ("docker", "context"):
+                return s.socketOK ? ok("unix:///tmp/fake-docker.sock\n") : CommandResult(status: 1, stdout: "", stderr: "no context", timedOut: false)
+            case ("/usr/bin/curl", _):
+                let url = args.last ?? ""
+                let name = url.components(separatedBy: "/containers/").last?.components(separatedBy: "/stats").first ?? ""
+                guard let bytes = s.api[name] else { return CommandResult(status: 7, stdout: "", stderr: "", timedOut: false) }
+                return ok(#"{"networks":{"eth0":{"rx_bytes":\#(bytes / 2),"tx_bytes":\#(bytes - bytes / 2)}}}"#)
+            default: return ok("")
             }
         }
     }
@@ -265,7 +305,16 @@ private func isoDate(_ date: Date) -> String {
     return f.string(from: date)
 }
 
-private struct Row { var name: String; var cpu = "0.00%"; var net = "1.2MB / 3.4MB"; var port: Int? = 5432; var age: TimeInterval = .days(12) }
+private struct Row {
+    var name: String
+    var cpu = "0.00%"
+    /// The rounded figure `docker stats` prints. Deliberately never used for the idle decision.
+    var net = "251MB / 156MB"
+    /// Exact counter from the Engine API; nil → the API can't answer for this container.
+    var api: Int64? = 407_000_000
+    var port: Int? = 5432
+    var age: TimeInterval = .days(12)
+}
 
 private func fakeDocker(_ rows: [Row]) -> FakeDocker {
     let d = FakeDocker()
@@ -280,11 +329,20 @@ private func apply(_ rows: [Row], to s: inout FakeDocker.State) {
         let ports = r.port.map { #"{"5432/tcp":[{"HostIp":"0.0.0.0","HostPort":"\#($0)"}]}"# } ?? "{}"
         return #"{"Name":"/\#(r.name)","State":{"StartedAt":"\#(isoDate(now.addingTimeInterval(-r.age)))"},"NetworkSettings":{"Ports":\#(ports)}}"#
     }.joined(separator: "\n")
+    s.api = [:]
+    for r in rows { if let api = r.api { s.api[r.name] = api } }
 }
 
 private func module(_ d: FakeDocker, quit: @escaping ContainersModule.AppAction = { _ in true }, launch: @escaping ContainersModule.AppAction = { _ in true }) -> ContainersModule {
     ContainersModule(run: d.run, quitApp: quit, launchApp: launch)
 }
+
+/// A scan context `minutes` after the first scan.
+private func ctx(_ minutes: Double = 0, processes: [Int32: ProcessInfoRecord] = [:], cpu: [Int32: Double] = [:], sockets: [SocketInfo] = []) -> ScanContext {
+    .testContext(now: fixedNow.addingTimeInterval(.minutes(minutes)), processes: processes, cpu: cpu, sockets: sockets)
+}
+
+private let client5432 = SocketInfo(pid: 900, state: .established, localPort: 51_000, remotePort: 5432)
 
 @Suite struct ContainersModuleTests {
     @Test func dockerDaemonDownYieldsNoItems() async {
@@ -300,70 +358,183 @@ private func module(_ d: FakeDocker, quit: @escaping ContainersModule.AppAction 
     @Test func daemonDownEvenWithEngineRunningYieldsNoItems() async {
         let d = FakeDocker()
         d.set { $0.psStatus = 1 }
-        #expect(await module(d).scan(.testContext(processes: dockerTable())).isEmpty)
+        #expect(await module(d).scan(ctx(processes: dockerTable())).isEmpty)
     }
 
-    @Test func firstScanIsInUseSecondScanIdle() async throws {
+    @Test func idleOnlyAfterTheTenMinuteWindow() async throws {
         let d = fakeDocker([Row(name: "orbit-trust-pg")])
         let m = module(d)
-        let first = await m.scan(.testContext())
+        let first = await m.scan(ctx(0))
         #expect(first.count == 1)
         #expect(first[0].judgement.verdict == .inUse)
 
-        let second = try #require(await m.scan(.testContext()).first)
-        #expect(second.id == .container(name: "orbit-trust-pg"))
-        #expect(second.category == .containers)
-        #expect(second.judgement.verdict == .idle)
-        #expect(second.judgement.fact == "idle 12 days")
-        #expect(second.detail["image"] == "postgres:16")
-        #expect(second.detail["ports"] == "5432")
+        // Five minutes in: still no baseline that is 10 minutes old.
+        #expect(try #require(await m.scan(ctx(5)).first).judgement.verdict == .inUse)
+
+        let later = try #require(await m.scan(ctx(11)).first)
+        #expect(later.id == .container(name: "orbit-trust-pg"))
+        #expect(later.category == .containers)
+        #expect(later.judgement.verdict == .idle)
+        #expect(later.judgement.fact == "idle 12 days")
+        #expect(later.detail["image"] == "postgres:16")
+        #expect(later.detail["ports"] == "5432")
     }
 
-    @Test func trafficBetweenScansMakesItBusy() async throws {
-        let d = fakeDocker([Row(name: "a", net: "1.2MB / 3.4MB")])
+    @Test func baselineYoungerThanTenMinutesIsInUse() async throws {
+        let d = fakeDocker([Row(name: "a")])
         let m = module(d)
-        _ = await m.scan(.testContext())
-        d.set { apply([Row(name: "a", net: "1.3MB / 3.5MB")], to: &$0) }
-        let item = try #require(await m.scan(.testContext()).first)
+        _ = await m.scan(ctx(0))
+        let item = try #require(await m.scan(ctx(9.5)).first)
+        #expect(item.judgement.verdict == .inUse)
+        #expect(item.judgement.fact == "measuring traffic")
+    }
+
+    @Test func roundedDockerStatsCannotHideRealTraffic() async throws {
+        // `docker stats` prints "251MB / 156MB" both times, but the exact counter moved by 2 MB.
+        let d = fakeDocker([Row(name: "a", net: "251MB / 156MB", api: 407_000_000)])
+        let m = module(d)
+        _ = await m.scan(ctx(0))
+        d.set { apply([Row(name: "a", net: "251MB / 156MB", api: 409_000_000)], to: &$0) }
+        let item = try #require(await m.scan(ctx(11)).first)
         #expect(item.judgement.verdict == .inUse)
         #expect(item.judgement.fact == "busy")
     }
 
-    @Test func counterResetIsTreatedAsUnknown() async throws {
-        let d = fakeDocker([Row(name: "a", net: "9MB / 9MB")])
+    @Test func tinyExactDeltaStaysIdle() async throws {
+        let d = fakeDocker([Row(name: "a", api: 407_000_000)])
         let m = module(d)
-        _ = await m.scan(.testContext())
-        d.set { apply([Row(name: "a", net: "1kB / 1kB")], to: &$0) }
-        #expect(try #require(await m.scan(.testContext()).first).judgement.verdict == .inUse)
+        _ = await m.scan(ctx(0))
+        d.set { apply([Row(name: "a", api: 407_001_000)], to: &$0) }
+        #expect(try #require(await m.scan(ctx(11)).first).judgement.verdict == .idle)
+    }
+
+    @Test func deltaIsMeasuredAgainstTheBaselineNotTheLastScan() async throws {
+        // Small steps every 30 s that add up to more than the threshold over 10+ minutes.
+        let d = fakeDocker([Row(name: "a", api: 1_000_000)])
+        let m = module(d)
+        var minutes = 0.0
+        var last: Item?
+        while minutes <= 11 {
+            d.set { apply([Row(name: "a", api: 1_000_000 + Int64(minutes * 60) * 500)], to: &$0) }   // 500 B/s
+            last = await m.scan(ctx(minutes)).first
+            minutes += 0.5
+        }
+        #expect(last?.judgement.verdict == .inUse)
+        #expect(last?.judgement.fact == "busy")
+    }
+
+    @Test func lowCPUForLessThanTenMinutesIsInUse() async throws {
+        let d = fakeDocker([Row(name: "a", cpu: "50.00%")])
+        let m = module(d)
+        _ = await m.scan(ctx(0))
+        // Busy at first, quiet only since minute 8; by minute 12 the traffic baseline is old enough but the CPU history is not.
+        d.set { apply([Row(name: "a", cpu: "0.00%")], to: &$0) }
+        _ = await m.scan(ctx(8))
+        let item = try #require(await m.scan(ctx(12)).first)
+        #expect(item.judgement.verdict == .inUse)
+        #expect(item.judgement.fact == "measuring activity")
+        // Ten minutes after it went quiet it is idle.
+        #expect(try #require(await m.scan(ctx(18.5)).first).judgement.verdict == .idle)
+    }
+
+    @Test func aCPUBlipRestartsTheCPUWindow() async throws {
+        let d = fakeDocker([Row(name: "a")])
+        let m = module(d)
+        _ = await m.scan(ctx(0))
+        d.set { apply([Row(name: "a", cpu: "35.00%")], to: &$0) }
+        _ = await m.scan(ctx(6))
+        d.set { apply([Row(name: "a", cpu: "0.00%")], to: &$0) }
+        #expect(try #require(await m.scan(ctx(11)).first).judgement.verdict == .inUse)
+    }
+
+    @Test func unavailableEngineAPIIsInUse() async throws {
+        let d = fakeDocker([Row(name: "a", api: nil)])
+        let m = module(d)
+        _ = await m.scan(ctx(0))
+        let item = try #require(await m.scan(ctx(11)).first)
+        #expect(item.judgement.verdict == .inUse)
+        #expect(item.judgement.fact == "measuring traffic")
+    }
+
+    @Test func unavailableSocketIsInUse() async throws {
+        let d = fakeDocker([Row(name: "a")])
+        d.set { $0.socketOK = false }
+        let m = module(d)
+        _ = await m.scan(ctx(0))
+        #expect(try #require(await m.scan(ctx(11)).first).judgement.verdict == .inUse)
+        #expect(d.calls.allSatisfy { $0.first != "/usr/bin/curl" })
+    }
+
+    @Test func apiOutageResetsTheBaseline() async throws {
+        let d = fakeDocker([Row(name: "a")])
+        let m = module(d)
+        _ = await m.scan(ctx(0))
+        d.set { apply([Row(name: "a", api: nil)], to: &$0) }
+        _ = await m.scan(ctx(6))
+        d.set { apply([Row(name: "a")], to: &$0) }
+        #expect(try #require(await m.scan(ctx(11)).first).judgement.verdict == .inUse)   // history was dropped at minute 6
+    }
+
+    @Test func usesTheExactEngineAPICallAndSocketOnce() async {
+        let d = fakeDocker([Row(name: "a"), Row(name: "b")])
+        let m = module(d)
+        _ = await m.scan(ctx(0))
+        _ = await m.scan(ctx(1))
+        #expect(d.count("context") == 1)
+        let curl = d.calls.filter { $0.first == "/usr/bin/curl" }
+        #expect(curl.count == 4)
+        #expect(Set(curl.map { $0.last ?? "" }) == [
+            "http://localhost/containers/a/stats?stream=false&one-shot=true",
+            "http://localhost/containers/b/stats?stream=false&one-shot=true",
+        ])
+        #expect(curl[0].starts(with: ["/usr/bin/curl", "--silent", "--max-time", "10", "--unix-socket", "/tmp/fake-docker.sock"]))
+    }
+
+    @Test func counterResetIsTreatedAsUnknown() async throws {
+        let d = fakeDocker([Row(name: "a", api: 9_000_000)])
+        let m = module(d)
+        _ = await m.scan(ctx(0))
+        d.set { apply([Row(name: "a", api: 1_000)], to: &$0) }
+        #expect(try #require(await m.scan(ctx(11)).first).judgement.verdict == .inUse)
     }
 
     @Test func connectedClientMakesItInUse() async throws {
         let d = fakeDocker([Row(name: "a")])
         let m = module(d)
-        _ = await m.scan(.testContext())
-        let sockets = [SocketInfo(pid: 900, state: .established, localPort: 51_000, remotePort: 5432)]
-        let item = try #require(await m.scan(.testContext(sockets: sockets)).first)
+        _ = await m.scan(ctx(0))
+        let item = try #require(await m.scan(ctx(11, sockets: [client5432])).first)
         #expect(item.judgement.verdict == .inUse)
         #expect(item.judgement.fact == "1 connection")
     }
 
-    @Test func engineProxySocketsAreNotClients() async throws {
+    @Test func engineProxyOutboundSocketsAreNotClients() async throws {
         let d = fakeDocker([Row(name: "a")])
         let m = module(d)
-        let ctxProcs = dockerTable()
-        _ = await m.scan(.testContext(processes: ctxProcs))
+        let procs = dockerTable()
+        _ = await m.scan(ctx(0, processes: procs))
         let sockets = [SocketInfo(pid: 100, state: .established, localPort: 51_000, remotePort: 5432)]
-        let items = await m.scan(.testContext(processes: ctxProcs, sockets: sockets))
+        let items = await m.scan(ctx(11, processes: procs, sockets: sockets))
         #expect(items.first { $0.id == .container(name: "a") }?.judgement.verdict == .idle)
+    }
+
+    @Test func lanClientSeenOnlyThroughTheProxyMakesItInUse() async throws {
+        let d = fakeDocker([Row(name: "a")])
+        let m = module(d)
+        let procs = dockerTable()
+        _ = await m.scan(ctx(0, processes: procs))
+        let sockets = [SocketInfo(pid: 100, state: .established, localPort: 5432, remotePort: 60_000)]
+        let items = await m.scan(ctx(11, processes: procs, sockets: sockets))
+        #expect(items.first { $0.id == .container(name: "a") }?.judgement.verdict == .inUse)
+        #expect(items.first { $0.id == .container(name: "a") }?.judgement.fact == "1 connection")
     }
 
     @Test func emitsEngineItemWhenEngineRunsAndEverythingIdle() async throws {
         let d = fakeDocker([Row(name: "a"), Row(name: "b", port: 5433)])
         let m = module(d)
         let procs = dockerTable()
-        let ctx = ScanContext.testContext(processes: procs, cpu: [100: 50, 101: 100, 102: 25])
-        _ = await m.scan(ctx)
-        let items = await m.scan(ctx)
+        let cpu: [Int32: Double] = [100: 50, 101: 100, 102: 25]
+        _ = await m.scan(ctx(0, processes: procs, cpu: cpu))
+        let items = await m.scan(ctx(11, processes: procs, cpu: cpu))
         #expect(items.count == 3)
         let engine = try #require(items.first { $0.id == .engine(name: "Docker Desktop") })
         #expect(engine.name == "Docker Desktop")
@@ -382,16 +553,16 @@ private func module(_ d: FakeDocker, quit: @escaping ContainersModule.AppAction 
         let d = fakeDocker([Row(name: "a"), Row(name: "b", port: 5433)])
         let m = module(d)
         let procs = dockerTable()
-        _ = await m.scan(.testContext(processes: procs))
+        _ = await m.scan(ctx(0, processes: procs))
         let sockets = [SocketInfo(pid: 900, state: .established, localPort: 51_000, remotePort: 5433)]
-        let items = await m.scan(.testContext(processes: procs, sockets: sockets))
+        let items = await m.scan(ctx(11, processes: procs, sockets: sockets))
         let engine = try #require(items.first { $0.id == .engine(name: "Docker Desktop") })
         #expect(engine.judgement.verdict == .inUse)
     }
 
     @Test func engineWithZeroContainersIsIdle() async throws {
         let d = fakeDocker([])
-        let items = await module(d).scan(.testContext(processes: dockerTable()))
+        let items = await module(d).scan(ctx(processes: dockerTable()))
         #expect(items.count == 1)
         #expect(items[0].id == .engine(name: "Docker Desktop"))
         #expect(items[0].judgement.verdict == .idle)
@@ -399,7 +570,7 @@ private func module(_ d: FakeDocker, quit: @escaping ContainersModule.AppAction 
 
     @Test func noEngineItemWhenNoEngineProcesses() async {
         let d = fakeDocker([Row(name: "a")])
-        let items = await module(d).scan(.testContext())
+        let items = await module(d).scan(ctx())
         #expect(items.allSatisfy { $0.id != .engine(name: "Docker Desktop") })
         #expect(items.first?.detail["engine"] == nil)
     }
@@ -408,7 +579,7 @@ private func module(_ d: FakeDocker, quit: @escaping ContainersModule.AppAction 
         let d = fakeDocker([])
         var procs = dockerTable()
         procs[10] = .fixture(pid: 10, name: "OrbStack", path: "/Applications/OrbStack.app/Contents/MacOS/OrbStack")
-        let items = await module(d).scan(.testContext(processes: procs))
+        let items = await module(d).scan(ctx(processes: procs))
         #expect(items.count == 2)
         #expect(items.allSatisfy { $0.judgement.verdict == .inUse })
     }
@@ -417,45 +588,43 @@ private func module(_ d: FakeDocker, quit: @escaping ContainersModule.AppAction 
         let d = fakeDocker([Row(name: "a")])
         d.set { $0.stats = "" }
         let m = module(d)
-        _ = await m.scan(.testContext())
-        let item = try #require(await m.scan(.testContext()).first)
-        #expect(item.judgement.verdict == .inUse)
+        _ = await m.scan(ctx(0))
+        #expect(try #require(await m.scan(ctx(11)).first).judgement.verdict == .inUse)
     }
 
     @Test func containerWithoutInspectDataIsInUse() async throws {
         let d = fakeDocker([Row(name: "a")])
         d.set { $0.inspect = "" }
         let m = module(d)
-        _ = await m.scan(.testContext())
-        #expect(try #require(await m.scan(.testContext()).first).judgement.verdict == .inUse)
+        _ = await m.scan(ctx(0))
+        #expect(try #require(await m.scan(ctx(11)).first).judgement.verdict == .inUse)
     }
 
     @Test func cachedScanDoesNotRunDockerAgain() async throws {
         let d = fakeDocker([Row(name: "a")])
         let m = module(d)
-        _ = await m.scan(.testContext())
-        _ = await m.scan(.testContext())
+        _ = await m.scan(ctx(0))
+        _ = await m.scan(ctx(11))
         let before = d.calls.count
-        var cached = ScanContext.testContext()
-        cached = ScanContext(now: cached.now, processes: [:], cpu: [:], sockets: [], frontmostBundleID: nil, ownPID: cached.ownPID, runExternal: false)
-        let item = try #require(await m.scan(cached).first)
+        func cached(_ minutes: Double, sockets: [SocketInfo] = []) -> ScanContext {
+            ScanContext(now: fixedNow.addingTimeInterval(.minutes(minutes)), processes: [:], cpu: [:], sockets: sockets,
+                        frontmostBundleID: nil, ownPID: getpid(), runExternal: false)
+        }
+        #expect(try #require(await m.scan(cached(11.2)).first).judgement.verdict == .idle)
         #expect(d.calls.count == before)
-        #expect(item.judgement.verdict == .idle)
         // …but client connections are always live.
-        let live = ScanContext(now: cached.now, processes: [:], cpu: [:], sockets: [SocketInfo(pid: 900, state: .established, localPort: 51_000, remotePort: 5432)],
-                               frontmostBundleID: nil, ownPID: cached.ownPID, runExternal: false)
-        #expect(try #require(await m.scan(live).first).judgement.verdict == .inUse)
+        #expect(try #require(await m.scan(cached(11.2, sockets: [client5432])).first).judgement.verdict == .inUse)
     }
 
     @Test func cachedScanBeforeAnyRealScanIsEmpty() async {
         let m = module(fakeDocker([Row(name: "a")]))
-        let ctx = ScanContext(now: now, processes: [:], cpu: [:], sockets: [], frontmostBundleID: nil, ownPID: 1, runExternal: false)
-        #expect(await m.scan(ctx).isEmpty)
+        let c = ScanContext(now: now, processes: [:], cpu: [:], sockets: [], frontmostBundleID: nil, ownPID: 1, runExternal: false)
+        #expect(await m.scan(c).isEmpty)
     }
 
     @Test func inspectIsBatchedInOneCall() async {
         let d = fakeDocker([Row(name: "a"), Row(name: "b"), Row(name: "c")])
-        _ = await module(d).scan(.testContext())
+        _ = await module(d).scan(ctx())
         #expect(d.count("inspect") == 1)
         let inspect = d.calls.first { $0.dropFirst().first == "inspect" } ?? []
         #expect(Array(inspect.suffix(3)) == ["a", "b", "c"])
@@ -464,15 +633,15 @@ private func module(_ d: FakeDocker, quit: @escaping ContainersModule.AppAction 
     // MARK: stop / undo
 
     private func idleContainerItem(_ m: ContainersModule) async throws -> Item {
-        _ = await m.scan(.testContext())
-        return try #require(await m.scan(.testContext()).first)
+        _ = await m.scan(ctx(0))
+        return try #require(await m.scan(ctx(11)).first)
     }
 
     @Test func stopsIdleContainerAndOffersUndo() async throws {
         let d = fakeDocker([Row(name: "evone-postgres")])
         let m = module(d)
         let item = try await idleContainerItem(m)
-        let result = await m.stop(item, ctx: .testContext())
+        let result = await m.stop(item, ctx: ctx(11))
         #expect(result == .stopped(UndoToken(identity: .container(name: "evone-postgres"), action: "start", arguments: ["evone-postgres"])))
         #expect(d.calls.last == ["docker", "stop", "evone-postgres"])
     }
@@ -480,10 +649,10 @@ private func module(_ d: FakeDocker, quit: @escaping ContainersModule.AppAction 
     @Test func refusesToStopInUseContainer() async throws {
         let d = fakeDocker([Row(name: "a", cpu: "50.00%")])
         let m = module(d)
-        _ = await m.scan(.testContext())
-        let item = try #require(await m.scan(.testContext()).first)
+        _ = await m.scan(ctx(0))
+        let item = try #require(await m.scan(ctx(11)).first)
         #expect(item.judgement.verdict == .inUse)
-        let result = await m.stop(item, ctx: .testContext())
+        let result = await m.stop(item, ctx: ctx(11))
         guard case .skipped = result else { Issue.record("expected skipped, got \(result)"); return }
         #expect(d.count("stop") == 0)
     }
@@ -492,9 +661,26 @@ private func module(_ d: FakeDocker, quit: @escaping ContainersModule.AppAction 
         let d = fakeDocker([Row(name: "a")])
         let m = module(d)
         let item = try await idleContainerItem(m)
-        let sockets = [SocketInfo(pid: 900, state: .established, localPort: 51_000, remotePort: 5432)]
-        let result = await m.stop(item, ctx: .testContext(sockets: sockets))
+        let result = await m.stop(item, ctx: ctx(11, sockets: [client5432]))
         guard case .skipped = result else { Issue.record("expected skipped, got \(result)"); return }
+        #expect(d.count("stop") == 0)
+    }
+
+    @Test func rechecksExactTrafficRightBeforeStopping() async throws {
+        let d = fakeDocker([Row(name: "a", api: 407_000_000)])
+        let m = module(d)
+        let item = try await idleContainerItem(m)
+        d.set { $0.api["a"] = 407_500_000 }   // 500 kB since the scan
+        guard case .skipped = await m.stop(item, ctx: ctx(11)) else { Issue.record("expected skipped"); return }
+        #expect(d.count("stop") == 0)
+    }
+
+    @Test func doesNotStopWhenTrafficCannotBeRechecked() async throws {
+        let d = fakeDocker([Row(name: "a")])
+        let m = module(d)
+        let item = try await idleContainerItem(m)
+        d.set { $0.api = [:] }
+        guard case .skipped = await m.stop(item, ctx: ctx(11)) else { Issue.record("expected skipped"); return }
         #expect(d.count("stop") == 0)
     }
 

@@ -7,12 +7,16 @@ import SwiftUI
 struct MenuBarPopover: View {
     @Environment(AppModel.self) private var model
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
+    /// The popover's own panel, so it can be dismissed explicitly.
+    @State private var panel: NSWindow?
 
-    /// The three categories using the most CPU. Restart is advice, not something to tick.
+    /// The three categories using the most CPU (ties broken by id so rows never swap places).
+    /// Restart is advice, not something to tick.
     private var topCategories: [CategorySummary] {
         Array(model.snapshot.categories
             .filter { $0.id != .restart }
-            .sorted { $0.cores > $1.cores }
+            .sorted { ($0.cores, $1.id.rawValue) > ($1.cores, $0.id.rawValue) }
             .prefix(3))
     }
 
@@ -20,31 +24,67 @@ struct MenuBarPopover: View {
         VStack(spacing: 10) {
             header
             list
+            if let toast = model.toast {
+                ToastView(toast: toast) { Task { await model.undoLast() } }
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .id(toast.id)
+            }
             CleanUpButton()
+            footer
+        }
+        .animation(.snappy, value: model.toast?.id)
+        .padding(14)
+        .frame(width: 290)
+        .background(WindowVisibility { model.popoverVisible = $0 } onWindow: { panel = $0 })
+        .onAppear { model.popoverVisible = true }
+        .onDisappear { model.popoverVisible = false }
+    }
+
+    // MARK: Footer
+
+    private var footer: some View {
+        HStack(spacing: 8) {
             Button {
                 NSApp.activate()
                 openWindow(id: "main")
+                dismissPanel()
             } label: {
                 Text("Open full view")
                     .font(.callout)
                     .foregroundStyle(Palette.blue)
-                    .frame(maxWidth: .infinity)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-        }
-        .padding(14)
-        .frame(width: 290)
-        .overlay(alignment: .bottom) {
-            if let toast = model.toast {
-                ToastView(toast: toast) { Task { await model.undoLast() } }
-                    .padding(.bottom, 80)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-                    .id(toast.id)
+            Spacer(minLength: 0)
+            iconButton("gearshape", label: "Settings", help: "Settings") {
+                NSApp.activate()
+                openSettings()
+                dismissPanel()
+            }
+            iconButton("power", label: "Quit CleanUp", help: "Quit CleanUp") {
+                NSApp.terminate(nil)
             }
         }
-        .onAppear { model.popoverVisible = true }
-        .onDisappear { model.popoverVisible = false }
+    }
+
+    private func iconButton(_ symbol: String, label: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 12, weight: .medium))
+                .frame(width: 26, height: 26)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .glassEffect(.regular.interactive(), in: .circle)
+        .help(help)
+        .accessibilityLabel(label)
+    }
+
+    /// Closes the popover if it is still the key window (opening another window normally dismisses it).
+    private func dismissPanel() {
+        DispatchQueue.main.async {
+            if let panel, panel.isKeyWindow { panel.close() }
+        }
     }
 
     // MARK: Header

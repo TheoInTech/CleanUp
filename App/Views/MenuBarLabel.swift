@@ -10,7 +10,6 @@ struct MenuBarLabel: View {
     var body: some View {
         MenuBarLabelContent(
             mood: model.snapshot.mood,
-            load: MenuBarGlyph.load(of: model.snapshot),
             minutes: model.hasScanned ? Self.minutes(in: model.snapshot) : nil
         )
     }
@@ -25,13 +24,11 @@ struct MenuBarLabel: View {
 /// Split from `MenuBarLabel` so the debug renderer can draw it without a model.
 struct MenuBarLabelContent: View {
     let mood: Mood
-    /// 0...1: how much of the ring is filled.
-    let load: Double
     let minutes: String?
 
     var body: some View {
         HStack(spacing: 4) {
-            Image(nsImage: MenuBarGlyph.image(mood: mood, load: load))
+            Image(nsImage: MenuBarGlyph.image(mood: mood))
                 .renderingMode(.original)
             if let minutes {
                 Text(minutes).monospacedDigit()
@@ -42,34 +39,27 @@ struct MenuBarLabelContent: View {
     }
 }
 
-/// The 14 pt ring: a faint track with an arc in the mood color showing how busy the CPU is.
+/// The 14 pt ring, a full circle in the mood color. Rendered once per mood and reused, so the label
+/// doesn't redraw an image on every 5 s refresh.
+@MainActor
 enum MenuBarGlyph {
     static let size: CGFloat = 14
+    private static var cache: [Mood: NSImage] = [:]
 
-    /// Share of the CPU in use, so a calm Mac shows a short arc and a drained one a nearly full ring.
-    static func load(of snapshot: Snapshot) -> Double {
-        let cores = Double(ProcessInfo.processInfo.activeProcessorCount)
-        return min(1, max(0, snapshot.coresBusy / cores))
-    }
-
-    @MainActor
-    static func image(mood: Mood, load: Double) -> NSImage {
-        let color = Palette.color(mood)
-        let ring = ZStack {
-            Circle().stroke(Palette.gray.opacity(0.45), lineWidth: 2.5)
-            Circle()
-                .trim(from: 0, to: max(0.12, load))
-                .stroke(color, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
-                .rotationEffect(.degrees(-90))
-        }
-        .padding(1.25)
-        .frame(width: size, height: size)
+    static func image(mood: Mood) -> NSImage {
+        if let cached = cache[mood] { return cached }
+        let ring = Circle()
+            .strokeBorder(Palette.color(mood), lineWidth: 2.5)
+            .padding(0.5)
+            .frame(width: size, height: size)
 
         let renderer = ImageRenderer(content: ring)
-        renderer.scale = NSScreen.main?.backingScaleFactor ?? 2
+        // The menu bar sits on the primary screen; 2x if no screen is reachable.
+        renderer.scale = NSScreen.screens.first?.backingScaleFactor ?? 2
         let image = renderer.nsImage ?? NSImage(size: NSSize(width: size, height: size))
         // The ring is colored on purpose: the menu bar must not turn it into a monochrome template.
         image.isTemplate = false
+        cache[mood] = image
         return image
     }
 }

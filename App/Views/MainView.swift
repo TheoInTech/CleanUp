@@ -55,6 +55,7 @@ struct MainView: View {
         .sheet(item: Binding(get: { model.explaining }, set: { model.explaining = $0 })) { item in
             ExplainSheet(item: item).environment(model)
         }
+        .background(WindowVisibility { model.windowVisible = $0 })
         .onAppear {
             model.windowVisible = true
             NSApp.activate()

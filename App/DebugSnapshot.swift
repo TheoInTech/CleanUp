@@ -79,10 +79,10 @@ enum DebugSnapshot {
         window.orderOut(nil)
 
         let strip = HStack(spacing: 28) {
-            MenuBarLabelContent(mood: .allGood, load: 0.2, minutes: "2h 5m")
-            MenuBarLabelContent(mood: .busy, load: 0.5, minutes: "58m")
-            MenuBarLabelContent(mood: .drainingFast, load: 0.9, minutes: "35m")
-            MenuBarLabelContent(mood: .allGood, load: 0.2, minutes: nil)
+            MenuBarLabelContent(mood: .allGood, minutes: "2h 5m")
+            MenuBarLabelContent(mood: .busy, minutes: "58m")
+            MenuBarLabelContent(mood: .drainingFast, minutes: "35m")
+            MenuBarLabelContent(mood: .allGood, minutes: nil)
         }
         .foregroundStyle(.white)
         .padding(14)

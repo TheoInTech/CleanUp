@@ -59,12 +59,31 @@ public protocol CategoryModule: Sendable {
     /// CleanUp's own process tree, id validation. Engines are never forced.
     func stop(_ item: Item, ctx: ScanContext, force: Bool) async -> StopResult
     func undo(_ token: UndoToken) async -> Bool
+    /// Forget every observation window (quiet clocks, traffic baselines, "watched for"): the time
+    /// since the last scan wasn't watched, e.g. the Mac slept. Modules with no windows do nothing.
+    func restartObservation()
 }
 
 extension CategoryModule {
     /// A normal (not forced) stop.
     public func stop(_ item: Item, ctx: ScanContext) async -> StopResult {
         await stop(item, ctx: ctx, force: false)
+    }
+
+    public func restartObservation() {}
+}
+
+/// How observation windows treat time CleanUp didn't watch.
+public enum Observation {
+    /// Scans come every 5 s (window open) or 60 s (background). A longer gap between two scans
+    /// (sleep, App Nap, a stuck refresh) wasn't watched, so it can't count as quiet time: every
+    /// window starts over.
+    public static let maxGap: TimeInterval = 150
+
+    /// True when `now` is more than `maxGap` after `last`.
+    public static func isGap(since last: Date?, now: Date) -> Bool {
+        guard let last else { return false }
+        return now.timeIntervalSince(last) > maxGap
     }
 }
 

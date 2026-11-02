@@ -33,3 +33,15 @@ public struct Item: Codable, Identifiable, Hashable, Sendable {
         self.detail = detail
     }
 }
+
+extension Item {
+    /// A copy with one more detail entry.
+    func with(detail key: String, _ value: String) -> Item {
+        var detail = self.detail
+        detail[key] = value
+        return Item(
+            id: id, category: category, name: name, symbol: symbol, judgement: judgement, cores: cores,
+            memoryBytes: memoryBytes, processes: processes, detail: detail
+        )
+    }
+}

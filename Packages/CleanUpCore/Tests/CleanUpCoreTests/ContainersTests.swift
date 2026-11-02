@@ -270,6 +270,11 @@ private final class FakeDocker: Sendable {
         /// Exact byte counters served by the (fake) Engine API; a missing name → API error.
         var api: [String: Int64] = [:]
         var socketOK = true
+        var contextHost = "unix:///Users/me/.docker/run/docker.sock"
+        /// Each Engine API call takes this long; `curlInFlight`/`curlPeak` track how many overlap.
+        var curlDelay: Duration?
+        var curlInFlight = 0
+        var curlPeak = 0
         var orbList = CommandResult(status: 0, stdout: "", stderr: "", timedOut: false)
         var calls: [[String]] = []
     }
@@ -288,9 +293,14 @@ private final class FakeDocker: Sendable {
             case ("docker", "stats"): return ok(s.stats)
             case ("docker", "inspect"): return ok(s.inspect)
             case ("docker", "context"):
-                return s.socketOK ? ok("unix:///tmp/fake-docker.sock\n") : CommandResult(status: 1, stdout: "", stderr: "no context", timedOut: false)
+                return s.socketOK ? ok(s.contextHost + "\n") : CommandResult(status: 1, stdout: "", stderr: "no context", timedOut: false)
             case ("orb", "list"): return s.orbList
             case ("/usr/bin/curl", _):
+                if let delay = s.curlDelay {
+                    state.withLock { $0.curlInFlight += 1; $0.curlPeak = max($0.curlPeak, $0.curlInFlight) }
+                    try? await Task.sleep(for: delay)
+                    state.withLock { $0.curlInFlight -= 1 }
+                }
                 let url = args.last ?? ""
                 let name = url.components(separatedBy: "/containers/").last?.components(separatedBy: "/stats").first ?? ""
                 guard let bytes = s.api[name] else { return CommandResult(status: 7, stdout: "", stderr: "", timedOut: false) }
@@ -351,11 +361,11 @@ private func apply(_ rows: [Row], to s: inout FakeDocker.State) {
 }
 
 private func module(_ d: FakeDocker, quit: @escaping ContainersModule.AppAction = { _ in true }, launch: @escaping ContainersModule.AppAction = { _ in true }) -> ContainersModule {
-    ContainersModule(run: d.run, quitApp: quit, launchApp: launch)
+    ContainersModule(run: d.run, quitApp: quit, launchApp: launch, home: "/Users/me", resolveLink: { $0 })
 }
 
-/// A scan context `minutes` after the first scan.
-private func ctx(_ minutes: Double = 0, processes: [Int32: ProcessInfoRecord] = [:], cpu: [Int32: Double] = [:], sockets: [SocketInfo] = []) -> ScanContext {
+/// A scan context `minutes` after the first scan, with Docker Desktop running unless told otherwise.
+private func ctx(_ minutes: Double = 0, processes: [Int32: ProcessInfoRecord] = dockerTable(), cpu: [Int32: Double] = [:], sockets: [SocketInfo] = []) -> ScanContext {
     .testContext(now: fixedNow.addingTimeInterval(.minutes(minutes)), processes: processes, cpu: cpu, sockets: sockets)
 }
 
@@ -367,7 +377,7 @@ private let quietEngineCPU: [Int32: Double] = [100: 1, 101: 1.5, 102: 1, 103: 0]
 /// Scans once a minute from `from` to `to` (inclusive), as the refresh loop does; returns the last scan.
 private func scanEveryMinute(
     _ m: ContainersModule, from: Double = 0, to: Double,
-    processes: [Int32: ProcessInfoRecord] = [:], cpu: [Int32: Double] = [:], sockets: [SocketInfo] = []
+    processes: [Int32: ProcessInfoRecord] = dockerTable(), cpu: [Int32: Double] = [:], sockets: [SocketInfo] = []
 ) async -> [Item] {
     var last: [Item] = []
     var minute = from
@@ -396,6 +406,7 @@ private func orbStackTable() -> [Int32: ProcessInfoRecord] {
 }
 
 private let quietOrbCPU: [Int32: Double] = [10: 1, 11: 1]
+private let orbContext = "unix:///Users/me/.orbstack/run/docker.sock"
 
 // MARK: - Shells, attached sessions and dev containers
 
@@ -407,7 +418,7 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
 @Suite struct AttachedContainerTests {
     private func judged(_ rows: [Row], with p: ProcessInfoRecord, name: String = "evone-postgres") async -> Item? {
         let m = module(fakeDocker(rows))
-        let items = await scanEveryMinute(m, to: 11, processes: processTable(p))
+        let items = await scanEveryMinute(m, to: 11, processes: withProcess(dockerTable(), p))
         return items.first { $0.id == .container(name: name) }
     }
 
@@ -479,10 +490,142 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
         let m = module(d)
         let item = try #require(await scanEveryMinute(m, to: 11).first)
         #expect(item.judgement.verdict == .idle)
-        let shell = processTable(.fixture(pid: 600, ppid: 50, name: "docker", path: "/usr/local/bin/docker",
-                                          arguments: ["docker", "exec", "-it", "evone-postgres", "bash"]))
+        let shell = withProcess(dockerTable(), .fixture(pid: 600, ppid: 50, name: "docker", path: "/usr/local/bin/docker",
+                                                        arguments: ["docker", "exec", "-it", "evone-postgres", "bash"]))
         let result = await m.stop(item, ctx: ctx(11, processes: shell))
         #expect(result == .skipped(reason: "evone-postgres is used by docker"))
+        #expect(d.count("stop") == 0)
+    }
+}
+
+// MARK: - Gaps, polling and the docker context
+
+@Suite struct ContainerObservationTests {
+    @Test func aGapBetweenScansStartsTheWindowsOver() async throws {
+        // Asleep (or App Nap) from minute 5 to 20: those 15 minutes were not watched.
+        let m = module(fakeDocker([Row(name: "a")]))
+        _ = await scanEveryMinute(m, to: 5, cpu: quietEngineCPU)
+        let woke = try #require(await m.scan(ctx(20, cpu: quietEngineCPU)).first)
+        #expect(woke.judgement.verdict == .inUse)
+        #expect(try #require(await scanEveryMinute(m, from: 21, to: 29, cpu: quietEngineCPU).first).judgement.verdict == .inUse)
+        #expect(try #require(await m.scan(ctx(30, cpu: quietEngineCPU)).first).judgement.verdict == .idle)
+    }
+
+    @Test func aGapRestartsTheEngineQuietClock() async {
+        let m = module(fakeDocker([]))
+        _ = await scanEveryMinute(m, to: 8, cpu: quietEngineCPU)
+        #expect(engine(await m.scan(ctx(12, cpu: quietEngineCPU)))?.judgement.verdict == .inUse)   // 4 min gap
+        #expect(engine(await scanEveryMinute(m, from: 13, to: 21, cpu: quietEngineCPU))?.judgement.verdict == .inUse)
+        #expect(engine(await m.scan(ctx(22, cpu: quietEngineCPU)))?.judgement.verdict == .idle)
+    }
+
+    @Test func gapsUpToTwoAndAHalfMinutesAreFine() async throws {
+        let m = module(fakeDocker([Row(name: "a")]))
+        var minute = 0.0
+        var last: Item?
+        while minute <= 12.5 {
+            last = await m.scan(ctx(minute)).first
+            minute += 2.5
+        }
+        #expect(last?.judgement.verdict == .idle)
+        #expect(Observation.maxGap == 150)
+    }
+
+    @Test func restartObservationForgetsWhatWasWatched() async throws {
+        let m = module(fakeDocker([Row(name: "a")]))
+        #expect(try #require(await scanEveryMinute(m, to: 11).first).judgement.verdict == .idle)
+        m.restartObservation()   // e.g. the Mac just woke up
+        #expect(try #require(await m.scan(ctx(11.5)).first).judgement.verdict == .inUse)
+    }
+
+    @Test func engineAPICallsRunAtMostFourAtATime() async {
+        let rows = (1...10).map { Row(name: "c\($0)", port: 7_000 + $0) }
+        let d = fakeDocker(rows)
+        d.set { $0.curlDelay = .milliseconds(30) }
+        _ = await module(d).scan(ctx())
+        #expect(d.calls.filter { $0.first == "/usr/bin/curl" }.count == 10)
+        #expect(d.state.withLock { $0.curlPeak } <= 4)
+        #expect(d.state.withLock { $0.curlPeak } >= 2)
+    }
+
+    @Test func dockerContextIsMappedToTheEngine() {
+        let home = "/Users/me"
+        func target(_ host: String) -> ContainersModule.ContextTarget {
+            ContainersModule.contextTarget(host: host, home: home, resolveLink: { $0 == "/var/run/docker.sock" ? "/Users/me/.orbstack/run/docker.sock" : $0 })
+        }
+        #expect(target("unix:///Users/me/.docker/run/docker.sock") == .engine(.dockerDesktop, profile: nil))
+        #expect(target("unix:///Users/me/.orbstack/run/docker.sock") == .engine(.orbStack, profile: nil))
+        #expect(target("unix:///Users/me/.colima/default/docker.sock") == .engine(.colima, profile: "default"))
+        #expect(target("unix:///Users/me/.colima/docker.sock") == .engine(.colima, profile: "default"))
+        #expect(target("unix:///Users/me/.colima/work/docker.sock") == .engine(.colima, profile: "work"))
+        // /var/run/docker.sock is a link: whatever it points at decides.
+        #expect(target("unix:///var/run/docker.sock") == .engine(.orbStack, profile: nil))
+        #expect(ContainersModule.contextTarget(host: "unix:///var/run/docker.sock", home: home, resolveLink: { $0 }) == .engine(.dockerDesktop, profile: nil))
+        #expect(target("tcp://10.0.0.5:2376") == .elsewhere)
+        #expect(target("ssh://me@build-box") == .elsewhere)
+        #expect(target("unix:///Users/other/.docker/run/docker.sock") == .elsewhere)
+        #expect(target("") == .elsewhere)
+    }
+
+    @Test func aRemoteContextMakesEverythingInUse() async throws {
+        let d = fakeDocker([Row(name: "a")])
+        d.set { $0.contextHost = "tcp://10.0.0.5:2376" }
+        let items = await scanEveryMinute(module(d), to: 25, cpu: quietEngineCPU)
+        let container = try #require(items.first { $0.id == .container(name: "a") })
+        #expect(container.judgement.verdict == .inUse)
+        #expect(container.judgement.fact == "on another Docker host")
+        #expect(container.detail["engine"] == nil)
+        #expect(engine(items)?.judgement.verdict == .inUse)
+        #expect(engine(items)?.judgement.fact == "docker is pointed elsewhere")
+        #expect(d.calls.allSatisfy { $0.first != "/usr/bin/curl" })
+    }
+
+    @Test func aContextOfAnotherEngineKeepsTheRunningOneInUse() async {
+        // Docker Desktop runs, but docker talks to OrbStack's socket: what docker ps shows isn't Docker Desktop's.
+        let d = fakeDocker([])
+        d.set { $0.contextHost = orbContext }
+        let item = engine(await scanEveryMinute(module(d), to: 15, cpu: quietEngineCPU))
+        #expect(item?.judgement.verdict == .inUse)
+        #expect(item?.judgement.fact == "docker is pointed elsewhere")
+    }
+
+    @Test func anUnreadableContextIsInUse() async {
+        let d = fakeDocker([])
+        d.set { $0.socketOK = false }
+        let item = engine(await scanEveryMinute(module(d), to: 15, cpu: quietEngineCPU))
+        #expect(item?.judgement.verdict == .inUse)
+        #expect(item?.judgement.fact == "couldn't read the docker context")
+    }
+
+    @Test func colimaProfileComesFromTheContextAndMustBeTheOneRunning() async {
+        func colima(_ instance: String) -> [Int32: ProcessInfoRecord] {
+            processTable(
+                .fixture(pid: 20, name: "limactl", path: "/opt/homebrew/bin/limactl",
+                         arguments: ["limactl", "hostagent", "--pidfile", "/Users/me/.colima/_lima/\(instance)/ha.pid", instance], startedAgo: .hours(2)),
+                .fixture(pid: 21, name: "com.apple.Virtualization.VirtualMachine", path: vmPath, startedAgo: .hours(2) - 1)
+            )
+        }
+        let cpu: [Int32: Double] = [20: 0.5, 21: 2]
+        let d = fakeDocker([])
+        d.set { $0.contextHost = "unix:///Users/me/.colima/work/docker.sock" }
+        let work = engine(await scanEveryMinute(module(d), to: 10, processes: colima("colima-work"), cpu: cpu), "Colima")
+        #expect(work?.judgement.verdict == .idle)
+        #expect(work?.detail["profile"] == "work")
+
+        let other = engine(await scanEveryMinute(module(d), to: 10, processes: colima("colima"), cpu: cpu), "Colima")
+        #expect(other?.judgement.verdict == .inUse)
+        #expect(other?.detail["profile"] == nil)
+    }
+
+    @Test func stopWithoutATrafficSampleFailsClosed() async {
+        // No scan has measured this container's traffic: never stop on trust.
+        let d = fakeDocker([Row(name: "a")])
+        let item = Item(
+            id: .container(name: "a"), category: .containers, name: "a", symbol: "shippingbox",
+            judgement: Judgement(verdict: .idle, fact: "idle 3 days", signals: []), cores: 0, memoryBytes: 0,
+            processes: [], detail: ["ports": "5432"]
+        )
+        #expect(await module(d).stop(item, ctx: ctx()) == .skipped(reason: "couldn't check a's traffic"))
         #expect(d.count("stop") == 0)
     }
 }
@@ -532,7 +675,9 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
                      arguments: ["limactl", "hostagent", "--pidfile", "/Users/me/.colima/_lima/colima/ha.pid", "colima"], startedAgo: .hours(2)),
             .fixture(pid: 21, name: "com.apple.Virtualization.VirtualMachine", path: vmPath, startedAgo: .hours(2) - 1)
         )
-        let m = module(fakeDocker([]))
+        let d = fakeDocker([])
+        d.set { $0.contextHost = "unix:///Users/me/.colima/default/docker.sock" }
+        let m = module(d)
         let item = engine(await scanEveryMinute(m, to: 10, processes: procs, cpu: [20: 0.5, 21: 2]), "Colima")
         #expect(item?.judgement.verdict == .idle)
     }
@@ -569,6 +714,7 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
 
     @Test func aRunningOrbStackMachineKeepsItInUse() async {
         let d = fakeDocker([])
+        d.set { $0.contextHost = orbContext }
         d.set { $0.orbList = CommandResult(status: 0, stdout: "NAME    STATE    DISTRO  VERSION  ARCH\nubuntu  running  ubuntu  noble    arm64\n", stderr: "", timedOut: false) }
         let item = engine(await scanEveryMinute(module(d), to: 15, processes: orbStackTable(), cpu: quietOrbCPU), "OrbStack")
         #expect(item?.judgement.verdict == .inUse)
@@ -577,6 +723,7 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
 
     @Test func orbStackMachinesThatCantBeListedCountAsRunning() async {
         let d = fakeDocker([])
+        d.set { $0.contextHost = orbContext }
         d.set { $0.orbList = CommandResult(status: 1, stdout: "", stderr: "boom", timedOut: false) }
         let item = engine(await scanEveryMinute(module(d), to: 15, processes: orbStackTable(), cpu: quietOrbCPU), "OrbStack")
         #expect(item?.judgement.verdict == .inUse)
@@ -585,9 +732,10 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
 
     @Test func orbStackWithOnlyStoppedMachinesCanBeIdle() async {
         let d = fakeDocker([])
+        d.set { $0.contextHost = orbContext }
         d.set { $0.orbList = CommandResult(status: 0, stdout: "NAME    STATE    DISTRO  VERSION  ARCH\nubuntu  stopped  ubuntu  noble    arm64\n", stderr: "", timedOut: false) }
         let item = engine(await scanEveryMinute(module(d), to: 10, processes: orbStackTable(), cpu: quietOrbCPU), "OrbStack")
-        #expect(item?.judgement.verdict == .idle)
+        #expect(item?.judgement.verdict == .idle, "\(String(describing: item?.judgement))")
         #expect(d.calls.contains(["orb", "list"]))
     }
 
@@ -625,12 +773,12 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
 @Suite struct ContainersModuleTests {
     @Test func dockerDaemonDownYieldsNoItems() async {
         let m = ContainersModule(run: { _, _ in CommandResult(status: 1, stdout: "", stderr: "Cannot connect to the Docker daemon", timedOut: false) })
-        #expect(await m.scan(.testContext()).isEmpty)
+        #expect(await m.scan(ctx()).isEmpty)
     }
 
     @Test func dockerTimeoutYieldsNoItems() async {
         let m = ContainersModule(run: { _, _ in CommandResult(status: 137, stdout: "{}", stderr: "", timedOut: true) })
-        #expect(await m.scan(.testContext()).isEmpty)
+        #expect(await m.scan(ctx()).isEmpty)
     }
 
     @Test func daemonDownEvenWithEngineRunningYieldsNoItems() async {
@@ -643,13 +791,13 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
         let d = fakeDocker([Row(name: "orbit-trust-pg")])
         let m = module(d)
         let first = await m.scan(ctx(0))
-        #expect(first.count == 1)
+        #expect(first.filter { $0.id == .container(name: "orbit-trust-pg") }.count == 1)
         #expect(first[0].judgement.verdict == .inUse)
 
         // Five minutes in: still no baseline that is 10 minutes old.
-        #expect(try #require(await m.scan(ctx(5)).first).judgement.verdict == .inUse)
+        #expect(try #require(await scanEveryMinute(m, from: 1, to: 5).first).judgement.verdict == .inUse)
 
-        let later = try #require(await m.scan(ctx(11)).first)
+        let later = try #require(await scanEveryMinute(m, from: 6, to: 11).first)
         #expect(later.id == .container(name: "orbit-trust-pg"))
         #expect(later.category == .containers)
         #expect(later.judgement.verdict == .idle)
@@ -661,7 +809,7 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
     @Test func baselineYoungerThanTenMinutesIsInUse() async throws {
         let d = fakeDocker([Row(name: "a")])
         let m = module(d)
-        _ = await m.scan(ctx(0))
+        _ = await scanEveryMinute(m, to: 9)
         let item = try #require(await m.scan(ctx(9.5)).first)
         #expect(item.judgement.verdict == .inUse)
         #expect(item.judgement.fact == "measuring traffic")
@@ -673,7 +821,8 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
         let m = module(d)
         _ = await m.scan(ctx(0))
         d.set { apply([Row(name: "a", net: "251MB / 156MB", api: 409_000_000)], to: &$0) }
-        let item = try #require(await m.scan(ctx(11)).first)
+        // At minute 10 the window reaches back to the 2 MB that moved in the first minute.
+        let item = try #require(await scanEveryMinute(m, from: 1, to: 10).first)
         #expect(item.judgement.verdict == .inUse)
         #expect(item.judgement.fact == "busy")
     }
@@ -683,7 +832,7 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
         let m = module(d)
         _ = await m.scan(ctx(0))
         d.set { apply([Row(name: "a", api: 407_001_000)], to: &$0) }
-        #expect(try #require(await m.scan(ctx(11)).first).judgement.verdict == .idle)
+        #expect(try #require(await scanEveryMinute(m, from: 1, to: 11).first).judgement.verdict == .idle)
     }
 
     @Test func deltaIsMeasuredAgainstTheBaselineNotTheLastScan() async throws {
@@ -704,15 +853,14 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
     @Test func lowCPUForLessThanTenMinutesIsInUse() async throws {
         let d = fakeDocker([Row(name: "a", cpu: "50.00%")])
         let m = module(d)
-        _ = await m.scan(ctx(0))
+        _ = await scanEveryMinute(m, to: 7)
         // Busy at first, quiet only since minute 8; by minute 12 the traffic baseline is old enough but the CPU history is not.
         d.set { apply([Row(name: "a", cpu: "0.00%")], to: &$0) }
-        _ = await m.scan(ctx(8))
-        let item = try #require(await m.scan(ctx(12)).first)
+        let item = try #require(await scanEveryMinute(m, from: 8, to: 12).first)
         #expect(item.judgement.verdict == .inUse)
         #expect(item.judgement.fact == "measuring activity")
         // Ten minutes after it went quiet it is idle.
-        #expect(try #require(await m.scan(ctx(18.5)).first).judgement.verdict == .idle)
+        #expect(try #require(await scanEveryMinute(m, from: 13, to: 18).first).judgement.verdict == .idle)
     }
 
     @Test func aCPUBlipRestartsTheCPUWindow() async throws {
@@ -720,9 +868,9 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
         let m = module(d)
         _ = await m.scan(ctx(0))
         d.set { apply([Row(name: "a", cpu: "35.00%")], to: &$0) }
-        _ = await m.scan(ctx(6))
+        _ = await scanEveryMinute(m, from: 1, to: 6)
         d.set { apply([Row(name: "a", cpu: "0.00%")], to: &$0) }
-        #expect(try #require(await m.scan(ctx(11)).first).judgement.verdict == .inUse)
+        #expect(try #require(await scanEveryMinute(m, from: 7, to: 11).first).judgement.verdict == .inUse)
     }
 
     @Test func unavailableEngineAPIIsInUse() async throws {
@@ -748,24 +896,25 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
         let m = module(d)
         _ = await m.scan(ctx(0))
         d.set { apply([Row(name: "a", api: nil)], to: &$0) }
-        _ = await m.scan(ctx(6))
+        _ = await scanEveryMinute(m, from: 1, to: 6)
         d.set { apply([Row(name: "a")], to: &$0) }
-        #expect(try #require(await m.scan(ctx(11)).first).judgement.verdict == .inUse)   // history was dropped at minute 6
+        #expect(try #require(await scanEveryMinute(m, from: 7, to: 11).first).judgement.verdict == .inUse)   // history was dropped at minute 6
     }
 
-    @Test func usesTheExactEngineAPICallAndSocketOnce() async {
+    @Test func usesTheExactEngineAPICallAndReadsTheContextEachTime() async {
         let d = fakeDocker([Row(name: "a"), Row(name: "b")])
         let m = module(d)
         _ = await m.scan(ctx(0))
         _ = await m.scan(ctx(1))
-        #expect(d.count("context") == 1)
+        // `docker context use` can switch engines at any time.
+        #expect(d.count("context") == 2)
         let curl = d.calls.filter { $0.first == "/usr/bin/curl" }
         #expect(curl.count == 4)
         #expect(Set(curl.map { $0.last ?? "" }) == [
             "http://localhost/containers/a/stats?stream=false&one-shot=true",
             "http://localhost/containers/b/stats?stream=false&one-shot=true",
         ])
-        #expect(curl[0].starts(with: ["/usr/bin/curl", "--silent", "--max-time", "10", "--unix-socket", "/tmp/fake-docker.sock"]))
+        #expect(curl[0].starts(with: ["/usr/bin/curl", "--silent", "--max-time", "10", "--unix-socket", "/Users/me/.docker/run/docker.sock"]))
     }
 
     @Test func counterResetIsTreatedAsUnknown() async throws {
@@ -773,14 +922,14 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
         let m = module(d)
         _ = await m.scan(ctx(0))
         d.set { apply([Row(name: "a", api: 1_000)], to: &$0) }
-        #expect(try #require(await m.scan(ctx(11)).first).judgement.verdict == .inUse)
+        // The counter went back at minute 1: no baseline ten minutes old since then.
+        #expect(try #require(await scanEveryMinute(m, from: 1, to: 10).first).judgement.verdict == .inUse)
     }
 
     @Test func connectedClientMakesItInUse() async throws {
         let d = fakeDocker([Row(name: "a")])
         let m = module(d)
-        _ = await m.scan(ctx(0))
-        let item = try #require(await m.scan(ctx(11, sockets: [client5432])).first)
+        let item = try #require(await scanEveryMinute(m, to: 11, sockets: [client5432]).first)
         #expect(item.judgement.verdict == .inUse)
         #expect(item.judgement.fact == "1 connection")
     }
@@ -789,9 +938,8 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
         let d = fakeDocker([Row(name: "a")])
         let m = module(d)
         let procs = dockerTable()
-        _ = await m.scan(ctx(0, processes: procs))
         let sockets = [SocketInfo(pid: 100, state: .established, localPort: 51_000, remotePort: 5432)]
-        let items = await m.scan(ctx(11, processes: procs, sockets: sockets))
+        let items = await scanEveryMinute(m, to: 11, processes: procs, sockets: sockets)
         #expect(items.first { $0.id == .container(name: "a") }?.judgement.verdict == .idle)
     }
 
@@ -848,11 +996,11 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
         #expect(items[0].judgement.fact == "measuring activity")
     }
 
-    @Test func noEngineItemWhenNoEngineProcesses() async {
+    @Test func noEngineMeansDockerIsNeverAsked() async {
+        // Polling `docker` with no engine up can start one (or a helper); with nothing running, claim nothing.
         let d = fakeDocker([Row(name: "a")])
-        let items = await module(d).scan(ctx())
-        #expect(items.allSatisfy { $0.id != .engine(name: "Docker Desktop") })
-        #expect(items.first?.detail["engine"] == nil)
+        #expect(await module(d).scan(ctx(processes: [:])).isEmpty)
+        #expect(d.calls.isEmpty)
     }
 
     @Test func twoEnginesMakeTheEngineVerdictUncertain() async {
@@ -883,11 +1031,10 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
     @Test func cachedScanDoesNotRunDockerAgain() async throws {
         let d = fakeDocker([Row(name: "a")])
         let m = module(d)
-        _ = await m.scan(ctx(0))
-        _ = await m.scan(ctx(11))
+        _ = await scanEveryMinute(m, to: 11)
         let before = d.calls.count
         func cached(_ minutes: Double, sockets: [SocketInfo] = []) -> ScanContext {
-            ScanContext(now: fixedNow.addingTimeInterval(.minutes(minutes)), processes: [:], cpu: [:], sockets: sockets,
+            ScanContext(now: fixedNow.addingTimeInterval(.minutes(minutes)), processes: dockerTable(), cpu: [:], sockets: sockets,
                         frontmostBundleID: nil, ownPID: getpid(), runExternal: false)
         }
         #expect(try #require(await m.scan(cached(11.2)).first).judgement.verdict == .idle)
@@ -913,8 +1060,7 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
     // MARK: stop / undo
 
     private func idleContainerItem(_ m: ContainersModule) async throws -> Item {
-        _ = await m.scan(ctx(0))
-        return try #require(await m.scan(ctx(11)).first)
+        try #require(await scanEveryMinute(m, to: 11).first)
     }
 
     @Test func stopsIdleContainerAndOffersUndo() async throws {
@@ -993,7 +1139,7 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
             processes: [], detail: ["ports": "5432"]
         )
         let m = ContainersModule(run: { _, _ in CommandResult(status: 1, stdout: "", stderr: "Error response from daemon: boom\nmore", timedOut: false) })
-        #expect(await m.stop(item, ctx: .testContext()) == .failed(reason: "Error response from daemon: boom"))
+        #expect(await m.stop(item, ctx: .testContext(), force: true) == .failed(reason: "Error response from daemon: boom"))
     }
 
     @Test func refusesUnsafeContainerNames() async {
@@ -1014,9 +1160,10 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
         #expect(d.calls == [["docker", "start", "a"]])
     }
 
-    private func engineItem(_ engine: ContainerEngine, verdict: Verdict = .idle, appPath: String?) -> Item {
+    private func engineItem(_ engine: ContainerEngine, verdict: Verdict = .idle, appPath: String?, profile: String? = nil) -> Item {
         var detail = ["ports": "5432"]
         if let appPath { detail["appPath"] = appPath }
+        if let profile { detail["profile"] = profile }
         return Item(
             id: .engine(name: engine.rawValue), category: .containers, name: engine.rawValue, symbol: "gearshape.2",
             judgement: Judgement(verdict: verdict, fact: "idle engine", signals: []), cores: 0, memoryBytes: 0,
@@ -1035,13 +1182,20 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
         #expect(d.calls.isEmpty)
     }
 
-    @Test func stopsColimaWithItsOwnCommand() async {
+    @Test func stopsColimaWithItsOwnCommandAndProfile() async {
         let d = FakeDocker()
         let m = module(d, quit: { _ in Issue.record("must not quit an app"); return false })
-        let item = engineItem(.colima, appPath: nil)
+        let item = engineItem(.colima, appPath: nil, profile: "work")
         let result = await m.stop(item, ctx: .testContext())
-        #expect(result == .stopped(UndoToken(identity: item.id, action: "colima-start", arguments: [])))
-        #expect(d.calls == [["colima", "stop"]])
+        #expect(result == .stopped(UndoToken(identity: item.id, action: "colima-start", arguments: ["work"])))
+        #expect(d.calls == [["colima", "stop", "-p", "work"]])
+    }
+
+    @Test func colimaWithoutAKnownProfileIsNotStopped() async {
+        let d = FakeDocker()
+        guard case .failed = await module(d).stop(engineItem(.colima, appPath: nil), ctx: .testContext()) else { Issue.record("expected failure"); return }
+        guard case .failed = await module(d).stop(engineItem(.colima, appPath: nil, profile: "--all"), ctx: .testContext()) else { Issue.record("expected failure"); return }
+        #expect(d.calls.isEmpty)
     }
 
     @Test func engineStopFailsWhenAppCannotBeQuit() async {
@@ -1081,8 +1235,9 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
         let m = module(d, launch: { path in launches.withLock { $0.append(path) }; return true })
         #expect(await m.undo(UndoToken(identity: .engine(name: "Docker Desktop"), action: "launch", arguments: ["/Applications/Docker.app"])))
         #expect(launches.withLock { $0 } == ["/Applications/Docker.app"])
-        #expect(await m.undo(UndoToken(identity: .engine(name: "Colima"), action: "colima-start", arguments: [])))
-        #expect(d.calls == [["colima", "start"]])
+        #expect(await m.undo(UndoToken(identity: .engine(name: "Colima"), action: "colima-start", arguments: ["work"])))
+        #expect(d.calls == [["colima", "start", "-p", "work"]])
+        #expect(await m.undo(UndoToken(identity: .engine(name: "Colima"), action: "colima-start", arguments: ["-x"])) == false)
         #expect(await m.undo(UndoToken(identity: .engine(name: "x"), action: "bogus", arguments: [])) == false)
     }
 }

@@ -124,12 +124,19 @@ public struct EngineFacts: Sendable {
     public let machines: Machines
     /// Another container engine is running too, so we can't tell whose containers these are.
     public let otherEngineRunning: Bool
+    /// Whether the docker CLI's current context talks to this engine. Only then are the containers
+    /// `docker ps` lists this engine's.
+    public let endpoint: Endpoint
     /// Since when every condition has held without a break; nil when they don't hold now.
     public let quietSince: Date?
 
+    public enum Endpoint: Sendable, Equatable {
+        case matches, elsewhere, unknown
+    }
+
     public init(
         engine: ContainerEngine, containerVerdicts: [Verdict], clients: [String], overheadPercent: Double?,
-        machines: Machines, otherEngineRunning: Bool, quietSince: Date?
+        machines: Machines, otherEngineRunning: Bool, endpoint: Endpoint = .matches, quietSince: Date?
     ) {
         self.engine = engine
         self.containerVerdicts = containerVerdicts
@@ -137,6 +144,7 @@ public struct EngineFacts: Sendable {
         self.overheadPercent = overheadPercent
         self.machines = machines
         self.otherEngineRunning = otherEngineRunning
+        self.endpoint = endpoint
         self.quietSince = quietSince
     }
 }
@@ -176,6 +184,16 @@ public enum EngineJudge {
         if f.otherEngineRunning {
             signals.append(Signal(kind: .inUse, text: "More than one container engine is running, so we can't tell which one hosts the containers"))
             reasons.append("another engine is running")
+        }
+
+        switch f.endpoint {
+        case .matches: break
+        case .elsewhere:
+            signals.append(Signal(kind: .inUse, text: "docker talks to another engine or host, so its containers can't be seen"))
+            reasons.append("docker is pointed elsewhere")
+        case .unknown:
+            signals.append(Signal(kind: .inUse, text: "Couldn't read which engine docker talks to"))
+            reasons.append("couldn't read the docker context")
         }
 
         let containers = ContainersModule.engineJudgement(containerVerdicts: f.containerVerdicts)
@@ -231,6 +249,8 @@ struct DetectedEngine: Sendable {
     let vm: [ProcessInfoRecord]
     /// The `.app` bundle to quit; nil for Colima.
     let appPath: String?
+    /// Colima only: the profiles whose VM is running (`default`, `work`, …).
+    var colimaProfiles: Set<String> = []
 
     var allPIDs: Set<Int32> { Set((processes + vm).map(\.pid)) }
 }
@@ -249,6 +269,8 @@ public struct ContainersModule: CategoryModule {
     private let run: Run
     private let quitApp: AppAction
     private let launchApp: AppAction
+    private let home: String
+    private let resolveLink: @Sendable (String) -> String
 
     private struct Collected: Sendable {
         let name: String
@@ -277,8 +299,14 @@ public struct ContainersModule: CategoryModule {
         /// `observationWindow` old (the baseline) and everything after it.
         var samples: [String: [NetSample]] = [:]
         var lowCPUSince: [String: Date] = [:]
-        /// Docker Engine API socket, discovered once.
+        /// Where the docker CLI's current context points, read on every external scan; nil when it
+        /// couldn't be read.
+        var context: ContextTarget?
+        /// Docker Engine API socket of that context, when it is a local engine's.
         var socketPath: String?
+        /// When docker was last asked, and when engines were last judged: for spotting unwatched gaps.
+        var lastCollect: Date?
+        var lastEngineScan: Date?
         /// OrbStack's Linux machines at the last external scan.
         var orbMachines: EngineFacts.Machines = .unknown
         /// Since when each engine has been quiet without a break.
@@ -291,10 +319,27 @@ public struct ContainersModule: CategoryModule {
 
     private let memory = OSAllocatedUnfairLock(initialState: Memory())
 
-    public init(run: Run? = nil, quitApp: AppAction? = nil, launchApp: AppAction? = nil) {
+    /// - Parameters:
+    ///   - home: the user's home, where engines keep their sockets (`~/.docker/run`, `~/.orbstack`, `~/.colima`).
+    ///   - resolveLink: resolves symbolic links in a socket path (`/var/run/docker.sock` is usually one).
+    public init(
+        run: Run? = nil, quitApp: AppAction? = nil, launchApp: AppAction? = nil,
+        home: String = NSHomeDirectory(),
+        resolveLink: (@Sendable (String) -> String)? = nil
+    ) {
         self.run = run ?? { await Self.defaultRun($0, $1) }
         self.quitApp = quitApp ?? { await Self.defaultQuit($0) }
         self.launchApp = launchApp ?? { await Self.defaultLaunch($0) }
+        self.home = home
+        self.resolveLink = resolveLink ?? { ($0 as NSString).resolvingSymlinksInPath }
+    }
+
+    public func restartObservation() {
+        memory.withLock { state in
+            state.samples = [:]
+            state.lowCPUSince = [:]
+            state.engineQuietSince = [:]
+        }
     }
 
     // MARK: scan
@@ -315,14 +360,39 @@ public struct ContainersModule: CategoryModule {
     private func collect(ctx: ScanContext) async -> [Collected]? {
         let now = ctx.now
         let engines = Self.detectEngines(ctx.processes)
+        // No engine running: asking docker could start one (or a helper). Claim nothing.
+        guard !engines.isEmpty else {
+            memory.withLock { $0 = Memory() }
+            return nil
+        }
+        memory.withLock { state in
+            if Observation.isGap(since: state.lastCollect, now: now) {
+                state.samples = [:]
+                state.lowCPUSince = [:]
+            }
+            state.lastCollect = max(state.lastCollect ?? now, now)
+        }
         async let orbList: CommandResult? = engines.contains { $0.engine == .orbStack } ? run("orb", ["list"]) : nil
+        async let contextResult = run("docker", ["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"])
         let ps = await run("docker", ["ps", "--format", "{{json .}}"])
         let machines = await orbList.map(Self.orbMachines) ?? .unknown
+        let context = await contextResult
         guard ps.status == 0, !ps.timedOut else {
             memory.withLock { $0 = Memory() }
             return nil
         }
-        memory.withLock { $0.orbMachines = machines }
+        let host = context.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let target = (context.status == 0 && !context.timedOut)
+            ? Self.contextTarget(host: host, home: home, resolveLink: resolveLink) : nil
+        memory.withLock { state in
+            state.orbMachines = machines
+            state.context = target
+            if case .engine = target, host.hasPrefix("unix:///") {
+                state.socketPath = String(host.dropFirst("unix://".count))
+            } else {
+                state.socketPath = nil
+            }
+        }
         let running = Self.parsePS(ps.stdout)
         guard !running.isEmpty else {
             memory.withLock { state in
@@ -335,7 +405,7 @@ public struct ContainersModule: CategoryModule {
 
         async let statsResult = run("docker", ["stats", "--no-stream", "--format", "{{json .}}"])
         async let inspectResult = run("docker", ["inspect", "--format", Self.inspectTemplate] + running.map(\.name))
-        let socket = await engineSocket()
+        let socket = memory.withLock { $0.socketPath }
         let counters = await networkBytes(of: running.map(\.name), socket: socket)
         let stats = await statsResult
         let inspect = await inspectResult
@@ -379,29 +449,55 @@ public struct ContainersModule: CategoryModule {
 
     // MARK: Docker Engine API
 
-    /// The engine's unix socket from the current docker context, e.g. `~/.docker/run/docker.sock`.
-    private func engineSocket() async -> String? {
-        if let known = memory.withLock({ $0.socketPath }) { return known }
-        let result = await run("docker", ["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"])
-        guard result.status == 0, !result.timedOut else { return nil }
-        let host = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard host.hasPrefix("unix://") else { return nil }
-        let path = String(host.dropFirst("unix://".count))
-        guard path.hasPrefix("/") else { return nil }
-        memory.withLock { $0.socketPath = path }
-        return path
+    /// Where a docker context endpoint leads: one of the engines on this Mac (by its socket), or
+    /// somewhere else (a remote host, another user's socket, a path we don't know).
+    public enum ContextTarget: Sendable, Equatable {
+        case engine(ContainerEngine, profile: String?)
+        case elsewhere
     }
 
-    /// Exact rx + tx bytes per container from the Engine API, fetched concurrently (each call has a
+    /// Maps `docker context inspect`'s Host to an engine: `~/.docker/run/…` or `/var/run/docker.sock`
+    /// → Docker Desktop, `~/.orbstack/…` → OrbStack, `~/.colima/<profile>/…` → that Colima profile.
+    /// Links are resolved first (`/var/run/docker.sock` often points at OrbStack's or Colima's socket).
+    static func contextTarget(host: String, home: String, resolveLink: (String) -> String) -> ContextTarget {
+        guard host.hasPrefix("unix:///") else { return .elsewhere }
+        let raw = String(host.dropFirst("unix://".count))
+        let path = resolveLink(raw)
+        let homeDir = home.hasSuffix("/") ? String(home.dropLast()) : home
+        if path == "/var/run/docker.sock" || path == "/private/var/run/docker.sock" || path.hasPrefix(homeDir + "/.docker/run/") {
+            return .engine(.dockerDesktop, profile: nil)
+        }
+        if path.hasPrefix(homeDir + "/.orbstack/") { return .engine(.orbStack, profile: nil) }
+        let colima = homeDir + "/.colima/"
+        if path.hasPrefix(colima) {
+            let parts = path.dropFirst(colima.count).split(separator: "/").map(String.init)
+            guard let first = parts.first else { return .elsewhere }
+            if first == "docker.sock" { return .engine(.colima, profile: "default") }
+            guard first != "_lima", isSafeName(first) else { return .elsewhere }
+            return .engine(.colima, profile: first)
+        }
+        return .elsewhere
+    }
+
+    /// At most this many Engine API calls run at once.
+    static let maxConcurrentAPICalls = 4
+
+    /// Exact rx + tx bytes per container from the Engine API, a few at a time (each call has a
     /// 10 s cap). Containers whose counter can't be read are absent.
     private func networkBytes(of names: [String], socket: String?) async -> [String: Int64] {
         guard let socket else { return [:] }
         return await withTaskGroup(of: (String, Int64?).self) { group in
-            for name in names {
+            var pending = names[...]
+            func startNext() {
+                guard let name = pending.popFirst() else { return }
                 group.addTask { (name, await self.apiNetworkBytes(name: name, socket: socket)) }
             }
+            for _ in 0..<Self.maxConcurrentAPICalls { startNext() }
             var found: [String: Int64] = [:]
-            for await (name, bytes) in group { if let bytes { found[name] = bytes } }
+            for await (name, bytes) in group {
+                if let bytes { found[name] = bytes }
+                startNext()
+            }
             return found
         }
     }
@@ -432,8 +528,15 @@ public struct ContainersModule: CategoryModule {
 
     private func buildItems(_ collected: [Collected], ctx: ScanContext) -> [Item] {
         let engines = Self.detectEngines(ctx.processes)
+        // The engine quit since docker was last asked: what was listed is gone with it.
+        guard !engines.isEmpty else { return [] }
         let proxyPIDs = engines.reduce(into: Set<Int32>()) { $0.formUnion($1.allPIDs) }
         let sessions = collected.isEmpty ? nil : SessionIndex(ctx.processes, ownPID: ctx.ownPID)
+        let context = memory.withLock { $0.context }
+        let endpoints = Dictionary(uniqueKeysWithValues: engines.map { ($0.engine, Self.endpoint(context, of: $0)) })
+        // The containers docker lists belong to the engine its context points at, if that one runs here.
+        let host = engines.first { endpoints[$0.engine] == .matches }
+        let elsewhere: String? = host != nil ? nil : (context == nil ? "couldn't read the docker context" : "on another Docker host")
 
         var containerItems: [Item] = []
         var verdicts: [Verdict] = []
@@ -441,7 +544,9 @@ public struct ContainersModule: CategoryModule {
         var containersCPU = 0.0
         for c in collected.sorted(by: { $0.name < $1.name }) {
             let users = sessions?.users(name: c.name, id: c.id, service: c.service) ?? []
-            let item = Self.containerItem(c, engine: engines.first?.engine, proxyPIDs: proxyPIDs, attachedBy: users, ctx: ctx)
+            let item = Self.containerItem(
+                c, engine: host?.engine, elsewhere: elsewhere, proxyPIDs: proxyPIDs, attachedBy: users, ctx: ctx
+            )
             containerItems.append(item)
             verdicts.append(item.judgement.verdict)
             allPorts.formUnion(c.ports ?? [])
@@ -449,7 +554,11 @@ public struct ContainersModule: CategoryModule {
         }
 
         let clients = Self.dockerClients(in: ctx.processes, ownPID: ctx.ownPID)
-        let machines = memory.withLock { $0.orbMachines }
+        let machines = memory.withLock { state -> EngineFacts.Machines in
+            if Observation.isGap(since: state.lastEngineScan, now: ctx.now) { state.engineQuietSince = [:] }
+            state.lastEngineScan = max(state.lastEngineScan ?? ctx.now, ctx.now)
+            return state.orbMachines
+        }
         let engineItems = engines.map { e -> Item in
             let (overhead, cores) = Self.overhead(of: e, containersCPU: containersCPU, cpu: ctx.cpu)
             // Two engines can run at once but the docker CLI talks to only one of them, so we can't say
@@ -457,18 +566,32 @@ public struct ContainersModule: CategoryModule {
             let draft = EngineFacts(
                 engine: e.engine, containerVerdicts: verdicts, clients: clients, overheadPercent: overhead,
                 machines: e.engine == .orbStack ? machines : .notApplicable,
-                otherEngineRunning: engines.count > 1, quietSince: nil
+                otherEngineRunning: engines.count > 1, endpoint: endpoints[e.engine] ?? .unknown, quietSince: nil
             )
             let since = rememberQuiet(e.engine, quiet: EngineJudge.isQuietNow(draft), now: ctx.now)
             let facts = EngineFacts(
                 engine: draft.engine, containerVerdicts: verdicts, clients: clients, overheadPercent: overhead,
-                machines: draft.machines, otherEngineRunning: draft.otherEngineRunning, quietSince: since
+                machines: draft.machines, otherEngineRunning: draft.otherEngineRunning, endpoint: draft.endpoint,
+                quietSince: since
             )
-            return Self.engineItem(e, facts: facts, cores: cores, ports: allPorts, ctx: ctx)
+            var item = Self.engineItem(e, facts: facts, cores: cores, ports: allPorts, ctx: ctx)
+            if e.engine == .colima, draft.endpoint == .matches, case .engine(_, let profile?) = context {
+                item = item.with(detail: "profile", profile)
+            }
+            return item
         }
         let running = Set(engines.map(\.engine))
         memory.withLock { state in state.engineQuietSince = state.engineQuietSince.filter { running.contains($0.key) } }
         return containerItems + engineItems
+    }
+
+    /// Whether the docker context talks to this engine. A Colima context matches only while that
+    /// profile, and no other, is the one running.
+    private static func endpoint(_ context: ContextTarget?, of e: DetectedEngine) -> EngineFacts.Endpoint {
+        guard let context else { return .unknown }
+        guard case .engine(let engine, let profile) = context, engine == e.engine else { return .elsewhere }
+        if engine == .colima { return e.colimaProfiles == [profile ?? "default"] ? .matches : .elsewhere }
+        return .matches
     }
 
     /// Starts, keeps or clears the engine's quiet clock; returns since when it has been quiet.
@@ -530,7 +653,7 @@ public struct ContainersModule: CategoryModule {
     }
 
     private static func containerItem(
-        _ c: Collected, engine: ContainerEngine?, proxyPIDs: Set<Int32>, attachedBy: [String], ctx: ScanContext
+        _ c: Collected, engine: ContainerEngine?, elsewhere: String?, proxyPIDs: Set<Int32>, attachedBy: [String], ctx: ScanContext
     ) -> Item {
         var detail = ["image": c.image, "id": c.id]
         if let service = c.service { detail["service"] = service }
@@ -540,7 +663,14 @@ public struct ContainersModule: CategoryModule {
 
         let judgement: Judgement
         var cores = 0.0
-        if let startedAt = c.startedAt, let ports = c.ports, let cpu = c.cpuPercent {
+        if let elsewhere {
+            // Not this Mac's engine (or we can't tell): its connections and sessions can't be seen from here.
+            cores = 0
+            judgement = Judgement(
+                verdict: .inUse, fact: elsewhere,
+                signals: [Signal(kind: .inUse, text: "docker talks to another engine or host, so CleanUp can't tell who uses it")]
+            )
+        } else if let startedAt = c.startedAt, let ports = c.ports, let cpu = c.cpuPercent {
             cores = cpu / 100
             let facts = ContainerFacts(
                 name: c.name, image: c.image, startedAt: startedAt, cpuPercent: cpu, publishedPorts: ports,
@@ -658,12 +788,28 @@ public struct ContainersModule: CategoryModule {
                 engine: engine,
                 processes: processes.sorted { $0.pid < $1.pid },
                 vm: (vmByEngine[engine] ?? []).sorted { $0.pid < $1.pid },
-                appPath: appBundle(of: processes, engine: engine)
+                appPath: appBundle(of: processes, engine: engine),
+                colimaProfiles: engine == .colima ? colimaProfiles(processes) : []
             )
         }
     }
 
     private static func leaf(_ p: ProcessInfoRecord) -> String { (p.path as NSString).lastPathComponent }
+
+    /// Lima instances `colima` (profile `default`) and `colima-<profile>`, from `…/.colima/_lima/<instance>/…`.
+    private static func colimaProfiles(_ processes: [ProcessInfoRecord]) -> Set<String> {
+        var profiles = Set<String>()
+        for p in processes {
+            for argument in p.arguments {
+                for part in argument.components(separatedBy: "_lima/").dropFirst() {
+                    let instance = String(part.prefix { $0 != "/" })
+                    if instance == "colima" { profiles.insert("default") }
+                    else if instance.hasPrefix("colima-") { profiles.insert(String(instance.dropFirst("colima-".count))) }
+                }
+            }
+        }
+        return profiles
+    }
 
     private static func engine(of p: ProcessInfoRecord) -> ContainerEngine? {
         if p.path.contains("/Docker.app/Contents/MacOS/") { return .dockerDesktop }
@@ -829,11 +975,14 @@ public struct ContainersModule: CategoryModule {
         }
         guard Self.isSafeName(item.name) else { return .failed(reason: "Unexpected container name") }
         // Traffic since the last scan (moments ago) must still be negligible, measured exactly.
-        let (last, socket) = memory.withLock { ($0.samples[item.name]?.last, $0.socketPath) }
-        if checkActivity, let last {
-            guard let socket, let bytes = await apiNetworkBytes(name: item.name, socket: socket),
-                  bytes >= last.bytes, bytes - last.bytes < ContainerJudge.idleNetBytes else {
-                return .skipped(reason: "\(item.name) has network traffic, or it couldn't be checked")
+        // No sample to compare with means it can't be checked: never stop on trust.
+        if checkActivity {
+            let (last, socket) = memory.withLock { ($0.samples[item.name]?.last, $0.socketPath) }
+            guard let last, let socket, let bytes = await apiNetworkBytes(name: item.name, socket: socket) else {
+                return .skipped(reason: "couldn't check \(item.name)'s traffic")
+            }
+            guard bytes >= last.bytes, bytes - last.bytes < ContainerJudge.idleNetBytes else {
+                return .skipped(reason: "\(item.name) has network traffic")
             }
         }
         let result = await run("docker", ["stop", item.name])
@@ -849,12 +998,16 @@ public struct ContainersModule: CategoryModule {
         guard let engine = ContainerEngine(rawValue: rawName) else { return .failed(reason: "Unknown container engine") }
         switch engine {
         case .colima:
-            let result = await run("colima", ["stop"])
+            // Only the profile docker was judged against; plain `colima stop` would stop the default one.
+            guard let profile = item.detail["profile"], Self.isSafeName(profile) else {
+                return .failed(reason: "Can't tell which Colima profile to stop")
+            }
+            let result = await run("colima", ["stop", "-p", profile])
             if result.timedOut { return .failed(reason: "colima stop timed out") }
             guard result.status == 0 else {
                 return .failed(reason: Self.firstLine(result.stderr, fallback: "colima stop failed (\(result.status))"))
             }
-            return .stopped(UndoToken(identity: item.id, action: "colima-start", arguments: []))
+            return .stopped(UndoToken(identity: item.id, action: "colima-start", arguments: [profile]))
         case .dockerDesktop, .orbStack:
             guard let path = item.detail["appPath"], Self.isEngineApp(path) else {
                 return .failed(reason: "Can't find the \(engine.rawValue) app")
@@ -873,8 +1026,9 @@ public struct ContainersModule: CategoryModule {
         case ("launch", 1):
             guard let path = token.arguments.first, Self.isEngineApp(path) else { return false }
             return await launchApp(path)
-        case ("colima-start", 0):
-            let result = await run("colima", ["start"])
+        case ("colima-start", 1):
+            guard let profile = token.arguments.first, Self.isSafeName(profile) else { return false }
+            let result = await run("colima", ["start", "-p", profile])
             return !result.timedOut && result.status == 0
         default:
             return false
@@ -900,12 +1054,14 @@ public struct ContainersModule: CategoryModule {
 
     /// Asks every running app inside the bundle (Docker ships a nested app too) to quit.
     private static func defaultQuit(_ appPath: String) async -> Bool {
-        let running = NSWorkspace.shared.runningApplications.filter {
-            guard let path = $0.bundleURL?.path else { return false }
-            return path == appPath || path.hasPrefix(appPath + "/")
+        await MainActor.run {
+            let running = NSWorkspace.shared.runningApplications.filter {
+                guard let path = $0.bundleURL?.path else { return false }
+                return path == appPath || path.hasPrefix(appPath + "/")
+            }
+            guard !running.isEmpty else { return false }
+            return running.map { $0.terminate() }.contains(true)
         }
-        guard !running.isEmpty else { return false }
-        return running.map { $0.terminate() }.contains(true)
     }
 
     private static func defaultLaunch(_ appPath: String) async -> Bool {

@@ -45,10 +45,20 @@ CleanUp has to watch before it can call anything quiet, so **nothing shows as id
 | **Browser tabs** | Read-only. CleanUp shows a runaway tab and points you to the browser's own task manager. It never closes tabs. |
 | **Restart** | Advice only, when swap is over 75% full and over 8 GB, or the Mac has been up more than 14 days with swap over half full. The button opens the normal macOS Restart dialog. |
 
+## Install
+
+1. Download **CleanUp-0.1.0.dmg** from the [latest release](https://github.com/TheoInTech/CleanUp/releases/latest).
+2. Open it and drag **CleanUp** into **Applications**.
+3. Open CleanUp. Because this preview isn't notarized by Apple yet, macOS says it can't verify it. Click **Done**, then go to **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** next to CleanUp. You only do this once.
+
+CleanUp then lives in your menu bar. To add the widget, right-click the desktop and choose **Edit Widgets**.
+
+A signed download that opens without the warning is the [first sponsorship goal](https://github.com/sponsors/TheoInTech).
+
 ## Requirements
 
-- macOS 26 or later
-- Xcode 27 to build (there is no download yet)
+- macOS 26 or later, Apple Silicon or Intel
+- To build it yourself: Xcode 27
 
 ## Build
 

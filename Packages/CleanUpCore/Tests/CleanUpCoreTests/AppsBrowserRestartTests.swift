@@ -217,6 +217,7 @@ private func appsModule(
         let second = ActivationLog(suiteName: suite, now: now.addingTimeInterval(500))
         #expect(await second.lastActivated("com.a") == now.addingTimeInterval(-50))
         #expect(await second.trackingSince == now)   // fixed on first run, not reset by later launches
+        #expect(await second.launchedAt == now.addingTimeInterval(500))   // this launch only: no gap behind it
     }
 
     @Test func olderActivationDoesNotOverwriteNewer() async {

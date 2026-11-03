@@ -57,6 +57,12 @@ import Testing
     #expect(j.verdict == .inUse); #expect(j.fact == "watching for 30 min")
     #expect(SimulatorJudge.judge(.fixture(bootedAgo: .days(2), trackedFor: .minutes(30)), now: now).verdict == .idle)
 }
+@Test func frontHistoryFromBeforeThisLaunchIsNotTrustedYet() {
+    // CleanUp was closed while the Simulator was in use; its last stamp is from the previous launch.
+    let j = SimulatorJudge.judge(.fixture(bootedAgo: .days(2), inFrontAgo: .hours(2), trackedFor: .minutes(5)), now: now)
+    #expect(j.verdict == .inUse); #expect(j.fact == "watching for 30 min")
+    #expect(SimulatorJudge.judge(.fixture(bootedAgo: .days(2), inFrontAgo: .hours(2), trackedFor: .minutes(30)), now: now).verdict == .idle)
+}
 @Test func busyDeviceAppsAreInUse() {
     let j = SimulatorJudge.judge(.fixture(bootedAgo: .days(2), appCPU: 5.1), now: now)
     #expect(j.verdict == .inUse); #expect(j.fact == "busy")

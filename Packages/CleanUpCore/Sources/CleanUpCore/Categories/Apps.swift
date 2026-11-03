@@ -19,10 +19,14 @@ public actor ActivationLog {
     /// When CleanUp first started recording. Apps launched before this and never seen since have an
     /// unknown last use; the fact says "since CleanUp started" rather than guessing.
     public let trackingSince: Date
+    /// When this launch started recording. Stamps from earlier launches miss the time CleanUp wasn't
+    /// running, so "not in front since" is only trustworthy from here on.
+    public let launchedAt: Date
 
     init(suiteName: String, now: Date = Date()) {
         let defaults = UserDefaults(suiteName: suiteName) ?? .standard
         self.defaults = defaults
+        launchedAt = now
         activations = defaults.dictionary(forKey: Self.activationsKey) as? [String: Double] ?? [:]
         if let stored = defaults.object(forKey: Self.trackingKey) as? Double {
             trackingSince = Date(timeIntervalSince1970: stored)

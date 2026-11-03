@@ -17,7 +17,7 @@ public struct SimulatorFacts: Sendable {
     public let cores: Double
     /// When the Simulator app was last in front (CleanUp's activation log); nil when never seen.
     public let simulatorLastInFront: Date?
-    /// Since when CleanUp has been recording which app is in front.
+    /// Since when CleanUp has been recording which app is in front without a gap (this launch).
     public let frontTrackedSince: Date
     /// CPU of the device's own apps (under its Containers/Bundle/Application), 100 = one core;
     /// nil when one of them hasn't been measured yet.
@@ -79,7 +79,7 @@ public enum SimulatorJudge {
             let ago = RelativeAge.short(now.timeIntervalSince(front))
             signals.append(Signal(kind: .inUse, text: "The Simulator app was in front \(ago) ago"))
             reasons.append("Simulator was in front \(ago) ago")
-        } else if f.simulatorLastInFront == nil, now.timeIntervalSince(f.frontTrackedSince) < frontPeriod {
+        } else if now.timeIntervalSince(f.frontTrackedSince) < frontPeriod {
             let window = RelativeAge.short(frontPeriod)
             signals.append(Signal(kind: .inUse, text: "CleanUp just started: can't tell yet when the Simulator app was last used"))
             reasons.append("watching for \(window)")
@@ -184,7 +184,7 @@ public struct SimulatorsModule: CategoryModule {
 
     /// - Parameters:
     ///   - lastInFront: when an app (by bundle ID) was last in front; defaults to CleanUp's activation log.
-    ///   - trackingSince: since when that log has been recording.
+    ///   - trackingSince: since when that log has been recording without a gap (this launch).
     public init(
         run: Run? = nil,
         lastInFront: (@Sendable (String) async -> Date?)? = nil,
@@ -192,7 +192,7 @@ public struct SimulatorsModule: CategoryModule {
     ) {
         self.run = run ?? { await CommandRunner.run($0, $1, timeout: $2) }
         self.lastInFront = lastInFront ?? { await ActivationLog.shared.lastActivated($0) }
-        self.trackingSince = trackingSince ?? { ActivationLog.shared.trackingSince }
+        self.trackingSince = trackingSince ?? { ActivationLog.shared.launchedAt }
     }
 
     private func frontHistory() async -> FrontHistory {

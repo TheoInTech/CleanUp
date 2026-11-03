@@ -8,12 +8,16 @@ public struct SocketInfo: Sendable, Hashable {
     public let state: State
     public let localPort: Int
     public let remotePort: Int?
+    /// The other end is on this Mac (loopback, or this Mac's own address). Only then can a
+    /// connection to a port be one to a local server; a remote host's port 8081 is not ours.
+    public let remoteIsLocal: Bool
 
-    public init(pid: Int32, state: State, localPort: Int, remotePort: Int?) {
+    public init(pid: Int32, state: State, localPort: Int, remotePort: Int?, remoteIsLocal: Bool = true) {
         self.pid = pid
         self.state = state
         self.localPort = localPort
         self.remotePort = remotePort
+        self.remoteIsLocal = remoteIsLocal
     }
 }
 
@@ -54,12 +58,29 @@ public enum Sockets {
             case TSI_S_LISTEN:
                 result.append(SocketInfo(pid: pid, state: .listen, localPort: local, remotePort: nil))
             case TSI_S_ESTABLISHED:
-                result.append(SocketInfo(pid: pid, state: .established, localPort: local, remotePort: remote))
+                result.append(SocketInfo(
+                    pid: pid, state: .established, localPort: local, remotePort: remote,
+                    remoteIsLocal: isLocalPeer(tcp.tcpsi_ini)
+                ))
             default:
                 break
             }
         }
         return result
+    }
+
+    /// Loopback, or the same address as our own end (a connection to this Mac's LAN address).
+    static func isLocalPeer(_ ini: in_sockinfo) -> Bool {
+        var local = ini.insi_laddr, remote = ini.insi_faddr
+        let same = withUnsafeBytes(of: &local) { l in withUnsafeBytes(of: &remote) { r in l.elementsEqual(r) } }
+        if same { return true }
+        if ini.insi_vflag & UInt8(INI_IPV4) != 0 {
+            return UInt32(bigEndian: ini.insi_faddr.ina_46.i46a_addr4.s_addr) >> 24 == 127
+        }
+        let bytes = withUnsafeBytes(of: ini.insi_faddr.ina_6) { Array($0) }
+        let loopback6 = bytes[0..<15].allSatisfy { $0 == 0 } && bytes[15] == 1
+        let mapped = bytes[0..<10].allSatisfy { $0 == 0 } && bytes[10] == 0xff && bytes[11] == 0xff
+        return loopback6 || (mapped && bytes[12] == 127)
     }
 
     /// The kernel stores ports as network-order 16-bit values widened to Int32.

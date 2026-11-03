@@ -578,14 +578,20 @@ extension EngineTests {
             let report = await Cleaner(modules: [containers], probe: FakeMachine().probe).clean([staleOrbStack], ctx: .testContext())
             #expect(report.stopped.isEmpty)
             #expect(report.skipped.map(\.0) == [.engine(name: "OrbStack")])
-            #expect(report.skipped.first?.1 == "couldn't check containers")
+            #expect(report.skipped.first?.1 == "another container engine is running")
             #expect(containers.log.stopped.isEmpty)
         }
 
         @Test func freshlyInUseEngineIsSkippedEvenWithNoContainerListed() async {
-            let containers = StubModule(id: .containers, items: [.fixtureEngine(verdict: .inUse)])
+            // The skip says why the fresh look found it in use, not a generic "a container is running".
+            let busy = Item(
+                id: .engine(name: "Docker Desktop"), category: .containers, name: "Docker Desktop", symbol: "circle",
+                judgement: Judgement(verdict: .inUse, fact: "used by docker-buildx", signals: []),
+                cores: 0, memoryBytes: 0, processes: [], detail: [:]
+            )
+            let containers = StubModule(id: .containers, items: [busy])
             let report = await Cleaner(modules: [containers], probe: FakeMachine().probe).clean([.fixtureEngine()], ctx: .testContext())
-            #expect(report.skipped.first?.1 == "a container is still running")
+            #expect(report.skipped.first?.1 == "used by docker-buildx")
             #expect(containers.log.stopped.isEmpty)
         }
 
@@ -788,9 +794,22 @@ extension EngineTests {
             let newer = Snapshot.incident()
             let older = Snapshot(date: fixedNow.addingTimeInterval(-5), battery: nil, coresBusy: 1, swapUsedBytes: 0,
                                  swapTotalBytes: 0, uptime: 0, categories: [], mood: .allGood)
-            #expect(try await writer.write(newer))
-            #expect(try await writer.write(older) == false)
+            #expect(try await writer.write(newer, sequence: 2))
+            #expect(try await writer.write(older, sequence: 1) == false)
             #expect(SnapshotStore.read(from: url) == newer)
+        }
+
+        @Test func aClockSteppingBackDoesNotFreezeTheWidget() async throws {
+            // Order comes from when the app made each snapshot, not from the wall clock.
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("cleanup-writer-\(UUID().uuidString)/snapshot.json")
+            defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+            let writer = SnapshotWriter(url: url)
+            let before = Snapshot.incident()
+            let afterStepBack = Snapshot(date: fixedNow.addingTimeInterval(-3_600), battery: nil, coresBusy: 1, swapUsedBytes: 0,
+                                         swapTotalBytes: 0, uptime: 0, categories: [], mood: .allGood)
+            #expect(try await writer.write(before, sequence: 1))
+            #expect(try await writer.write(afterStepBack, sequence: 2))
+            #expect(SnapshotStore.read(from: url) == afterStepBack)
         }
 
         @Test func theWidgetCopyCarriesNoDetailsOrSignals() throws {

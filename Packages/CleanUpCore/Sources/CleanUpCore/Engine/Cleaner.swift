@@ -102,8 +102,9 @@ public actor Cleaner {
                     if fresh.judgement.verdict != .idle {
                         // With several engines up, the module can't tell which hosts each container
                         // (it tags them all with one) and judges every engine in use.
+                        // Otherwise the fresh judgement says why ("used by docker-buildx", "measuring activity").
                         let engineCount = listed.filter { Selection.engineName(of: $0) != nil }.count
-                        skip = engineCount > 1 ? "couldn't check containers" : "a container is still running"
+                        skip = engineCount > 1 ? "another container engine is running" : fresh.judgement.fact
                     } else {
                         skip = running ? "a container is still running" : nil
                     }

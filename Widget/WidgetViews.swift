@@ -142,24 +142,16 @@ private struct WidgetRing: View {
     }
 }
 
-/// Busy: "35 min left" (or "10.5 cores" when plugged in). Calm: green "All good" over the same line.
+/// Busy: "35m left" (or "10.5 cores" when plugged in). Calm: green "All good" over the same line.
 private struct StatusLines: View {
     let snapshot: Snapshot
     let alignment: HorizontalAlignment
 
     private var detail: String {
         if let battery = snapshot.battery, battery.onBattery, let minutes = battery.minutesLeft {
-            return Self.minutesLeft(minutes)
+            return "\(Palette.minutes(minutes)) left"   // "35m left", "2h 5m left", as in the menu bar
         }
         return "\(Palette.cores(snapshot.coresBusy)) cores"
-    }
-
-    /// "35 min left", "6 h 10 min left".
-    static func minutesLeft(_ minutes: Int) -> String {
-        let minutes = max(0, minutes)
-        if minutes < 60 { return "\(minutes) min left" }
-        let rest = minutes % 60
-        return rest == 0 ? "\(minutes / 60) h left" : "\(minutes / 60) h \(rest) min left"
     }
 
     var body: some View {

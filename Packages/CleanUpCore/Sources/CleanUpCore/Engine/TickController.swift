@@ -98,6 +98,12 @@ public struct TickController: Sendable {
         s.allItems.filter { chosen.ticked.contains($0.id) && Selection.isTickable($0) }
     }
 
+    /// Same, limited to what was ticked when the button was pressed: a refresh in between (a stale
+    /// snapshot) can tick newly idle items in Quick select that the user never saw ticked.
+    public static func itemsToClean(_ chosen: Selection, in s: Snapshot, pressed: Set<ItemIdentity>) -> [Item] {
+        itemsToClean(chosen, in: s).filter { pressed.contains($0.id) }
+    }
+
     public static func isStale(_ s: Snapshot, now: Date) -> Bool {
         now.timeIntervalSince(s.date) > staleAfter
     }

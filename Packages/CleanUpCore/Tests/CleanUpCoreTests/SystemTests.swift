@@ -203,3 +203,31 @@ import Testing
     #expect(CommandRunner.searchPath.contains(NSHomeDirectory() + "/.docker/bin"))
     #expect(CommandRunner.searchPath.contains("/Applications/Docker.app/Contents/Resources/bin"))
 }
+
+@Test func peerOnThisMacIsLoopbackOrOurOwnAddress() {
+    func ipv4(_ local: String, _ remote: String) -> in_sockinfo {
+        var info = in_sockinfo()
+        info.insi_vflag = UInt8(INI_IPV4)
+        inet_pton(AF_INET, local, &info.insi_laddr.ina_46.i46a_addr4)
+        inet_pton(AF_INET, remote, &info.insi_faddr.ina_46.i46a_addr4)
+        return info
+    }
+    func ipv6(_ local: String, _ remote: String) -> in_sockinfo {
+        var info = in_sockinfo()
+        info.insi_vflag = UInt8(INI_IPV6)
+        inet_pton(AF_INET6, local, &info.insi_laddr.ina_6)
+        inet_pton(AF_INET6, remote, &info.insi_faddr.ina_6)
+        return info
+    }
+    #expect(Sockets.isLocalPeer(ipv4("127.0.0.1", "127.0.0.1")))
+    #expect(Sockets.isLocalPeer(ipv4("192.168.1.20", "192.168.1.20")))   // this Mac's own LAN address
+    #expect(!Sockets.isLocalPeer(ipv4("192.168.1.20", "93.184.216.34")))
+    #expect(Sockets.isLocalPeer(ipv6("::1", "::1")))
+    #expect(Sockets.isLocalPeer(ipv6("::ffff:127.0.0.1", "::ffff:127.0.0.1")))
+    #expect(!Sockets.isLocalPeer(ipv6("2001:db8::2", "2001:db8::1")))
+    // Different ends, so only the loopback checks can say yes.
+    #expect(Sockets.isLocalPeer(ipv4("127.0.0.1", "127.0.0.2")))
+    #expect(Sockets.isLocalPeer(ipv6("::1", "::ffff:127.0.0.1")))
+    #expect(Sockets.isLocalPeer(ipv6("2001:db8::2", "::1")))
+    #expect(!Sockets.isLocalPeer(ipv6("::1", "::ffff:10.0.0.1")))
+}

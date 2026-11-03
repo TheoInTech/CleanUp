@@ -125,11 +125,11 @@ struct MenuBarPopover: View {
         }
     }
 
-    /// "≈ 35 min left · 10.5 cores busy" on battery, "10.5 cores busy" otherwise.
+    /// "≈ 35m left · 10.5 cores busy" on battery (written like the menu bar's "2h 5m"), "10.5 cores busy" otherwise.
     static func statusLine(for snapshot: Snapshot) -> String {
         let busy = "\(Palette.cores(snapshot.coresBusy)) cores busy"
         if let battery = snapshot.battery, battery.onBattery, let minutes = battery.minutesLeft {
-            return "≈ \(minutes) min left · \(busy)"
+            return "≈ \(Palette.minutes(minutes)) left · \(busy)"
         }
         return busy
     }

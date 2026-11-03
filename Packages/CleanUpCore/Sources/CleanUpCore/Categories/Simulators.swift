@@ -405,8 +405,12 @@ public struct SimulatorsModule: CategoryModule {
     }
 
     /// The services can be watched: they are running and nothing is booting.
+    /// The services' quiet clock runs only while nothing is booted, they are running, and no tool is
+    /// working them: a build or download ending starts the ten minutes over.
     private static func servicesWatchable(_ ctx: ScanContext) -> Bool {
-        !simulatorLauncherExists(ctx.processes) && ctx.processes.values.contains { $0.uid == getuid() && isEngineProcess($0) }
+        !simulatorLauncherExists(ctx.processes)
+            && ctx.processes.values.contains { $0.uid == getuid() && isEngineProcess($0) }
+            && servicesUsers(ctx).isEmpty
     }
 
     /// Tools that work the services without booting a device: a build or test run, `simctl` (runtime

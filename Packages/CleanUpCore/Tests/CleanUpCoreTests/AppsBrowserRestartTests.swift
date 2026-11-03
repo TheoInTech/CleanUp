@@ -363,3 +363,14 @@ private func appsModule(
         #expect(!(await module().undo(UndoToken(identity: .restart, action: "x", arguments: []))))
     }
 }
+
+@Test func betaAndCanaryBrowsersAreRecognised() {
+    func renderer(_ product: String, in bundle: String) -> ProcessInfoRecord {
+        let name = "\(product) Helper (Renderer)"
+        return .fixture(pid: 40, name: name, path: "/Applications/\(bundle).app/Contents/Frameworks/\(product) Framework.framework/Helpers/\(name).app/Contents/MacOS/\(name)")
+    }
+    #expect(BrowserTabsModule.browserName(for: renderer("Brave Browser Beta", in: "Brave Browser Beta")) == "Brave Beta")
+    #expect(BrowserTabsModule.browserName(for: renderer("Google Chrome Canary", in: "Google Chrome Canary")) == "Chrome Canary")
+    // The product must live in its own app: a Canary helper inside some other bundle is not a tab.
+    #expect(BrowserTabsModule.browserName(for: renderer("Google Chrome Canary", in: "Slack")) == nil)
+}

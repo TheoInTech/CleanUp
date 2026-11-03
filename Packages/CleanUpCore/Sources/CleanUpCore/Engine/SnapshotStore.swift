@@ -40,18 +40,20 @@ public enum SnapshotStore {
 /// dropped, so a slow write can never put an old snapshot back over a newer one.
 public actor SnapshotWriter {
     private let url: URL
-    private var lastWritten: Date?
+    private var lastWritten: UInt64?
 
     public init(url: URL) {
         self.url = url
     }
 
     /// True when `s` was written; false when a newer (or the same) snapshot is already there.
+    /// `sequence` counts up as the app makes snapshots; it orders them, not the wall clock, which
+    /// can step back (a time sync) and would otherwise freeze the widget until it caught up.
     @discardableResult
-    public func write(_ s: Snapshot) throws -> Bool {
-        if let lastWritten, s.date <= lastWritten { return false }
+    public func write(_ s: Snapshot, sequence: UInt64) throws -> Bool {
+        if let lastWritten, sequence <= lastWritten { return false }
         try SnapshotStore.write(s, to: url)
-        lastWritten = s.date
+        lastWritten = sequence
         return true
     }
 }

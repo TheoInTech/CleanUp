@@ -447,6 +447,21 @@ func aSimulatorToolKeepsServicesInUse(tool: String) async {
     #expect(last?.judgement.verdict == .idle)
 }
 
+@Test func servicesWatchStartsOverWhenAToolFinishes() async {
+    // A runtime download ran until minute 15; ten quiet minutes are counted from when it ended.
+    var (procs, cpu) = engineTable(cpu: 0.5)
+    procs[700] = .fixture(pid: 700, ppid: 50, name: "xcodebuild", path: "/usr/bin/xcodebuild", arguments: ["xcodebuild", "-downloadPlatform", "iOS"])
+    cpu[700] = 0
+    let (module, _) = listingModule()
+    var minute = 0.0
+    while minute <= 15 { _ = await module.scan(at(minute, procs, cpu)); minute += 1 }
+    procs[700] = nil
+    var last: Item?
+    while minute <= 25 { last = services(await module.scan(at(minute, procs, cpu))); minute += 1 }
+    #expect(last?.judgement.verdict == .inUse)   // minute 25: watched quiet for 9 minutes
+    #expect(services(await module.scan(at(26, procs, cpu)))?.judgement.verdict == .idle)
+}
+
 @Test func aGapRestartsTheServicesWatch() async {
     let (procs, cpu) = engineTable(cpu: 0.5)
     let (module, _) = listingModule()

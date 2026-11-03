@@ -276,6 +276,9 @@ private final class FakeDocker: Sendable {
         var curlInFlight = 0
         var curlPeak = 0
         var orbList = CommandResult(status: 0, stdout: "", stderr: "", timedOut: false)
+        /// Exec instances the Engine API knows (`/exec/<id>/json`); an id in `execFails` → API error.
+        var execs: [String: Exec] = [:]
+        var execFails: Set<String> = []
         var calls: [[String]] = []
     }
     let state = Mutex(State())
@@ -302,6 +305,13 @@ private final class FakeDocker: Sendable {
                     state.withLock { $0.curlInFlight -= 1 }
                 }
                 let url = args.last ?? ""
+                if url.contains("/exec/") {
+                    let id = url.components(separatedBy: "/exec/").last?.components(separatedBy: "/").first ?? ""
+                    if s.execFails.contains(id) { return CommandResult(status: 7, stdout: "", stderr: "", timedOut: false) }
+                    guard let e = s.execs[id] else { return ok(#"{"message":"No such exec instance: \#(id)"}"#) }
+                    let args = "[" + e.arguments.map { #""\#($0)""# }.joined(separator: ",") + "]"
+                    return ok(#"{"ID":"\#(id)","Running":\#(e.running),"OpenStdin":\#(e.stdin),"ProcessConfig":{"tty":\#(e.tty),"entrypoint":"\#(e.entrypoint)","arguments":\#(args)}}"#)
+                }
                 let name = url.components(separatedBy: "/containers/").last?.components(separatedBy: "/stats").first ?? ""
                 guard let bytes = s.api[name] else { return CommandResult(status: 7, stdout: "", stderr: "", timedOut: false) }
                 return ok(#"{"networks":{"eth0":{"rx_bytes":\#(bytes / 2),"tx_bytes":\#(bytes - bytes / 2)}}}"#)
@@ -321,8 +331,29 @@ private func isoDate(_ date: Date) -> String {
     return f.string(from: date)
 }
 
+/// An exec instance in a container: an interactive shell (Docker Desktop's Exec tab, lazydocker,
+/// `docker exec -it`) has stdin and a tty; a healthcheck probe has neither.
+struct Exec {
+    var id: String
+    var running = true
+    var stdin = true
+    var tty = true
+    var entrypoint = "bash"
+    var arguments: [String] = []
+    static func shell(_ id: String) -> Exec { Exec(id: id) }
+    /// Docker runs a `CMD-SHELL` healthcheck as `/bin/sh -c <command>`, with no stdin or tty.
+    static func healthcheck(_ id: String, _ command: String = "pg_isready") -> Exec {
+        Exec(id: id, stdin: false, tty: false, entrypoint: "/bin/sh", arguments: ["-c", command])
+    }
+    /// `docker exec -d`: no stdin, no tty, and not the healthcheck.
+    static func detached(_ id: String) -> Exec { Exec(id: id, stdin: false, tty: false, entrypoint: "/backup.sh") }
+}
+
 private struct Row {
     var name: String
+    var execs: [Exec] = []
+    /// `Config.Healthcheck.Test`, e.g. ["CMD-SHELL", "pg_isready"].
+    var healthcheck: [String]? = ["CMD-SHELL", "pg_isready"]
     var cpu = "0.00%"
     /// The rounded figure `docker stats` prints. Deliberately never used for the idle decision.
     var net = "251MB / 156MB"
@@ -354,8 +385,12 @@ private func apply(_ rows: [Row], to s: inout FakeDocker.State) {
     s.inspect = rows.map { r in
         let ports = r.port.map { #"{"5432/tcp":[{"HostIp":"0.0.0.0","HostPort":"\#($0)"}]}"# } ?? "{}"
         let service = r.service.map { #""\#($0)""# } ?? #""""#
-        return #"{"Name":"/\#(r.name)","State":{"StartedAt":"\#(isoDate(now.addingTimeInterval(-r.age)))"},"NetworkSettings":{"Ports":\#(ports)},"Service":\#(service)}"#
+        let execIDs = r.execs.isEmpty ? "null" : "[" + r.execs.map { #""\#($0.id)""# }.joined(separator: ",") + "]"
+        let health = r.healthcheck.map { test in #"{"Test":["# + test.map { #""\#($0)""# }.joined(separator: ",") + "]}" } ?? "null"
+        return #"{"Id":"\#(r.fullID)","Name":"/\#(r.name)","State":{"StartedAt":"\#(isoDate(now.addingTimeInterval(-r.age)))"},"NetworkSettings":{"Ports":\#(ports)},"Service":\#(service),"ExecIDs":\#(execIDs),"Healthcheck":\#(health)}"#
     }.joined(separator: "\n")
+    s.execs = [:]
+    for r in rows { for e in r.execs { s.execs[e.id] = e } }
     s.api = [:]
     for r in rows { if let api = r.api { s.api[r.name] = api } }
 }
@@ -483,6 +518,82 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
         let mine = ProcessInfoRecord.fixture(pid: 600, ppid: getpid(), name: "curl", path: "/usr/bin/curl",
                                              arguments: ["curl", "http://localhost/containers/evone-postgres/stats"])
         #expect(await judged([Row(name: "evone-postgres")], with: mine)?.judgement.verdict == .idle)
+    }
+
+    // Docker Desktop's Exec tab and lazydocker open shells over the Engine API: no process names the
+    // container, but the exec instance is there.
+
+    private let shellID = String(repeating: "ab", count: 32)
+    private let probeID = String(repeating: "cd", count: 32)
+
+    @Test func aShellOpenThroughTheAPIIsInUse() async {
+        let m = module(fakeDocker([Row(name: "evone-postgres", execs: [.shell(shellID)])]))
+        let item = await scanEveryMinute(m, to: 11).first
+        #expect(item?.judgement.verdict == .inUse)
+        #expect(item?.judgement.fact == "shell open")
+    }
+
+    @Test func healthcheckProbesAndFinishedShellsDoNotCount() async {
+        let finished = Exec(id: shellID, running: false)
+        let m = module(fakeDocker([Row(name: "evone-postgres", execs: [.healthcheck(probeID), finished])]))
+        #expect(await scanEveryMinute(m, to: 11).first?.judgement.verdict == .idle)
+    }
+
+    @Test func aDetachedCommandIsInUse() async {
+        // `docker exec -d db /backup.sh`: the CLI exits at once, the job runs on quietly.
+        let m = module(fakeDocker([Row(name: "evone-postgres", execs: [.detached(shellID)])]))
+        let item = await scanEveryMinute(m, to: 11).first
+        #expect(item?.judgement.verdict == .inUse)
+        #expect(item?.judgement.fact == "command running")
+    }
+
+    @Test func aProbeIsOnlyAProbeWhenItRunsTheHealthcheck() async {
+        // Same shape as a probe (/bin/sh -c, no stdin), but not this container's healthcheck.
+        let lookalike = Exec.healthcheck(probeID, "pg_dumpall > /backup.sql")
+        let m = module(fakeDocker([Row(name: "evone-postgres", execs: [lookalike])]))
+        #expect(await scanEveryMinute(m, to: 11).first?.judgement.verdict == .inUse)
+        let noHealthcheck = module(fakeDocker([Row(name: "evone-postgres", execs: [.healthcheck(probeID)], healthcheck: nil)]))
+        #expect(await scanEveryMinute(noHealthcheck, to: 11).first?.judgement.verdict == .inUse)
+    }
+
+    @Test func execFormHealthchecksAreRecognised() async {
+        let probe = Exec(id: probeID, stdin: false, tty: false, entrypoint: "curl", arguments: ["-f", "http://localhost/health"])
+        let row = Row(name: "evone-postgres", execs: [probe], healthcheck: ["CMD", "curl", "-f", "http://localhost/health"])
+        #expect(await scanEveryMinute(module(fakeDocker([row])), to: 11).first?.judgement.verdict == .idle)
+    }
+
+    @Test func anExecThatEndedBeforeWeAskedDoesNotCount() async {
+        let d = fakeDocker([Row(name: "evone-postgres", execs: [.shell(shellID)])])
+        d.set { $0.execs = [:] }   // listed by inspect, gone from the API by the time we ask
+        #expect(await scanEveryMinute(module(d), to: 11).first?.judgement.verdict == .idle)
+    }
+
+    @Test func execsThatCantBeCheckedAreInUse() async {
+        let d = fakeDocker([Row(name: "evone-postgres", execs: [.shell(shellID)])])
+        d.set { $0.execFails = [self.shellID] }
+        let item = await scanEveryMinute(module(d), to: 11).first
+        #expect(item?.judgement.verdict == .inUse)
+        #expect(item?.judgement.fact == "checking for shells")
+    }
+
+    @Test func stopChecksForAPIShellsAgain() async throws {
+        let d = fakeDocker([Row(name: "evone-postgres")])
+        let m = module(d)
+        let item = try #require(await scanEveryMinute(m, to: 11).first)
+        #expect(item.judgement.verdict == .idle)
+        d.set { s in apply([Row(name: "evone-postgres", execs: [.shell(self.shellID)])], to: &s) }   // opened since the scan
+        #expect(await m.stop(item, ctx: ctx(11)) == .skipped(reason: "evone-postgres has a shell open"))
+        #expect(d.count("stop") == 0)
+    }
+
+    @Test func containerReplacedSinceTheScanIsNotStopped() async throws {
+        let d = fakeDocker([Row(name: "evone-postgres")])
+        let m = module(d)
+        let item = try #require(await scanEveryMinute(m, to: 11).first)
+        let newID = String(repeating: "9f", count: 32)
+        d.set { s in apply([Row(name: "evone-postgres", id: newID)], to: &s) }   // `docker compose up` recreated it
+        #expect(await m.stop(item, ctx: ctx(11)) == .skipped(reason: "evone-postgres was replaced since"))
+        #expect(d.count("stop") == 0)
     }
 
     @Test func stopChecksForSessionsAgain() async throws {
@@ -710,6 +821,42 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
         #expect(abs(docker.cores - 0.028) < 0.0001)   // 10% of the engine minus 7.2% of its containers
         let containerCores = items.filter { $0.id != docker.id }.reduce(0) { $0 + $1.cores }
         #expect(abs(containerCores - 0.072) < 0.0001)
+    }
+
+    // Docker Desktop's Kubernetes runs inside it: quitting Docker takes the cluster down.
+
+    @Test func dockerDesktopRunningKubernetesIsInUse() async {
+        let apiServer = SocketInfo(pid: 100, state: .listen, localPort: 6443, remotePort: nil)   // com.docker.backend
+        let item = engine(await scanEveryMinute(module(fakeDocker([])), to: 15, cpu: quietEngineCPU, sockets: [apiServer]))
+        #expect(item?.judgement.verdict == .inUse)
+        #expect(item?.judgement.fact == "Kubernetes is on")
+    }
+
+    @Test func aClusterNamedInKubeconfigOnADockerPortIsInUse() async {
+        // Docker Desktop's kind mode (or a kind/minikube cluster in Docker) publishes its API server on
+        // a random port, which ~/.kube/config names.
+        let kubeconfig = """
+        apiVersion: v1
+        clusters:
+        - cluster:
+            server: https://127.0.0.1:52817
+          name: kind-dev
+        - cluster:
+            server: https://k8s.example.com:6443
+          name: remote
+        """
+        let m = ContainersModule(run: fakeDocker([]).run, quitApp: { _ in true }, launchApp: { _ in true }, home: "/Users/me",
+                                 resolveLink: { $0 }, readKubeconfig: { kubeconfig })
+        let apiServer = SocketInfo(pid: 100, state: .listen, localPort: 52_817, remotePort: nil)
+        let item = engine(await scanEveryMinute(m, to: 15, cpu: quietEngineCPU, sockets: [apiServer]))
+        #expect(item?.judgement.fact == "Kubernetes is on")
+        #expect(ContainersModule.localClusterPorts(kubeconfig) == [52_817])
+    }
+
+    @Test func someoneElseOnPort6443IsNotDockersKubernetes() async {
+        let other = SocketInfo(pid: 900, state: .listen, localPort: 6443, remotePort: nil)
+        let item = engine(await scanEveryMinute(module(fakeDocker([])), to: 15, cpu: quietEngineCPU, sockets: [other]))
+        #expect(item?.judgement.verdict == .idle)
     }
 
     @Test func aRunningOrbStackMachineKeepsItInUse() async {
@@ -1069,7 +1216,8 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
         let item = try await idleContainerItem(m)
         let result = await m.stop(item, ctx: ctx(11))
         #expect(result == .stopped(UndoToken(identity: .container(name: "evone-postgres"), action: "start", arguments: ["evone-postgres"])))
-        #expect(d.calls.last == ["docker", "stop", "evone-postgres"])
+        // By ID: a container recreated under the same name since the scan is never the one stopped.
+        #expect(d.calls.last == ["docker", "stop", String(Row.hexID("evone-postgres").prefix(12))])
     }
 
     @Test func refusesToStopInUseContainer() async throws {
@@ -1092,7 +1240,7 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
         d.set { $0.api["a"] = 999_000_000 }   // traffic, and a client, are ignored when forced
         let result = await m.stop(item, ctx: ctx(11, sockets: [client5432]), force: true)
         #expect(result == .stopped(UndoToken(identity: .container(name: "a"), action: "start", arguments: ["a"])))
-        #expect(d.calls.last == ["docker", "stop", "a"])
+        #expect(d.calls.last == ["docker", "stop", String(Row.hexID("a").prefix(12))])
     }
 
     @Test func forcedStopStillRefusesUnsafeContainerNames() async {
@@ -1239,5 +1387,47 @@ private func hex(_ text: String) -> String { text.utf8.map { String(format: "%02
         #expect(d.calls == [["colima", "start", "-p", "work"]])
         #expect(await m.undo(UndoToken(identity: .engine(name: "Colima"), action: "colima-start", arguments: ["-x"])) == false)
         #expect(await m.undo(UndoToken(identity: .engine(name: "x"), action: "bogus", arguments: [])) == false)
+    }
+}
+
+// MARK: - Session index cache
+
+@Suite struct SessionIndexCacheTests {
+    private func table(_ args: [String]) -> [Int32: ProcessInfoRecord] {
+        processTable(.fixture(pid: 600, ppid: 50, name: "docker", path: "/usr/local/bin/docker", arguments: args))
+    }
+
+    @Test func cachedIndexMatchesAFreshOne() {
+        var cache = SessionIndex.Cache()
+        let t = table(["docker", "exec", "-it", "evone-postgres", "psql"])
+        _ = SessionIndex(t, ownPID: 1, cache: &cache)
+        let second = SessionIndex(t, ownPID: 1, cache: &cache)
+        #expect(second.users(name: "evone-postgres", id: nil, service: nil) == ["docker"])
+        #expect(cache.count == 1)
+    }
+
+    @Test func unchangedArgumentsAreNotParsedAgain() throws {
+        // Plant a marker entry under the process's key and hash: a reused entry shows up as the marker.
+        let t = table(["docker", "exec", "-it", "evone-postgres", "psql"])
+        let p = try #require(t[600])
+        let marker = SessionIndex.Entry(name: "from-cache", tokens: ["evone-postgres"], idPrefixes: [], isDockerClient: true, isCompose: false)
+        var cache: SessionIndex.Cache = [p.ref: SessionIndex.Cached(argumentsHash: p.arguments.hashValue, entry: marker)]
+        let index = SessionIndex(t, ownPID: 1, cache: &cache)
+        #expect(index.users(name: "evone-postgres", id: nil, service: nil) == ["from-cache"])
+    }
+
+    @Test func changedArgumentsAreParsedAgain() {
+        // Same process (pid and start time), new arguments, e.g. a retitled process.
+        var cache = SessionIndex.Cache()
+        _ = SessionIndex(table(["docker", "ps"]), ownPID: 1, cache: &cache)
+        let later = SessionIndex(table(["docker", "attach", "evone-routing"]), ownPID: 1, cache: &cache)
+        #expect(later.users(name: "evone-routing", id: nil, service: nil) == ["docker"])
+    }
+
+    @Test func goneProcessesLeaveTheCache() {
+        var cache = SessionIndex.Cache()
+        _ = SessionIndex(table(["docker", "exec", "x"]), ownPID: 1, cache: &cache)
+        _ = SessionIndex([:], ownPID: 1, cache: &cache)
+        #expect(cache.isEmpty)
     }
 }

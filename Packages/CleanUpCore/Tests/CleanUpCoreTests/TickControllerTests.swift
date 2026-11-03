@@ -110,6 +110,19 @@ private func snapshot(_ categories: [CategorySummary]) -> Snapshot {
         #expect(TickController.itemsToClean(ticks.selection, in: old).map(\.id) == [sim.id, sim2.id])
     }
 
+    @Test func aRefreshBeforeCleaningNeverAddsItemsYouDidntSee() {
+        // The button said "Clean up 1 idle"; the refresh right before stopping finds sim2 newly idle,
+        // and Quick select ticks it. Only what was ticked when the button was pressed is stopped.
+        let shown = snapshot([CategorySummary(id: .simulators, items: [sim])])
+        var ticks = TickController()
+        ticks.apply(shown, keep: .empty)
+        let pressed = ticks.selection.ticked
+        let fresh = snapshot([CategorySummary(id: .simulators, items: [sim, sim2])])
+        ticks.apply(fresh, keep: .empty)
+        #expect(ticks.selection.ticked == [sim.id, sim2.id])
+        #expect(TickController.itemsToClean(ticks.selection, in: fresh, pressed: pressed).map(\.id) == [sim.id])
+    }
+
     @Test func stoppedItemsAreUnticked() {
         let s = snapshot([CategorySummary(id: .simulators, items: [sim, sim2])])
         var ticks = TickController()

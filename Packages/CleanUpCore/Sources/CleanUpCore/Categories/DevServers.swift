@@ -434,13 +434,20 @@ public struct DevServersModule: CategoryModule {
         return root
     }
 
-    /// The first ancestor above the launcher chain owns the server when it is a GUI app's process.
+    /// A GUI app's process anywhere above the server (before any shell) owns it, wrappers included.
     /// Shells, terminal apps, `launchd` and a missing parent are fine: a terminal's integrated shell
     /// has `.app` ancestors above the shell, and orphans stay allowed.
     static func isLaunchedByApp(_ root: ProcessInfoRecord, table: [Int32: ProcessInfoRecord]) -> Bool {
-        guard let parent = table[root.ppid], parent.pid > 1 else { return false }
-        if isShellOrTerminal(parent) { return false }
-        return parent.path.contains(".app/")
+        // Walk up through any wrappers (uvx, python, a script) until a shell or terminal (the user
+        // started it) or an app's process (the app did).
+        var seen: Set<Int32> = [root.pid]
+        var cursor = table[root.ppid]
+        while let p = cursor, p.pid > 1, seen.insert(p.pid).inserted {
+            if isShellOrTerminal(p) { return false }
+            if p.path.contains(".app/") { return true }
+            cursor = table[p.ppid]
+        }
+        return false
     }
 
     /// The processes of a server's tree that CleanUp may list and signal: our own user's, not protected.
@@ -470,8 +477,8 @@ public struct DevServersModule: CategoryModule {
         for s in sockets where s.state == .established {
             if pids.contains(s.pid) {
                 if portSet.contains(s.localPort) { serverSide += 1 }
-                else if let remote = s.remotePort, portSet.contains(remote) { internalClients += 1 }
-            } else if let remote = s.remotePort, portSet.contains(remote) {
+                else if s.remoteIsLocal, let remote = s.remotePort, portSet.contains(remote) { internalClients += 1 }
+            } else if s.remoteIsLocal, let remote = s.remotePort, portSet.contains(remote) {
                 externalClients += 1
             }
         }
@@ -508,7 +515,7 @@ public struct DevServersModule: CategoryModule {
         if !force, ctx.sockets.contains(where: { socket in
             guard socket.state == .established else { return false }
             if known.contains(socket.pid) { return ports.contains(socket.localPort) }
-            return socket.remotePort.map(ports.contains) ?? false
+            return socket.remoteIsLocal && (socket.remotePort.map(ports.contains) ?? false)
         }) {
             return .skipped(reason: "a connection arrived")
         }

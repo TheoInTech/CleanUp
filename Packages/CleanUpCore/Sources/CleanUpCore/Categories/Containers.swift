@@ -20,10 +20,16 @@ public struct ContainerFacts: Sendable {
     /// `docker compose exec`, a VS Code / Cursor dev container. They talk over the Docker socket, so
     /// no port, CPU or traffic counter shows them.
     public let attachedBy: [String]
+    /// Interactive shells open in it through the Engine API (Docker Desktop's Exec tab, lazydocker),
+    /// which no process's arguments show; nil when they couldn't be checked.
+    public let openShells: Int?
+    /// Other commands running in it through the Engine API (`docker exec -d`), healthchecks left out.
+    public let runningCommands: Int
 
     public init(
         name: String, image: String, startedAt: Date, cpuPercent: Double,
-        publishedPorts: [Int], clientConnections: Int, netBytesDelta: Int64?, attachedBy: [String] = []
+        publishedPorts: [Int], clientConnections: Int, netBytesDelta: Int64?, attachedBy: [String] = [],
+        openShells: Int? = 0, runningCommands: Int = 0
     ) {
         self.name = name
         self.image = image
@@ -33,6 +39,8 @@ public struct ContainerFacts: Sendable {
         self.clientConnections = clientConnections
         self.netBytesDelta = netBytesDelta
         self.attachedBy = attachedBy
+        self.openShells = openShells
+        self.runningCommands = runningCommands
     }
 }
 
@@ -51,6 +59,21 @@ public enum ContainerJudge {
         if let user = f.attachedBy.first {
             signals.append(Signal(kind: .inUse, text: "\(f.attachedBy.joined(separator: ", ")) has a session open in it"))
             reasons.append("used by \(user)")
+        }
+
+        switch f.openShells {
+        case nil:
+            signals.append(Signal(kind: .inUse, text: "Couldn't check for open shells"))
+            reasons.append("checking for shells")
+        case let shells? where shells > 0:
+            signals.append(Signal(kind: .inUse, text: shells == 1 ? "A shell is open in it" : "\(shells) shells are open in it"))
+            reasons.append("shell open")
+        default:
+            break
+        }
+        if f.runningCommands > 0 {
+            signals.append(Signal(kind: .inUse, text: "A command started with docker exec is still running in it"))
+            reasons.append("command running")
         }
 
         if f.clientConnections == 0 {
@@ -129,6 +152,9 @@ public struct EngineFacts: Sendable {
     public let endpoint: Endpoint
     /// Since when every condition has held without a break; nil when they don't hold now.
     public let quietSince: Date?
+    /// Docker Desktop's built-in Kubernetes cluster is running (inside the engine). Always false for
+    /// the other engines.
+    public let kubernetesOn: Bool
 
     public enum Endpoint: Sendable, Equatable {
         case matches, elsewhere, unknown
@@ -136,7 +162,8 @@ public struct EngineFacts: Sendable {
 
     public init(
         engine: ContainerEngine, containerVerdicts: [Verdict], clients: [String], overheadPercent: Double?,
-        machines: Machines, otherEngineRunning: Bool, endpoint: Endpoint = .matches, quietSince: Date?
+        machines: Machines, otherEngineRunning: Bool, endpoint: Endpoint = .matches, quietSince: Date?,
+        kubernetesOn: Bool = false
     ) {
         self.engine = engine
         self.containerVerdicts = containerVerdicts
@@ -146,6 +173,7 @@ public struct EngineFacts: Sendable {
         self.otherEngineRunning = otherEngineRunning
         self.endpoint = endpoint
         self.quietSince = quietSince
+        self.kubernetesOn = kubernetesOn
     }
 }
 
@@ -213,6 +241,11 @@ public enum EngineJudge {
             reasons.append("used by \(client)")
         } else {
             signals.append(Signal(kind: .idle, text: "No docker command is running"))
+        }
+
+        if f.kubernetesOn {
+            signals.append(Signal(kind: .inUse, text: "Its Kubernetes cluster is running"))
+            reasons.append("Kubernetes is on")
         }
 
         switch f.machines {
@@ -288,6 +321,8 @@ public struct ContainersModule: CategoryModule {
         let netBytesDelta: Int64?
         /// Since when CPU has been continuously below the idle threshold; nil when it isn't.
         let lowCPUSince: Date?
+        /// What runs in it through `docker exec`; nil when it couldn't be checked.
+        let execs: ExecActivity?
     }
 
     private struct NetSample: Sendable {
@@ -314,6 +349,8 @@ public struct ContainersModule: CategoryModule {
         var orbMachines: EngineFacts.Machines = .unknown
         /// Since when each engine has been quiet without a break.
         var engineQuietSince: [ContainerEngine: Date] = [:]
+        /// Parsed process arguments, reused by the next scan's session check.
+        var sessionCache = SessionIndex.Cache()
     }
 
     /// Idleness has to hold for this long: low CPU the whole time, and traffic measured against a
@@ -321,6 +358,7 @@ public struct ContainersModule: CategoryModule {
     static let observationWindow: TimeInterval = 10 * 60
 
     private let memory = OSAllocatedUnfairLock(initialState: Memory())
+    private let readKubeconfig: @Sendable () -> String?
 
     /// - Parameters:
     ///   - home: the user's home, where engines keep their sockets (`~/.docker/run`, `~/.orbstack`, `~/.colima`).
@@ -328,8 +366,14 @@ public struct ContainersModule: CategoryModule {
     public init(
         run: Run? = nil, quitApp: AppAction? = nil, launchApp: AppAction? = nil,
         home: String = NSHomeDirectory(),
-        resolveLink: (@Sendable (String) -> String)? = nil
+        resolveLink: (@Sendable (String) -> String)? = nil,
+        readKubeconfig: (@Sendable () -> String?)? = nil
     ) {
+        self.readKubeconfig = readKubeconfig ?? { [home] in
+            let path = ProcessInfo.processInfo.environment["KUBECONFIG"]?.split(separator: ":").first.map(String.init)
+                ?? home + "/.kube/config"
+            return try? String(contentsOfFile: path, encoding: .utf8)
+        }
         self.run = run ?? { await Self.defaultRun($0, $1) }
         self.quitApp = quitApp ?? { await Self.defaultQuit($0) }
         self.launchApp = launchApp ?? { await Self.defaultLaunch($0) }
@@ -415,6 +459,16 @@ public struct ContainersModule: CategoryModule {
         // `docker stats` supplies CPU only: its NetIO is rounded to 3 significant figures.
         let statsByName = (stats.status == 0 && !stats.timedOut) ? Self.parseStats(stats.stdout) : [:]
         let inspected = (inspect.status == 0 && !inspect.timedOut) ? Self.parseInspect(inspect.stdout) : [:]
+        var checked: [String: ExecActivity] = [:]
+        let clock = ContinuousClock(), deadline = clock.now + Self.execCheckBudget
+        for (name, row) in inspected.sorted(by: { $0.key < $1.key }) {
+            // Past the budget (a hanging Engine API), the rest stay unchecked: in use.
+            if !row.execIDs.isEmpty, clock.now > deadline { continue }
+            if let activity = await execActivity(execIDs: row.execIDs, healthcheck: row.healthcheck, socket: socket) {
+                checked[name] = activity
+            }
+        }
+        let execs = checked
 
         return memory.withLock { state -> [Collected] in
             var samples: [String: [NetSample]] = [:]
@@ -440,7 +494,7 @@ public struct ContainersModule: CategoryModule {
                 return Collected(
                     name: row.name, id: row.id, image: row.image, service: inspected[row.name]?.service,
                     startedAt: inspected[row.name]?.startedAt, ports: inspected[row.name]?.ports,
-                    cpuPercent: cpu, netBytesDelta: delta, lowCPUSince: lowCPU[row.name]
+                    cpuPercent: cpu, netBytesDelta: delta, lowCPUSince: lowCPU[row.name], execs: execs[row.name]
                 )
             }
             state.samples = samples
@@ -505,6 +559,86 @@ public struct ContainersModule: CategoryModule {
         }
     }
 
+    /// Exec instances checked per container; more than this can't all be checked, so they count as in use.
+    static let maxExecsChecked = 8
+    /// All exec checks of one scan together get this long; containers not reached by then are unchecked (in use).
+    static let execCheckBudget: Duration = .seconds(10)
+
+    /// What is running in a container through `docker exec`.
+    struct ExecActivity: Sendable, Equatable {
+        /// Interactive sessions (stdin or a tty): Docker Desktop's Exec tab, lazydocker, `docker exec -it`.
+        var shells = 0
+        /// Anything else still running that isn't the container's own healthcheck (`docker exec -d`, a job
+        /// an extension started).
+        var commands = 0
+    }
+
+    /// The running execs of a container, its healthcheck probes left out. A probe is an exec running
+    /// exactly the healthcheck's command; anything else that runs counts. Nil when one couldn't be checked.
+    private func execActivity(execIDs: [String], healthcheck: [String]?, socket: String?) async -> ExecActivity? {
+        guard !execIDs.isEmpty else { return ExecActivity() }
+        guard let socket, execIDs.count <= Self.maxExecsChecked else { return nil }
+        let probe = Self.probeCommand(healthcheck)
+        var activity = ExecActivity()
+        for id in execIDs {
+            // Exec IDs are 64 hex characters; anything else never reaches a URL.
+            guard (12...128).contains(id.utf8.count), id.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { return nil }
+            let result = await run("/usr/bin/curl", [
+                "--silent", "--max-time", "5", "--unix-socket", socket, "http://localhost/exec/\(id)/json",
+            ])
+            guard result.status == 0, !result.timedOut, let exec = Self.parseExec(result.stdout) else { return nil }
+            switch exec {
+            case .finished: break
+            case .interactive: activity.shells += 1
+            case .background(let command): if command != probe { activity.commands += 1 }
+            }
+        }
+        return activity
+    }
+
+    /// The command Docker runs for a healthcheck test: `CMD-SHELL x` → `/bin/sh -c x`, `CMD a b` → `a b`.
+    static func probeCommand(_ test: [String]?) -> [String]? {
+        guard let test, let kind = test.first else { return nil }
+        switch kind {
+        case "CMD-SHELL": return test.count == 2 ? ["/bin/sh", "-c", test[1]] : nil
+        case "CMD": return test.count > 1 ? Array(test.dropFirst()) : nil
+        default: return nil   // NONE, or inherited from the image and unknown here
+        }
+    }
+
+    enum ExecState: Equatable {
+        case finished
+        case interactive
+        /// Running with no stdin and no tty: a healthcheck probe or a detached command.
+        case background(command: [String])
+    }
+
+    /// `/exec/<id>/json`. An exec that finished before we asked ("No such exec instance") is finished.
+    static func parseExec(_ json: String) -> ExecState? {
+        struct Exec: Decodable {
+            struct Config: Decodable {
+                let tty: Bool?
+                let entrypoint: String?
+                let arguments: [String]?
+            }
+            let Running: Bool
+            let OpenStdin: Bool?
+            let ProcessConfig: Config?
+        }
+        struct Message: Decodable { let message: String }
+        let data = Data(json.utf8)
+        if let exec = try? JSONDecoder().decode(Exec.self, from: data) {
+            guard exec.Running else { return .finished }
+            if exec.OpenStdin == true || exec.ProcessConfig?.tty == true { return .interactive }
+            let config = exec.ProcessConfig
+            return .background(command: [config?.entrypoint ?? ""] + (config?.arguments ?? []))
+        }
+        if let message = try? JSONDecoder().decode(Message.self, from: data), message.message.hasPrefix("No such exec instance") {
+            return .finished
+        }
+        return nil
+    }
+
     private func apiNetworkBytes(name: String, socket: String) async -> Int64? {
         guard Self.isSafeName(name) else { return nil }
         let result = await run("/usr/bin/curl", [
@@ -534,7 +668,13 @@ public struct ContainersModule: CategoryModule {
         // The engine quit since docker was last asked: what was listed is gone with it.
         guard !engines.isEmpty else { return [] }
         let proxyPIDs = engines.reduce(into: Set<Int32>()) { $0.formUnion($1.allPIDs) }
-        let sessions = collected.isEmpty ? nil : SessionIndex(ctx.processes, ownPID: ctx.ownPID)
+        // Parsed outside the lock (a cold parse takes a while); the cache goes back in afterwards.
+        var sessions: SessionIndex?
+        if !collected.isEmpty {
+            var cache = memory.withLock { $0.sessionCache }
+            sessions = SessionIndex(ctx.processes, ownPID: ctx.ownPID, cache: &cache)
+            memory.withLock { [cache] in $0.sessionCache = cache }
+        }
         let context = memory.withLock { $0.context }
         let endpoints = Dictionary(uniqueKeysWithValues: engines.map { ($0.engine, Self.endpoint(context, of: $0)) })
         // The containers docker lists belong to the engine its context points at, if that one runs here.
@@ -562,20 +702,29 @@ public struct ContainersModule: CategoryModule {
             state.lastEngineScan = max(state.lastEngineScan ?? ctx.now, ctx.now)
             return state.orbMachines
         }
+        // Docker Desktop's own cluster on 6443, plus any cluster ~/.kube/config says runs on this Mac.
+        let clusterPorts = engines.contains { $0.engine == .dockerDesktop }
+            ? Self.localClusterPorts(readKubeconfig() ?? "").union([Self.kubernetesAPIPort]) : []
         let engineItems = engines.map { e -> Item in
             let (overhead, cores) = Self.overhead(of: e, containersCPU: containersCPU, cpu: ctx.cpu)
+            // Its kube-apiserver is forwarded to this Mac: no file to read (another app's container would ask
+            // for permission), just a socket of its own.
+            let kubernetes = e.engine == .dockerDesktop && ctx.sockets.contains {
+                $0.state == .listen && clusterPorts.contains($0.localPort) && e.allPIDs.contains($0.pid)
+            }
             // Two engines can run at once but the docker CLI talks to only one of them, so we can't say
             // whose containers these are, or whether the other engine hosts any: never offer to quit.
             let draft = EngineFacts(
                 engine: e.engine, containerVerdicts: verdicts, clients: clients, overheadPercent: overhead,
                 machines: e.engine == .orbStack ? machines : .notApplicable,
-                otherEngineRunning: engines.count > 1, endpoint: endpoints[e.engine] ?? .unknown, quietSince: nil
+                otherEngineRunning: engines.count > 1, endpoint: endpoints[e.engine] ?? .unknown, quietSince: nil,
+                kubernetesOn: kubernetes
             )
             let since = rememberQuiet(e.engine, quiet: EngineJudge.isQuietNow(draft), now: ctx.now)
             let facts = EngineFacts(
                 engine: draft.engine, containerVerdicts: verdicts, clients: clients, overheadPercent: overhead,
                 machines: draft.machines, otherEngineRunning: draft.otherEngineRunning, endpoint: draft.endpoint,
-                quietSince: since
+                quietSince: since, kubernetesOn: kubernetes
             )
             var item = Self.engineItem(e, facts: facts, cores: cores, ports: allPorts, ctx: ctx)
             if e.engine == .colima, draft.endpoint == .matches, case .engine(_, let profile?) = context {
@@ -586,6 +735,16 @@ public struct ContainersModule: CategoryModule {
         let running = Set(engines.map(\.engine))
         memory.withLock { state in state.engineQuietSince = state.engineQuietSince.filter { running.contains($0.key) } }
         return containerItems + engineItems
+    }
+
+    /// Docker Desktop's Kubernetes API server port, which its backend listens on (on this Mac)
+    /// while the cluster runs.
+    static let kubernetesAPIPort = 6443
+
+    /// Ports of the kubeconfig clusters whose API server is on this Mac (`server: https://127.0.0.1:52817`).
+    static func localClusterPorts(_ kubeconfig: String) -> Set<Int> {
+        let local = /server:\s*["']?https?:\/\/(?:127\.0\.0\.1|localhost|kubernetes\.docker\.internal|\[::1\]):(\d{1,5})/
+        return Set(kubeconfig.matches(of: local).compactMap { Int($0.output.1) })
     }
 
     /// Whether the docker context talks to this engine. A Colima context matches only while that
@@ -678,7 +837,8 @@ public struct ContainersModule: CategoryModule {
             let facts = ContainerFacts(
                 name: c.name, image: c.image, startedAt: startedAt, cpuPercent: cpu, publishedPorts: ports,
                 clientConnections: clientConnections(ports: ports, sockets: ctx.sockets, excluding: proxyPIDs),
-                netBytesDelta: c.netBytesDelta, attachedBy: attachedBy
+                netBytesDelta: c.netBytesDelta, attachedBy: attachedBy,
+                openShells: c.execs?.shells, runningCommands: c.execs?.commands ?? 0
             )
             judgement = requireSustainedLowCPU(ContainerJudge.judge(facts, now: ctx.now), since: c.lowCPUSince, now: ctx.now)
         } else {
@@ -857,7 +1017,7 @@ public struct ContainersModule: CategoryModule {
 
     /// Prints only what we read, so container environment variables (passwords) never leave docker.
     static let inspectTemplate =
-        #"{"Name":{{json .Name}},"State":{"StartedAt":{{json .State.StartedAt}}},"NetworkSettings":{"Ports":{{json .NetworkSettings.Ports}}},"Service":{{json (index .Config.Labels "com.docker.compose.service")}}}"#
+        #"{"Id":{{json .Id}},"Name":{{json .Name}},"State":{"StartedAt":{{json .State.StartedAt}}},"NetworkSettings":{"Ports":{{json .NetworkSettings.Ports}}},"Service":{{json (index .Config.Labels "com.docker.compose.service")}},"ExecIDs":{{json .ExecIDs}},"Healthcheck":{{json .Config.Healthcheck}}}"#
 
     private static func jsonLines<T: Decodable>(_ output: String, as: T.Type) -> [T] {
         let decoder = JSONDecoder()
@@ -919,7 +1079,7 @@ public struct ContainersModule: CategoryModule {
     }
 
     /// Start time, published host ports and compose service per container, from `docker inspect`.
-    static func parseInspect(_ out: String) -> [String: (startedAt: Date, ports: [Int], service: String?)] {
+    static func parseInspect(_ out: String) -> [String: (startedAt: Date, ports: [Int], service: String?, execIDs: [String], id: String?, healthcheck: [String]?)] {
         struct Binding: Decodable { let HostPort: String? }
         struct Row: Decodable {
             struct State: Decodable { let StartedAt: String }
@@ -928,8 +1088,12 @@ public struct ContainersModule: CategoryModule {
             let State: State
             let NetworkSettings: Network
             let Service: String?
+            let ExecIDs: [String]?
+            let Id: String?
+            struct Health: Decodable { let Test: [String]? }
+            let Healthcheck: Health?
         }
-        var result: [String: (startedAt: Date, ports: [Int], service: String?)] = [:]
+        var result: [String: (startedAt: Date, ports: [Int], service: String?, execIDs: [String], id: String?, healthcheck: [String]?)] = [:]
         for row in jsonLines(out, as: Row.self) {
             // Docker's zero date means "never started"; treat it as unknown.
             guard let started = parseDate(row.State.StartedAt), started.timeIntervalSince1970 > 946_684_800 else { continue }
@@ -937,7 +1101,7 @@ public struct ContainersModule: CategoryModule {
                 .flatMap { $0 ?? [] }
                 .compactMap { $0.HostPort.flatMap { Int($0) } }
             let service = row.Service.flatMap { $0.isEmpty ? nil : $0 }
-            result[row.Name.hasPrefix("/") ? String(row.Name.dropFirst()) : row.Name] = (started, Array(Set(ports)).sorted(), service)
+            result[row.Name.hasPrefix("/") ? String(row.Name.dropFirst()) : row.Name] = (started, Array(Set(ports)).sorted(), service, row.ExecIDs ?? [], row.Id.map { String($0.lowercased().prefix(12)) }, row.Healthcheck?.Test)
         }
         return result
     }
@@ -990,13 +1154,34 @@ public struct ContainersModule: CategoryModule {
             guard bytes >= last.bytes, bytes - last.bytes < ContainerJudge.idleNetBytes else {
                 return .skipped(reason: "\(item.name) has network traffic")
             }
+            // A shell opened from Docker Desktop or lazydocker since the scan shows only as an exec.
+            let inspect = await run("docker", ["inspect", "--format", Self.inspectTemplate, item.name])
+            guard inspect.status == 0, !inspect.timedOut, let row = Self.parseInspect(inspect.stdout)[item.name] else {
+                return .skipped(reason: "couldn't check \(item.name) for shells")
+            }
+            if let scanned = Self.containerID(item), row.id != scanned {
+                return .skipped(reason: "\(item.name) was replaced since")
+            }
+            guard let execs = await execActivity(execIDs: row.execIDs, healthcheck: row.healthcheck, socket: socket) else {
+                return .skipped(reason: "couldn't check \(item.name) for shells")
+            }
+            guard execs.shells == 0 else { return .skipped(reason: "\(item.name) has a shell open") }
+            guard execs.commands == 0 else { return .skipped(reason: "\(item.name) is running a command") }
         }
-        let result = await run("docker", ["stop", item.name])
+        // By ID when known: a container recreated under the same name since the scan is a different one.
+        let result = await run("docker", ["stop", Self.containerID(item) ?? item.name])
         if result.timedOut { return .failed(reason: "docker stop timed out") }
         guard result.status == 0 else {
             return .failed(reason: Self.firstLine(result.stderr, fallback: "docker stop failed (\(result.status))"))
         }
         return .stopped(UndoToken(identity: item.id, action: "start", arguments: [item.name]))
+    }
+
+    /// The 12-character ID `docker ps` gave at scan time, when it looks like one.
+    static func containerID(_ item: Item) -> String? {
+        guard let id = item.detail["id"], id.utf8.count == 12,
+              id.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { return nil }
+        return id
     }
 
     private func stopEngine(_ item: Item) async -> StopResult {
@@ -1082,7 +1267,16 @@ public struct ContainersModule: CategoryModule {
 /// compose exec` and VS Code / Cursor dev containers all go through the Docker socket, invisible to
 /// ports, CPU and traffic, but they name the container (or its ID) in their arguments.
 struct SessionIndex {
-    private struct Entry {
+    /// Parsed arguments per process, kept between scans: a process's arguments rarely change, and
+    /// parsing every argument of every process costs ~18 ms a scan. Keyed by pid + start time; the
+    /// arguments' hash is checked so a process that rewrites them is parsed again.
+    typealias Cache = [ProcessRef: Cached]
+    struct Cached: Sendable {
+        let argumentsHash: Int
+        let entry: Entry?
+    }
+
+    struct Entry: Sendable {
         let name: String
         let tokens: Set<String>
         /// 12-character prefixes of the long hex tokens (container IDs) in the arguments.
@@ -1096,22 +1290,39 @@ struct SessionIndex {
 
     /// Every process outside CleanUp's own tree.
     init(_ table: [Int32: ProcessInfoRecord], ownPID: Int32) {
+        var cache = Cache()
+        self.init(table, ownPID: ownPID, cache: &cache)
+    }
+
+    /// Same, reusing what `cache` already parsed; afterwards it holds exactly the processes in `table`.
+    init(_ table: [Int32: ProcessInfoRecord], ownPID: Int32, cache: inout Cache) {
         let own = ProcessTree.ownTree(ownPID, in: table)
-        entries = table.values.filter { !own.contains($0.pid) }.sorted { $0.pid < $1.pid }.compactMap { p in
-            var tokens = Set<String>()
-            for argument in p.arguments.dropFirst() {
-                tokens.formUnion(Self.tokens(argument))
-                for decoded in Self.remoteAuthorities(argument) { tokens.formUnion(Self.tokens(decoded)) }
-            }
-            guard !tokens.isEmpty else { return nil }
-            let leaf = ProcessTree.leaf(p)
-            let prefixes = Set(tokens.filter { $0.count >= 12 && Self.isHex($0) }.map { String($0.prefix(12)) })
-            return Entry(
-                name: p.name.isEmpty ? leaf : p.name, tokens: tokens, idPrefixes: prefixes,
-                isDockerClient: ContainersModule.clientNames.contains(leaf),
-                isCompose: leaf == "docker-compose" || tokens.contains("compose")
-            )
+        var next = Cache(minimumCapacity: table.count)
+        var entries: [Entry] = []
+        for p in table.values.sorted(by: { $0.pid < $1.pid }) {
+            let hash = p.arguments.hashValue
+            let cached = cache[p.ref].flatMap { $0.argumentsHash == hash ? $0 : nil } ?? Cached(argumentsHash: hash, entry: Self.entry(p))
+            next[p.ref] = cached
+            if !own.contains(p.pid), let entry = cached.entry { entries.append(entry) }
         }
+        cache = next
+        self.entries = entries
+    }
+
+    private static func entry(_ p: ProcessInfoRecord) -> Entry? {
+        var tokens = Set<String>()
+        for argument in p.arguments.dropFirst() {
+            tokens.formUnion(Self.tokens(argument))
+            for decoded in Self.remoteAuthorities(argument) { tokens.formUnion(Self.tokens(decoded)) }
+        }
+        guard !tokens.isEmpty else { return nil }
+        let leaf = ProcessTree.leaf(p)
+        let prefixes = Set(tokens.filter { $0.count >= 12 && Self.isHex($0) }.map { String($0.prefix(12)) })
+        return Entry(
+            name: p.name.isEmpty ? leaf : p.name, tokens: tokens, idPrefixes: prefixes,
+            isDockerClient: ContainersModule.clientNames.contains(leaf),
+            isCompose: leaf == "docker-compose" || tokens.contains("compose")
+        )
     }
 
     /// Names of the processes naming this container, sorted, without duplicates.

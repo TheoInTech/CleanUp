@@ -296,6 +296,23 @@ private func scanEveryMinute(
     #expect(items[0].judgement.fact == "1 connection")
 }
 
+@Test func connectionsToOtherHostsOnTheSamePortAreNotClients() async {
+    // A browser talking to a remote API on port 8081 is not using the local Expo server.
+    let m = module()
+    let remote = SocketInfo(pid: 777, state: .established, localPort: 53_000, remotePort: 8081, remoteIsLocal: false)
+    let items = await scanEveryMinute(m, expoProcesses(), to: 31, sockets: [expoListen, remote])
+    #expect(items[0].judgement.verdict == .idle)
+}
+
+@Test func serverTalkingToARemoteHostDoesNotHideItsRealClient() async {
+    // Expo has a real client on 8081 and also talks out to some host's port 8081: still in use.
+    let m = module()
+    let client = SocketInfo(pid: 86_037, state: .established, localPort: 8081, remotePort: 52_000)
+    let outbound = SocketInfo(pid: 86_037, state: .established, localPort: 54_000, remotePort: 8081, remoteIsLocal: false)
+    let items = await m.scan(context(expoProcesses(), sockets: [expoListen, client, outbound]))
+    #expect(items[0].judgement.fact == "1 connection")
+}
+
 @Test func scanIgnoresConnectionsInsideTheTree() async {
     let m = module()
     // The wrapper talking to its own child is not a user.
@@ -469,6 +486,17 @@ private func appProcess(_ pid: Int32, ppid: Int32 = 1, name: String, path: Strin
         .fixture(pid: 332, ppid: 331, name: "node", path: nvmNode, arguments: ["node", "serve.js"], cwd: mobileCwd, startedAgo: .days(3)),
     ]
     #expect(await module().scan(context(procs, sockets: [listen(332)])).isEmpty)
+}
+
+@Test func wrapperBetweenTheAppAndTheServerDoesNotMakeItTheUsers() async {
+    // Claude -> uvx (python) -> node: an MCP server started through a wrapper is still the app's.
+    let procs = [
+        appProcess(340, name: "Claude", path: "/Applications/Claude.app/Contents/MacOS/Claude"),
+        .fixture(pid: 341, ppid: 340, name: "uv", path: "/Users/u/.local/bin/uv", arguments: ["uv", "tool", "uvx", "mcp-proxy"], startedAgo: .days(3)),
+        .fixture(pid: 342, ppid: 341, name: "python3", path: "/opt/homebrew/bin/python3", arguments: ["python3", "-m", "mcp_proxy"], startedAgo: .days(3)),
+        .fixture(pid: 343, ppid: 342, name: "node", path: nvmNode, arguments: ["node", "server.js"], cwd: mobileCwd, startedAgo: .days(3)),
+    ]
+    #expect(await module().scan(context(procs, sockets: [listen(343)])).isEmpty)
 }
 
 @Test func terminalAppsAndIntegratedTerminalsStayCandidates() async {

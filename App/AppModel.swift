@@ -86,7 +86,9 @@ final class AppModel {
     @ObservationIgnored private var signalGate = CleanupSignalGate()
     @ObservationIgnored private var workspaceObservers: [any NSObjectProtocol] = []
     /// Snapshots for the widget, written in order by one consumer (newest wins).
-    @ObservationIgnored private var snapshotOutbox: AsyncStream<(Snapshot, Bool)>.Continuation?
+    @ObservationIgnored private var snapshotOutbox: AsyncStream<(Snapshot, Bool, UInt64)>.Continuation?
+    /// Counts snapshots as they are made, so the writer keeps their order whatever the clock does.
+    @ObservationIgnored private var snapshotSequence: UInt64 = 0
     @ObservationIgnored private var lastWidgetReload: Date?
     /// Opens the main window; set by the menu bar label, the one view that always exists. "Show me"
     /// tapped before it is set (a cold launch from the notification) opens the window once it is.
@@ -211,14 +213,14 @@ final class AppModel {
     /// the widget never reads the previous snapshot.
     private func startSnapshotSharing() {
         guard let groupID, !groupID.hasPrefix("."), let url = SnapshotStore.url(groupID: groupID) else { return }
-        let (stream, outbox) = AsyncStream.makeStream(of: (Snapshot, Bool).self)
+        let (stream, outbox) = AsyncStream.makeStream(of: (Snapshot, Bool, UInt64).self)
         snapshotOutbox = outbox
         let writer = SnapshotWriter(url: url)
         let log = self.log
         Task.detached(priority: .utility) {
-            for await (snapshot, reload) in stream {
+            for await (snapshot, reload, sequence) in stream {
                 do {
-                    if try await writer.write(snapshot), reload { WidgetCenter.shared.reloadAllTimelines() }
+                    if try await writer.write(snapshot, sequence: sequence), reload { WidgetCenter.shared.reloadAllTimelines() }
                 } catch {
                     log.error("Snapshot not shared: \(String(describing: error), privacy: .public)")
                 }
@@ -227,7 +229,8 @@ final class AppModel {
     }
 
     private func writeSnapshot(_ s: Snapshot, reloadWidgets: Bool) {
-        snapshotOutbox?.yield((s, reloadWidgets))
+        snapshotSequence += 1
+        snapshotOutbox?.yield((s, reloadWidgets, snapshotSequence))
     }
 
     // MARK: Ticks
@@ -262,10 +265,11 @@ final class AppModel {
     func cleanUp() async -> CleanupReport? {
         guard !isCleaning, !cleanIdleInFlight else { return nil }
         isCleaning = true
+        let pressed = ticks.selection.ticked   // what the button promised; a refresh may tick more
         if TickController.isStale(snapshot, now: Date()) {
             await refresh(forceExternal: true)   // applying it reconciles the ticks with what is there now
         }
-        return await perform(TickController.itemsToClean(ticks.selection, in: snapshot))
+        return await perform(TickController.itemsToClean(ticks.selection, in: snapshot, pressed: pressed))
     }
 
     /// Stops one item from its "?" sheet. `force` is "Stop anyway" on an in-use item: the engine
@@ -436,22 +440,28 @@ final class AppModel {
     /// fresh scan, never from the numbers in the notification, which may be minutes old. Quick select
     /// only: never forced, never apps, and the user's own ticks stay as they were.
     func cleanIdle() async {
-        guard !isCleaning, !cleanIdleInFlight else { return }
+        guard !isCleaning, !cleanIdleInFlight else { return await sayAlreadyCleaning() }
         cleanIdleInFlight = true
         defer { cleanIdleInFlight = false }
         await refresh(forceExternal: true)
+        // A Clean up pressed in the window meanwhile is already stopping things: let it finish.
+        guard !isCleaning else { return await sayAlreadyCleaning() }
         let quick = TickController.cleanIdleSelection(snapshot, keep: keepList)
-        guard quick.count > 0, !isCleaning else {
-            if quick.count == 0 {
-                show(ToastState("Nothing idle"), for: .seconds(4))
-                if !isVisible { await Notifications.postResult("Nothing idle to stop") }
-            }
+        guard quick.count > 0 else {
+            show(ToastState("Nothing idle"), for: .seconds(4))
+            if !isVisible { await Notifications.postResult("Nothing idle to stop") }
             return
         }
         isCleaning = true
         guard let report = await perform(TickController.itemsToClean(quick, in: snapshot)) else { return }
         // With no window or popover open the toast is invisible, so say it in a quiet notification.
         if !isVisible { await Notifications.postResult(Self.summary(of: report).joined(separator: " · ")) }
+    }
+
+    /// A second Clean up (notification or widget) while one runs: say so instead of doing nothing.
+    private func sayAlreadyCleaning() async {
+        if isVisible { show(ToastState("Already cleaning up"), for: .seconds(4)) }
+        else { await Notifications.postResult("Already cleaning up") }
     }
 
     func showMainWindow() {

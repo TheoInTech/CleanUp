@@ -57,9 +57,17 @@ public struct BrowserTabsModule: CategoryModule {
     /// Anything else with a "Helper (Renderer)" (Slack, VS Code, Discord, ...) is an Electron app, not a browser.
     private static let chromiumBrowsers: [String: (display: String, bundle: String)] = [
         "Brave Browser": ("Brave", "Brave Browser"),
+        "Brave Browser Beta": ("Brave Beta", "Brave Browser Beta"),
+        "Brave Browser Nightly": ("Brave Nightly", "Brave Browser Nightly"),
         "Google Chrome": ("Chrome", "Google Chrome"),
+        "Google Chrome Beta": ("Chrome Beta", "Google Chrome Beta"),
+        "Google Chrome Dev": ("Chrome Dev", "Google Chrome Dev"),
+        "Google Chrome Canary": ("Chrome Canary", "Google Chrome Canary"),
         "Chromium": ("Chromium", "Chromium"),
         "Microsoft Edge": ("Edge", "Microsoft Edge"),
+        "Microsoft Edge Beta": ("Edge Beta", "Microsoft Edge Beta"),
+        "Microsoft Edge Dev": ("Edge Dev", "Microsoft Edge Dev"),
+        "Microsoft Edge Canary": ("Edge Canary", "Microsoft Edge Canary"),
         "Arc": ("Arc", "Arc"),
         "Vivaldi": ("Vivaldi", "Vivaldi"),
         "Opera": ("Opera", "Opera"),

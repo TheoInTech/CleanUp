@@ -54,7 +54,8 @@ CleanUp has to watch before it can call anything quiet, so **nothing shows as id
 
 ```sh
 brew install xcodegen
-# from the repository root
+git clone https://github.com/TheoInTech/CleanUp.git
+cd CleanUp
 cp Config/Team.xcconfig.example Config/Team.xcconfig
 ```
 
@@ -90,7 +91,7 @@ swift test --package-path Packages/CleanUpCore
 
 ## Support
 
-CleanUp is free. If it saved your battery, you can [sponsor the project](https://github.com/sponsors).
+CleanUp is free. If it saved your battery, you can [sponsor the project](https://github.com/sponsors/TheoInTech).
 
 ## License
 

@@ -8,7 +8,7 @@ struct SettingsView: View {
     @State private var openAtLogin = LoginItem.isEnabled
     @State private var loginError: String?
 
-    static let sponsorsURL = URL(string: "https://github.com/sponsors")!
+    static let sponsorsURL = URL(string: "https://github.com/sponsors/TheoInTech")!
 
     var body: some View {
         @Bindable var model = model

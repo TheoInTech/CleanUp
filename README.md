@@ -91,7 +91,14 @@ swift test --package-path Packages/CleanUpCore
 
 ## Support
 
-CleanUp is free. If it saved your battery, you can [sponsor the project](https://github.com/sponsors/TheoInTech).
+CleanUp is free, with no ads, accounts or tracking. If it saved your battery, you can [sponsor the project](https://github.com/sponsors/TheoInTech). The first goal is $10 a month, which covers Apple's developer fee so CleanUp can ship as a signed download anyone can install in one click.
+
+### Sponsors
+
+Thank you to everyone keeping CleanUp free.
+
+<!-- Monthly sponsors at $5 and up are listed here. -->
+*No sponsors yet. [Be the first](https://github.com/sponsors/TheoInTech).*
 
 ## License
 

@@ -52,6 +52,7 @@ public enum DevServerJudge {
     public static func judge(_ f: DevServerFacts, now: Date) -> Judgement {
         var signals: [Signal] = []
         var reasons: [String] = []   // in-use reasons, strongest first
+        var watchingUntil: Date?
 
         if f.establishedNow == 0 {
             signals.append(Signal(kind: .idle, text: "Nothing is connected to it"))
@@ -100,6 +101,7 @@ public enum DevServerJudge {
             let window = RelativeAge.short(observationWindow)
             signals.append(Signal(kind: .inUse, text: "Still watching for connections (\(window))"))
             reasons.append("watching for \(window)")
+            watchingUntil = now.addingTimeInterval(observationWindow - f.observedFor)
         }
 
         if f.orphaned {
@@ -107,7 +109,7 @@ public enum DevServerJudge {
         }
 
         if let reason = reasons.first {
-            return Judgement(verdict: .inUse, fact: reason, signals: signals)
+            return Judgement(verdict: .inUse, fact: reason, signals: signals, watchingUntil: watchingUntil)
         }
         return Judgement(verdict: .idle, fact: "running \(RelativeAge.short(age))", signals: signals)
     }

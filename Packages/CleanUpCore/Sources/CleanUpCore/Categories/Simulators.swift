@@ -56,6 +56,7 @@ public enum SimulatorJudge {
 
     /// Idle only when every condition holds; anything unknown is in use.
     public static func judge(_ f: SimulatorFacts, now: Date) -> Judgement {
+        var watchingUntil: Date?
         var signals: [Signal] = []
         var reasons: [String] = []   // in-use reasons, strongest first
 
@@ -83,6 +84,7 @@ public enum SimulatorJudge {
             let window = RelativeAge.short(frontPeriod)
             signals.append(Signal(kind: .inUse, text: "CleanUp just started: can't tell yet when the Simulator app was last used"))
             reasons.append("watching for \(window)")
+            watchingUntil = f.frontTrackedSince.addingTimeInterval(frontPeriod)
         } else {
             let text = f.simulatorLastInFront.map { "The Simulator app was last in front \(RelativeAge.short(now.timeIntervalSince($0))) ago" }
                 ?? "The Simulator app is in the background"
@@ -129,7 +131,7 @@ public enum SimulatorJudge {
         }
 
         if let reason = reasons.first {
-            return Judgement(verdict: .inUse, fact: reason, signals: signals)
+            return Judgement(verdict: .inUse, fact: reason, signals: signals, watchingUntil: watchingUntil)
         }
         // No reason above means bootedAt is known; idle time runs from the latest activity.
         let since = max(f.bootedAt ?? .distantPast, f.lastAppLaunch ?? .distantPast)
@@ -446,7 +448,10 @@ public struct SimulatorsModule: CategoryModule {
             judgement = Judgement(verdict: .inUse, fact: "used by \(user)", signals: signals)
         } else if watched < servicesObservationWindow {
             signals.append(Signal(kind: .inUse, text: "Watched for only \(RelativeAge.short(watched)) so far"))
-            judgement = Judgement(verdict: .inUse, fact: "measuring activity", signals: signals)
+            judgement = Judgement(
+                verdict: .inUse, fact: "measuring activity", signals: signals,
+                watchingUntil: (quietSince ?? ctx.now).addingTimeInterval(servicesObservationWindow)
+            )
         } else {
             signals.append(Signal(kind: .neutral, text: "They restart on demand"))
             judgement = Judgement(verdict: .idle, fact: "no simulator booted, using \(usage) cores", signals: signals)

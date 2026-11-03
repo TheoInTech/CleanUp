@@ -170,7 +170,10 @@ public enum EngineJudge {
         guard quiet >= observationWindow else {
             signals.append(Signal(kind: .inUse, text: "Quiet for only \(RelativeAge.short(quiet)) so far"))
             reasons.append("measuring activity")
-            return Judgement(verdict: .inUse, fact: "measuring activity", signals: signals)
+            return Judgement(
+                verdict: .inUse, fact: "measuring activity", signals: signals,
+                watchingUntil: (f.quietSince ?? now).addingTimeInterval(observationWindow)
+            )
         }
         signals.append(Signal(kind: .idle, text: "Nothing has used it for \(RelativeAge.short(quiet))"))
         signals.append(Signal(kind: .neutral, text: "Stopping it also stops its containers"))
@@ -695,7 +698,10 @@ public struct ContainersModule: CategoryModule {
         guard judgement.verdict == .idle else { return judgement }
         if let since, now.timeIntervalSince(since) >= observationWindow { return judgement }
         let text = since.map { "CPU has been low for only \(RelativeAge.short(now.timeIntervalSince($0)))" } ?? "CPU use not observed yet"
-        return Judgement(verdict: .inUse, fact: "measuring activity", signals: judgement.signals + [Signal(kind: .inUse, text: text)])
+        return Judgement(
+            verdict: .inUse, fact: "measuring activity", signals: judgement.signals + [Signal(kind: .inUse, text: text)],
+            watchingUntil: (since ?? now).addingTimeInterval(observationWindow)
+        )
     }
 
     private static func engineItem(_ e: DetectedEngine, facts: EngineFacts, cores: Double, ports: Set<Int>, ctx: ScanContext) -> Item {

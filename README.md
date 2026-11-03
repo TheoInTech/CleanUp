@@ -9,6 +9,16 @@
 A menu bar app, a window and a widget for macOS. It never touches anything that is in use.
 
 <p align="center">
+  <a href="https://github.com/TheoInTech/CleanUp/releases/download/v0.1.0/CleanUp-launch-video.mp4">
+    <img src="docs/screenshots/video-poster.png" alt="Watch the 60-second launch video: the ring shows simulators, containers, dev servers and apps draining the battery" width="720">
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/TheoInTech/CleanUp/releases/latest"><b>Download CleanUp for macOS</b></a> · free and open source
+</p>
+
+<p align="center">
   <img src="docs/screenshots/main-window.png" alt="CleanUp main window: a ring split by cause, and a checklist of what is idle" width="300">
 </p>
 

@@ -47,6 +47,13 @@ struct SettingsView: View {
             }
 
             Section {
+                Image("Logo")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(height: 44)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 4)
+                    .accessibilityLabel("CleanUp")
                 Link(destination: Self.sponsorsURL) {
                     Label("Support CleanUp on GitHub Sponsors", systemImage: "heart")
                 }

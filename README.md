@@ -1,4 +1,9 @@
-# CleanUp
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/cleanup-logo-dark.png">
+    <img src="docs/brand/cleanup-logo-light.png" alt="CleanUp" width="360">
+  </picture>
+</h1>
 
 **See what is draining your Mac's battery, and stop the idle culprits in one tap.**
 A menu bar app, a window and a widget for macOS. It never touches anything that is in use.

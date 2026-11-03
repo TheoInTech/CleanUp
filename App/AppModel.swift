@@ -38,6 +38,8 @@ final class AppModel {
     }
     var expanded: Set<CategoryID> = []
     var toast: ToastState?
+    /// The last cleanup, item by item, shown as a card until dismissed (or for a minute).
+    var outcome: CleanupOutcome?
     /// The item whose "?" sheet is open.
     var explaining: Item?
     /// The main window is on screen.
@@ -76,6 +78,7 @@ final class AppModel {
     @ObservationIgnored private var lastExternal: Date?
     @ObservationIgnored private var lastUndo: [UndoToken] = []
     @ObservationIgnored private var toastDismissal: Task<Void, Never>?
+    @ObservationIgnored private var outcomeDismissal: Task<Void, Never>?
     @ObservationIgnored private let log = Logger(subsystem: "io.cleanup.CleanUp", category: "AppModel")
     @ObservationIgnored private var drainMonitor: DrainMonitor
     @ObservationIgnored private let notificationDelegate = NotificationDelegate()
@@ -252,7 +255,7 @@ final class AppModel {
 
     // MARK: Actions
 
-    /// The Clean up button (window and popover): stops every ticked item, reports it in a toast, then
+    /// The Clean up button (window and popover): stops every ticked item, shows each one in the outcome card, then
     /// rescans. A snapshot more than 10 s old is looked at again first; only what is still ticked and
     /// tickable in the fresh one is stopped.
     @discardableResult
@@ -284,8 +287,8 @@ final class AppModel {
         lastUndo = report.undo
         ticks.stopped(report.stopped)
 
-        let parts = Self.summary(of: report)
-        show(ToastState(parts: parts, canUndo: !report.undo.isEmpty), for: .seconds(8))
+        dismissToast()
+        show(CleanupOutcome(items: items, report: report))
         for (id, reason) in report.failed { log.info("Couldn't stop \(id.rawValue, privacy: .public): \(reason, privacy: .public)") }
         for (id, reason) in report.skipped { log.info("Skipped \(id.rawValue, privacy: .public): \(reason, privacy: .public)") }
 
@@ -324,6 +327,7 @@ final class AppModel {
         guard !tokens.isEmpty else { return }
         lastUndo = []
         dismissToast()
+        dismissOutcome()
         let failed = await cleaner.undo(tokens)
         if !failed.isEmpty { show(ToastState("Couldn't undo \(failed.count)"), for: .seconds(4)) }
         await refresh(forceExternal: true)
@@ -505,6 +509,27 @@ final class AppModel {
     #endif
 
     // MARK: Toast
+
+    private func show(_ outcome: CleanupOutcome) {
+        outcomeDismissal?.cancel()
+        withAnimation(.snappy) { self.outcome = outcome }
+        let id = outcome.id
+        outcomeDismissal = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(60))
+            guard !Task.isCancelled, let self, self.outcome?.id == id else { return }
+            withAnimation(.snappy) { self.outcome = nil }
+        }
+    }
+
+    func dismissOutcome() {
+        outcomeDismissal?.cancel()
+        withAnimation(.snappy) { outcome = nil }
+    }
+
+    /// Whether anything on screen could be ticked right now (idle items, or apps by hand).
+    var hasTickable: Bool {
+        snapshot.categories.contains { $0.items.contains(where: Selection.isTickable) }
+    }
 
     private func show(_ toast: ToastState, for duration: Duration) {
         toastDismissal?.cancel()

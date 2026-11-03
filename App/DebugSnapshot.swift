@@ -37,8 +37,23 @@ enum DebugSnapshot {
         let requested = (UserDefaults.standard.string(forKey: "debugExpand") ?? "")
             .split(separator: ",").compactMap { CategoryID(rawValue: String($0)) }
         if requested.isEmpty { model.toggleExpanded(category.id) } else { requested.forEach(model.toggleExpanded) }
-        await pause(1.5)
+        await pause(0.1)
+        capture("main-expanding", into: dir)   // mid-animation: the items must stay inside their card
+        await pause(1.4)
         capture("main-expanded", into: dir)
+
+        // A made-up result (nothing is stopped) to show the outcome card in the window and the popover.
+        let sample = Array(category.items.prefix(3))
+        model.outcome = CleanupOutcome(items: sample, report: CleanupReport(
+            stopped: sample.dropLast().map(\.id), failed: [],
+            skipped: sample.count > 1 ? sample.suffix(1).map { ($0.id, "\($0.name) is in use now") } : [],
+            undo: [], freedCores: 1.2
+        ))
+        await pause(1)
+        capture("outcome-card", into: dir)
+        await capturePopover(model, into: dir, name: "menubar-opened", opened: category.id)
+        model.dismissOutcome()
+        await pause(0.5)
 
         model.explaining = item
         await pause(10)   // the explainer gives up on the model after 8 s
@@ -61,8 +76,8 @@ enum DebugSnapshot {
 
     /// Hosts the popover and the menu bar label in throwaway windows (the real ones only exist while
     /// the status item is open) and writes `menubar-popover.png` and `menubar-label.png`.
-    private static func capturePopover(_ model: AppModel, into dir: URL) async {
-        let host = NSHostingView(rootView: MenuBarPopover().environment(model))
+    private static func capturePopover(_ model: AppModel, into dir: URL, name: String = "menubar-popover", opened: CategoryID? = nil) async {
+        let host = NSHostingView(rootView: MenuBarPopover(opened: opened).environment(model))
         let size = host.fittingSize
         host.frame = NSRect(origin: .zero, size: size)
         let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
@@ -74,9 +89,10 @@ enum DebugSnapshot {
         await pause(2)
         if let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
             host.cacheDisplay(in: host.bounds, to: rep)
-            try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent("menubar-popover.png"))
+            try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent("\(name).png"))
         }
         window.orderOut(nil)
+        guard opened == nil else { return }
 
         let strip = HStack(spacing: 28) {
             MenuBarLabelContent(mood: .allGood, minutes: "2h 5m")

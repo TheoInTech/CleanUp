@@ -24,11 +24,20 @@ struct MainView: View {
             }
             .scrollIndicators(.never)
 
+            if let outcome = model.outcome {
+                OutcomeCard(outcome: outcome)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .id(outcome.id)
+            }
+
             CleanUpButton()
                 .padding(.horizontal, 16)
                 .padding(.top, 4)
                 .padding(.bottom, 16)
         }
+        .animation(.snappy, value: model.outcome?.id)
         .frame(minWidth: 420, maxWidth: 420, minHeight: 520, idealHeight: 700, maxHeight: .infinity)
         .overlay(alignment: .topTrailing) {
             SettingsLink {

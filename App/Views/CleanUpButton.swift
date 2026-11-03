@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// The Clean up button shared by the window and the menu bar popover: "Clean up 4 idle · frees 3.1
-/// cores", or a disabled "Nothing idle". Stops everything ticked.
+/// cores", or a disabled "Nothing ticked" / "Nothing idle". Stops everything ticked.
 struct CleanUpButton: View {
     @Environment(AppModel.self) private var model
 
@@ -15,7 +15,8 @@ struct CleanUpButton: View {
                     ProgressView().controlSize(.small)
                 }
                 if count == 0 {
-                    Text("Nothing idle")
+                    // Apps (ticked by hand) can be there with nothing idle: say what's missing.
+                    Text(model.hasTickable ? "Nothing ticked" : "Nothing idle")
                 } else {
                     Text("Clean up \(count) idle")
                     Text("· frees \(Palette.cores(model.freedCores)) cores").opacity(0.8)

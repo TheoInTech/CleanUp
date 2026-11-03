@@ -10,6 +10,12 @@ struct MenuBarPopover: View {
     @Environment(\.openSettings) private var openSettings
     /// The popover's own panel, so it can be dismissed explicitly.
     @State private var panel: NSWindow?
+    /// The one category opened into its items (one at a time keeps the popover short).
+    @State private var opened: CategoryID?
+
+    init(opened: CategoryID? = nil) {
+        _opened = State(initialValue: opened)
+    }
 
     /// The three categories using the most CPU (ties broken by id so rows never swap places).
     /// Restart is advice, not something to tick.
@@ -24,7 +30,11 @@ struct MenuBarPopover: View {
         VStack(spacing: 10) {
             header
             list
-            if let toast = model.toast {
+            if let outcome = model.outcome {
+                OutcomeCard(outcome: outcome, maxRows: 4)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .id(outcome.id)
+            } else if let toast = model.toast {
                 ToastView(toast: toast) { Task { await model.undoLast() } }
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                     .id(toast.id)
@@ -33,8 +43,9 @@ struct MenuBarPopover: View {
             footer
         }
         .animation(.snappy, value: model.toast?.id)
+        .animation(.snappy, value: model.outcome?.id)
         .padding(14)
-        .frame(width: 290)
+        .frame(width: 330)
         .background(WindowVisibility { model.popoverVisible = $0 } onWindow: { panel = $0 })
         // A MenuBarExtra builds its content at launch, before the panel is shown: trust the panel.
         .onAppear { model.popoverVisible = panel?.isVisible ?? false }
@@ -45,11 +56,7 @@ struct MenuBarPopover: View {
 
     private var footer: some View {
         HStack(spacing: 8) {
-            Button {
-                NSApp.activate()
-                openWindow(id: "main")
-                dismissPanel()
-            } label: {
+            Button { openFullView() } label: {
                 Text("Open full view")
                     .font(.callout)
                     .foregroundStyle(Palette.blue)
@@ -84,6 +91,14 @@ struct MenuBarPopover: View {
         .glassEffect(.regular.interactive(), in: .circle)
         .help(help)
         .accessibilityLabel(label)
+    }
+
+    /// Opens the main window, optionally with an item's "?" sheet, and closes the popover.
+    private func openFullView(explaining item: Item? = nil) {
+        NSApp.activate()
+        openWindow(id: "main")
+        if let item { model.explaining = item }
+        dismissPanel()
     }
 
     /// Closes the popover if it is still the key window (opening another window normally dismisses it).
@@ -135,50 +150,111 @@ struct MenuBarPopover: View {
         } else {
             GlassEffectContainer(spacing: 6) {
                 VStack(spacing: 6) {
-                    ForEach(topCategories, id: \.id) { PopoverRow(category: $0) }
+                    ForEach(topCategories, id: \.id) { category in
+                        PopoverRow(
+                            category: category,
+                            isOpen: Binding(
+                                get: { opened == category.id },
+                                set: { open in withAnimation(.snappy(duration: 0.25)) { opened = open ? category.id : nil } }
+                            ),
+                            onExplain: { openFullView(explaining: $0) },
+                            onMore: { openFullView() }
+                        )
+                    }
                 }
             }
         }
     }
 }
 
-/// One category: tick, icon, name, "4 of 6 ticked", cores.
+/// One category: tick, icon, name, "4 of 6 ticked", cores, chevron. Opens into its items, each
+/// tickable on its own (apps are only ever ticked this way).
 private struct PopoverRow: View {
     @Environment(AppModel.self) private var model
     let category: CategorySummary
+    @Binding var isOpen: Bool
+    let onExplain: (Item) -> Void
+    let onMore: () -> Void
+
+    /// Items shown when open before "+N more"; the full list is in the main window.
+    private static let maxItems = 6
 
     private var color: Color { Palette.color(category.id) }
     private var state: TickState { model.selection.state(of: category.id, in: model.snapshot) }
+    private var canTickAll: Bool { model.hasIdle(category.id) || state != .none }
 
     var body: some View {
+        VStack(spacing: 0) {
+            header
+            if isOpen {
+                VStack(spacing: 0) {
+                    ForEach(category.items.prefix(Self.maxItems)) { item in
+                        Divider().padding(.leading, 28)
+                        ItemRow(item: item, onExplain: { onExplain(item) })
+                    }
+                    if category.items.count > Self.maxItems {
+                        Divider().padding(.leading, 28)
+                        Button(action: onMore) {
+                            Text("+\(category.items.count - Self.maxItems) more in full view")
+                                .font(.caption)
+                                .foregroundStyle(Palette.blue)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.leading, 28)
+                                .padding(.vertical, 7)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .transition(.itemsReveal)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 2)
+        .clipShape(.rect(cornerRadius: 12))
+        .glassEffect(.regular, in: .rect(cornerRadius: 12))
+    }
+
+    private var header: some View {
         HStack(spacing: 10) {
             Button { model.toggleCategory(category.id) } label: {
                 TickCircle(state: state, color: color)
+                    .opacity(canTickAll ? 1 : 0.4)
                     .contentShape(Circle())
             }
             .buttonStyle(.plain)
-            .disabled(!model.hasIdle(category.id) && state == .none)
-            .help("Tick the idle ones")
+            .disabled(!canTickAll)
+            .help(canTickAll ? "Tick the idle ones" : "Nothing idle here: open it to tick items yourself")
             .accessibilityLabel("Tick idle \(Palette.name(category.id))")
             .accessibilityAddTraits(state == .all ? .isSelected : [])
 
-            IconTile(symbol: Palette.symbol(category.id), color: color, size: 24)
-            VStack(alignment: .leading, spacing: 0) {
-                Text(Palette.name(category.id)).font(.callout.weight(.semibold))
-                Text("\(category.items.filter(model.isTicked).count) of \(category.items.count) ticked")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+            Button { isOpen.toggle() } label: {
+                HStack(spacing: 10) {
+                    IconTile(symbol: Palette.symbol(category.id), color: color, size: 24)
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text(Palette.name(category.id)).font(.callout.weight(.semibold))
+                        Text("\(category.items.filter(model.isTicked).count) of \(category.items.count) ticked")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 6)
+                    Text(Palette.cores(category.cores))
+                        .font(.callout)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .contentTransition(.numericText())
+                    Image(systemName: "chevron.down")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isOpen ? 180 : 0))
+                }
+                .contentShape(Rectangle())
             }
-            Spacer(minLength: 6)
-            Text(Palette.cores(category.cores))
-                .font(.callout)
-                .monospacedDigit()
-                .foregroundStyle(.secondary)
-                .contentTransition(.numericText())
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(Palette.name(category.id)), \(category.items.filter(model.isTicked).count) of \(category.items.count) ticked")
+            .accessibilityValue(isOpen ? "Expanded" : "Collapsed")
         }
-        .padding(.horizontal, 10)
         .padding(.vertical, 7)
-        .glassEffect(.regular, in: .rect(cornerRadius: 12))
     }
 }

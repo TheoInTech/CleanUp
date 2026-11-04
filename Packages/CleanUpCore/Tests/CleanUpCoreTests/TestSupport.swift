@@ -459,3 +459,24 @@ struct SlowModule: CategoryModule {
     func stop(_ item: Item, ctx: ScanContext, force: Bool) async -> StopResult { .failed(reason: "slow") }
     func undo(_ token: UndoToken) async -> Bool { false }
 }
+
+extension WorktreeFacts {
+    static func fixture(
+        uncommitted: Int? = 0,
+        merge: MergeState = .ancestor,
+        locked: Bool = false,
+        processesInside: [String] = [],
+        lastChangeAgo: TimeInterval? = .days(6),
+        lastCommitAgo: TimeInterval? = .days(6),
+        repoExists: Bool = true,
+        agent: String? = nil
+    ) -> WorktreeFacts {
+        WorktreeFacts(
+            path: "/Users/u/.codex/worktrees/a1b2/app", repo: "app", branch: "codex/fix", agent: agent,
+            uncommitted: uncommitted, merge: merge, locked: locked, processesInside: processesInside,
+            lastChange: lastChangeAgo.map { now.addingTimeInterval(-$0) },
+            lastCommit: lastCommitAgo.map { now.addingTimeInterval(-$0) },
+            repoExists: repoExists
+        )
+    }
+}

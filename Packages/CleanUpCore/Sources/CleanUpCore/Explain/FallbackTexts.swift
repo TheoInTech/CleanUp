@@ -24,6 +24,11 @@ public enum FallbackTexts {
                 "A web page open in \(browser) that is working hard.",
                 "The page reloads when you open it again, and anything typed into it can be lost."
             )
+        case .worktrees:
+            return (
+                "A second checkout of your project that an agent made for one task.",
+                "Nothing in git. Files git ignores, like `.env`, go to the Trash with it."
+            )
         case .restart:
             return (
                 "Your Mac has been on for a while and is using swap, a slow overflow for memory. A restart clears it.",

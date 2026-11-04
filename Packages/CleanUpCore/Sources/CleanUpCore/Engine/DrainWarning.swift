@@ -59,7 +59,7 @@ public struct DrainWarning: Equatable, Sendable {
         case .simulators: return "\(count) idle simulator\(plural)"
         case .containers: return "\(count) old container\(plural)"
         case .devServers: return "\(count) old dev server\(plural)"
-        case .apps, .browserTabs, .restart: return nil
+        case .apps, .browserTabs, .restart, .worktrees: return nil
         }
     }
 }

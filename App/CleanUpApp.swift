@@ -6,6 +6,10 @@ struct CleanUpApp: App {
     @State private var model = AppModel.shared
 
     init() {
+        #if DEBUG
+        // Read-only worktree report: runs before the app model starts, then quits.
+        if DebugWorktreeReport.requested { DebugWorktreeReport.run(); return }
+        #endif
         AppModel.shared.start()
         #if DEBUG
         DebugSnapshot.runIfRequested(AppModel.shared)

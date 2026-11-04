@@ -33,6 +33,7 @@ One day a MacBook Pro lasted 30–40 minutes on a full charge. The battery was f
 - **A ring first, text second.** Each colour is one cause; the centre shows time left on battery.
 - **Quick select** stops everything that looks idle. **Choose myself** lets you tick items one by one.
 - **Every item is judged on its own**, and every item has a **?** that says what it is and why CleanUp thinks it is idle or in use.
+- **Finds worktrees agents left behind.** Clean, merged ones can go to the Trash in one tap, with their size shown, and Undo puts them back.
 - **Menu bar and widget** do the whole job without opening the window.
 - **Warns on its own** when the battery drains fast and idle items are to blame. It only warns; it never stops anything by itself.
 
@@ -49,6 +50,7 @@ CleanUp has to watch before it can call anything quiet, so **nothing shows as id
 | **Dev servers** | Running over 6 h, under 2% CPU, no connection in the last 30 min, and watched by CleanUp for at least 30 min. |
 | **Apps** | Never pre-ticked. Shown as "not used for X h"; only you can say you are done with one. They are asked to quit normally, so they can still offer to save. |
 | **Browser tabs** | Read-only. CleanUp shows a runaway tab and points you to the browser's own task manager. It never closes tabs. |
+| **Worktrees** | Not part of the battery ring; shown in GB. Safe to remove only when git status is clean (untracked files included), the branch is merged into main or master (local or remote; squash merges count only when the files still match), no running process works inside it, nothing in it changed in the last hour, and it is not locked. Anything unknown is kept. They go to the Trash, with their own button, never from the widget. Branches are never deleted. The first scan took about 4 minutes on a Mac with 141 worktrees (about 285 GB). |
 | **Restart** | Advice only, when swap is over 75% full and over 8 GB, or the Mac has been up more than 14 days with swap over half full. The button opens the normal macOS Restart dialog. |
 
 ## Install
@@ -88,13 +90,15 @@ Press **Run** in Xcode.
 
 ## Privacy
 
-No network access, no analytics, no accounts. Everything is read and decided on your Mac.
+No network access, no analytics, no accounts. Everything is read and decided on your Mac. For worktrees, CleanUp reads and moves only worktree folders, never anything else, and never deletes without Delete now or the permanent setting.
 
 ## Known limitations
 
 - The widget's **Clean up** button does nothing if CleanUp is not running. Open the app once.
 - With two container engines running at once (say Docker Desktop and Colima), neither can be quit.
 - Warnings need notifications to be allowed in **System Settings → Notifications → CleanUp**.
+- Worktrees are found in git repositories up to seven folders deep under your home folder. Squash merges are recognised only when the files still match main.
+- If you drag a worktree out of the Trash to a different folder, CleanUp forgets git's record of it; the files stay where you put them.
 - The plain-language "What is this?" text uses Apple Intelligence. On a Mac without it, CleanUp falls back to built-in descriptions.
 
 ## Contributing

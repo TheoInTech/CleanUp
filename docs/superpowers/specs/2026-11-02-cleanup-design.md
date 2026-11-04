@@ -24,7 +24,7 @@ Finding this took a terminal session with `ps`, `pmset`, `ioreg`, `simctl`, `doc
 
 ## Non-goals (v1)
 
-- Deleting files, caches, or "disk cleaning" of any kind.
+- Deleting files, caches, or "disk cleaning" of any kind. Exception (2026-11-04): merged, clean git worktrees — see 2026-11-04-worktrees-design.md.
 - Closing individual browser tabs (browsers are shown read-only with a hint).
 - Stopping anything automatically without a tap (warnings only).
 - Paid "Pro" features. Not built in v1; the rules engine should not make them hard to add later.

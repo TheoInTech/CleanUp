@@ -33,7 +33,8 @@ public enum FolderSize {
                 // Size of the link itself; the enumerator does not descend into symlinked directories.
                 bytes += Int64(v.totalFileAllocatedSize ?? 0)
             } else if v.isRegularFile == true {
-                bytes += Int64(v.totalFileAllocatedSize ?? 0)
+                // Hard links are counted once per link, so this is an estimate and may be above `du`.
+                if let size = v.totalFileAllocatedSize { bytes += Int64(size) } else { complete = false }
             }
         }
         return FolderMeasure(bytes: bytes, newest: newest, complete: complete)
@@ -55,16 +56,23 @@ public actor SizeCache {
         self.maxAge = maxAge
     }
 
-    public func measure(_ url: URL, now: Date) -> FolderMeasure {
+    /// The cache key (folder mtime and `.git` mtime) does not see changes deep inside the folder, so a cached
+    /// `newest` can be up to `maxAge` stale: use it for display only. The safety re-check before removal
+    /// must pass `fresh: true`, which skips the lookup, measures again and stores the result.
+    public func measure(_ url: URL, now: Date, fresh: Bool = false) -> FolderMeasure {
         let key = url.path
         let folder = Self.mtime(url)
         let git = Self.mtime(url.appendingPathComponent(".git"))
-        if let e = entries[key], e.measure.complete, e.folderMTime == folder, e.gitMTime == git,
-           now.timeIntervalSince(e.at) < maxAge, now >= e.at {
+        if !fresh, let folder, let e = entries[key], e.folderMTime == folder, e.gitMTime == git,
+           now >= e.at, now.timeIntervalSince(e.at) < maxAge {
             return e.measure
         }
         let m = FolderSize.measure(url)
-        entries[key] = Entry(measure: m, folderMTime: folder, gitMTime: git, at: now)
+        if m.complete {
+            entries[key] = Entry(measure: m, folderMTime: folder, gitMTime: git, at: now)
+        } else {
+            entries[key] = nil
+        }
         return m
     }
 

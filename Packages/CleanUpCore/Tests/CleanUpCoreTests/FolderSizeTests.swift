@@ -74,34 +74,76 @@ import Testing
         let cache = SizeCache()
         let t0 = Date()
         let first = await cache.measure(dir, now: t0)
-        // Nested change with the folder's own mtime restored: still served from cache.
-        try fm.createDirectory(at: dir.appendingPathComponent("sub"), withIntermediateDirectories: true)
-        try write(dir.appendingPathComponent("sub/inner"), bytes: 100_000)
-        try fm.setAttributes([.modificationDate: pinned], ofItemAtPath: dir.path)
-        #expect(await cache.measure(dir, now: t0.addingTimeInterval(10)) == first)
-        // Folder mtime moves: re-measures.
+        // Top-level change moves the folder mtime: re-measures.
         try write(dir.appendingPathComponent("b"), bytes: 100_000)
         try fm.setAttributes([.modificationDate: pinned.addingTimeInterval(5)], ofItemAtPath: dir.path)
         let second = await cache.measure(dir, now: t0.addingTimeInterval(20))
-        #expect(second.bytes >= first.bytes + 200_000)
-        // .git file mtime moves: re-measures.
+        #expect(second.bytes >= first.bytes + 100_000)
+        // .git file mtime moving also re-measures.
         let git = dir.appendingPathComponent(".git")
         try write(git, bytes: 10)
         try fm.setAttributes([.modificationDate: pinned], ofItemAtPath: git.path)
         try fm.setAttributes([.modificationDate: pinned.addingTimeInterval(5)], ofItemAtPath: dir.path)
         let third = await cache.measure(dir, now: t0.addingTimeInterval(30))
-        try write(dir.appendingPathComponent("sub/c"), bytes: 100_000)
+        try write(dir.appendingPathComponent("c"), bytes: 100_000)
         try fm.setAttributes([.modificationDate: pinned.addingTimeInterval(5)], ofItemAtPath: dir.path)
         #expect(await cache.measure(dir, now: t0.addingTimeInterval(31)) == third)
         try fm.setAttributes([.modificationDate: pinned.addingTimeInterval(9)], ofItemAtPath: git.path)
         #expect(await cache.measure(dir, now: t0.addingTimeInterval(32)).bytes > third.bytes)
-        // Age: expires after maxAge.
-        try write(dir.appendingPathComponent("sub/d"), bytes: 100_000)
-        try fm.setAttributes([.modificationDate: pinned.addingTimeInterval(5)], ofItemAtPath: dir.path)
-        try fm.setAttributes([.modificationDate: pinned.addingTimeInterval(9)], ofItemAtPath: git.path)
-        let stale = await cache.measure(dir, now: t0.addingTimeInterval(33))
-        let expired = await cache.measure(dir, now: t0.addingTimeInterval(33 + 7 * 3600))
-        _ = stale
-        #expect(expired.bytes >= stale.bytes)
+    }
+
+    @Test func nestedChangeIsStaleUntilFresh() async throws {
+        let dir = try makeDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fm = FileManager.default
+        let pinned = Date(timeIntervalSince1970: 1_700_000_000)
+        try fm.createDirectory(at: dir.appendingPathComponent("sub"), withIntermediateDirectories: true)
+        try write(dir.appendingPathComponent("sub/a"), bytes: 100_000)
+        try fm.setAttributes([.modificationDate: pinned], ofItemAtPath: dir.path)
+        let cache = SizeCache()
+        let t0 = Date()
+        let first = await cache.measure(dir, now: t0)
+        let deep = dir.appendingPathComponent("sub/deep")
+        try write(deep, bytes: 100_000)
+        try fm.setAttributes([.modificationDate: pinned], ofItemAtPath: dir.path)
+        let deepMTime = try #require(try fm.attributesOfItem(atPath: deep.path)[.modificationDate] as? Date)
+        // Cached call may serve the old value (display only).
+        #expect(await cache.measure(dir, now: t0.addingTimeInterval(10)) == first)
+        let fresh = await cache.measure(dir, now: t0.addingTimeInterval(11), fresh: true)
+        #expect(try #require(fresh.newest) >= deepMTime)
+        #expect(fresh.bytes > first.bytes)
+        #expect(await cache.measure(dir, now: t0.addingTimeInterval(12)) == fresh)
+    }
+
+    @Test func cacheExpiresAfterMaxAge() async throws {
+        let dir = try makeDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fm = FileManager.default
+        let pinned = Date(timeIntervalSince1970: 1_700_000_000)
+        try fm.createDirectory(at: dir.appendingPathComponent("sub"), withIntermediateDirectories: true)
+        try write(dir.appendingPathComponent("sub/a"), bytes: 100_000)
+        try fm.setAttributes([.modificationDate: pinned], ofItemAtPath: dir.path)
+        let cache = SizeCache()
+        let t0 = Date()
+        let first = await cache.measure(dir, now: t0)
+        try write(dir.appendingPathComponent("sub/big"), bytes: 1_000_000)
+        try fm.setAttributes([.modificationDate: pinned], ofItemAtPath: dir.path)
+        #expect(await cache.measure(dir, now: t0.addingTimeInterval(3600)) == first)
+        let expired = await cache.measure(dir, now: t0.addingTimeInterval(7 * 3600))
+        #expect(expired.bytes > first.bytes)
+    }
+
+    @Test func incompleteMeasureIsNotCached() async throws {
+        let dir = try makeDir()
+        let locked = dir.appendingPathComponent("locked")
+        try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+        try write(locked.appendingPathComponent("x"), bytes: 100_000)
+        chmod(locked.path, 0o000)
+        defer { chmod(locked.path, 0o755); try? FileManager.default.removeItem(at: dir) }
+        let cache = SizeCache()
+        let now = Date()
+        #expect(await cache.measure(dir, now: now).complete == false)
+        chmod(locked.path, 0o755)
+        #expect(await cache.measure(dir, now: now).complete == true)
     }
 }

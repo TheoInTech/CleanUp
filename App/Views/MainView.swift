@@ -10,19 +10,34 @@ struct MainView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            ScrollView {
-                VStack(spacing: 16) {
-                    RingView(snapshot: model.snapshot, size: 170)
-                        .padding(.top, 4)
-                    moodLine
-                    ModePicker(mode: Binding(get: { model.mode }, set: { model.mode = $0 }))
-                    checklist
+            ScrollViewReader { scroller in
+                ScrollView {
+                    VStack(spacing: 16) {
+                        RingView(snapshot: model.snapshot, size: 170)
+                            .padding(.top, 4)
+                        VStack(spacing: 10) {
+                            moodLine
+                            storageBar
+                        }
+                        ModePicker(mode: Binding(get: { model.mode }, set: { model.mode = $0 }))
+                        checklist
+                        // Its own button and result card; never part of the Clean up below.
+                        WorktreesSection { model.explaining = $0 }
+                            .id(Self.worktreesID)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+                    .padding(.bottom, 12)
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 8)
-                .padding(.bottom, 12)
+                .scrollIndicators(.never)
+                .task(id: model.worktrees.revealPending) {
+                    guard model.worktrees.revealPending else { return }
+                    // Let the opened row lay out first, or the scroll stops short of it.
+                    try? await Task.sleep(for: .milliseconds(150))
+                    withAnimation(.snappy) { scroller.scrollTo(Self.worktreesID, anchor: .top) }
+                    model.worktrees.revealed()
+                }
             }
-            .scrollIndicators(.never)
 
             if let outcome = model.outcome {
                 OutcomeCard(outcome: outcome)
@@ -96,6 +111,28 @@ struct MainView: View {
                     .padding(14)
                 }
             }
+        }
+    }
+
+    // MARK: Worktrees
+
+    private static let worktreesID = "worktrees"
+
+    /// How much disk the worktrees take, only when there are any. Tapping it opens their row.
+    @ViewBuilder
+    private var storageBar: some View {
+        if let worktrees = model.worktrees.snapshot, !(worktrees.items.isEmpty && worktrees.trashed.isEmpty) {
+            Button {
+                model.expanded.insert(.worktrees)
+                model.worktrees.reveal()
+            } label: {
+                StorageBar(safe: worktrees.safeBytes, kept: worktrees.keptBytes, trashed: worktrees.trashedBytes)
+                    .frame(maxWidth: 280)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Show worktrees")
+            .accessibilityHint("Shows the worktrees")
         }
     }
 

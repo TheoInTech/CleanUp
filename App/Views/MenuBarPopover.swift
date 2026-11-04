@@ -29,6 +29,7 @@ struct MenuBarPopover: View {
     var body: some View {
         VStack(spacing: 10) {
             header
+            worktreesLine
             list
             if let outcome = model.outcome {
                 OutcomeCard(outcome: outcome, maxRows: 4)
@@ -132,6 +133,34 @@ struct MenuBarPopover: View {
             return "≈ \(Palette.minutes(minutes)) left · \(busy)"
         }
         return busy
+    }
+
+    // MARK: Worktrees
+
+    /// The storage bar as one compact line; it opens the window on the Worktrees row, where they are
+    /// cleaned up (never from here, the widget or a notification).
+    @ViewBuilder
+    private var worktreesLine: some View {
+        if let worktrees = model.worktrees.snapshot, !(worktrees.items.isEmpty && worktrees.trashed.isEmpty) {
+            Button {
+                model.expanded.insert(.worktrees)
+                model.worktrees.reveal()
+                openFullView()
+            } label: {
+                HStack(spacing: 6) {
+                    StorageBar(
+                        safe: worktrees.safeBytes, kept: worktrees.keptBytes, trashed: worktrees.trashedBytes,
+                        compact: true)
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Show worktrees")
+            .accessibilityHint("Opens the full view on the worktrees")
+        }
     }
 
     // MARK: List

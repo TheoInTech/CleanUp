@@ -34,7 +34,11 @@ final class AppModel {
     var selection: Selection { ticks.selection }
     var mode: Mode {
         get { ticks.mode }
-        set { ticks.setMode(newValue, in: snapshot, keep: keepList) }
+        set {
+            ticks.setMode(newValue, in: snapshot, keep: keepList)
+            // One picker for both lists; worktrees still only go with their own button.
+            worktrees.quickSelect = newValue == .quick
+        }
     }
     var expanded: Set<CategoryID> = []
     var toast: ToastState?

@@ -12,6 +12,7 @@ struct SettingsView: View {
 
     var body: some View {
         @Bindable var model = model
+        @Bindable var worktrees = model.worktrees
         Form {
             Section {
                 Toggle("Open at login", isOn: loginBinding)
@@ -21,6 +22,17 @@ struct SettingsView: View {
                         .foregroundStyle(.red)
                 }
                 Toggle("Use Apple Intelligence", isOn: $model.useAI)
+            }
+
+            Section("Worktrees") {
+                Toggle(isOn: $worktrees.includeProtected) {
+                    Text("Also look in Documents and Desktop")
+                    Text("macOS asks before CleanUp can look in each.")
+                }
+                Toggle(isOn: $worktrees.removePermanently) {
+                    Text("Remove worktrees permanently")
+                    Text("Skips the Trash. CleanUp asks before each cleanup.")
+                }
             }
 
             Section("Always kept") {

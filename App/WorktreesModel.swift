@@ -29,6 +29,9 @@ final class WorktreesModel {
     @ObservationIgnored private let keepList: @MainActor () -> KeepList
     /// An action (clean up, undo, put back, delete) is under way; nothing else may start or scan meanwhile.
     private(set) var isBusy = false
+    /// What the last put back or delete couldn't do, as one line for the Trash row
+    /// ("2 couldn't be put back · find them in the Trash"); nil when everything went.
+    private(set) var failure: String?
 
     var includeProtected: Bool {
         didSet {
@@ -45,8 +48,8 @@ final class WorktreesModel {
     @ObservationIgnored private let trash: WorktreeTrash
     @ObservationIgnored private var timer: Task<Void, Never>?
     @ObservationIgnored private var scanRequestedWhileScanning = false
-    /// The Trash records the last move created, so Undo can put exactly those back.
-    @ObservationIgnored private var lastMoved: [UUID] = []
+    /// The Trash records the last move created, so Undo and the result card's Delete now act on exactly those.
+    private(set) var lastMoved: [UUID] = []
     @ObservationIgnored private let log = Logger(subsystem: "io.cleanup.CleanUp", category: "WorktreesModel")
 
     init(keepList: @escaping @MainActor () -> KeepList) {
@@ -76,6 +79,10 @@ final class WorktreesModel {
 
     /// Scans again. Without `force`, a scan newer than the stale limit is left alone.
     func refresh(force: Bool) async {
+        #if DEBUG
+        // Debug renders show fixtures only: never look at the owner's real worktrees.
+        if Self.isFixtureMode { return }
+        #endif
         if isScanning || isBusy {
             if force { scanRequestedWhileScanning = true }
             return
@@ -104,8 +111,9 @@ final class WorktreesModel {
 
     /// Removes the ticked worktrees, each looked at again first. Asks nothing: the permanent-mode dialog is the UI's.
     func cleanUp() async {
-        guard !isBusy, snapshot != nil else { return }
+        guard !isBusy, snapshot != nil, !Self.actionsBlocked else { return }
         isBusy = true
+        failure = nil
         await scanSettled()
         // Read after any scan in flight lands, so the list is the current one, minus anything kept since.
         guard let snapshot, case let items = selection.items(in: snapshot, keep: keepList()), !items.isEmpty else {
@@ -130,31 +138,51 @@ final class WorktreesModel {
     /// Puts back what the last move to the Trash created.
     func undoLast() async {
         let ids = lastMoved
-        guard !isBusy, !ids.isEmpty else { return }
+        guard !isBusy, !ids.isEmpty, !Self.actionsBlocked else { return }
         isBusy = true
         await scanSettled()
         lastMoved = await trash.putBack(ids)
+        failure = Self.failureLine(lastMoved.count, "put back")
         outcome = nil
         await finishAction()
     }
 
     func putBack(_ ids: [UUID]) async {
-        guard !isBusy else { return }
+        guard !isBusy, !Self.actionsBlocked else { return }
         isBusy = true
         await scanSettled()
         let failed = await trash.putBack(ids)
         if !failed.isEmpty { log.notice("\(failed.count) worktrees could not be put back") }
+        failure = Self.failureLine(failed.count, "put back")
         lastMoved.removeAll { ids.contains($0) && !failed.contains($0) }
+        closeOutcomeIfSpent()
         await finishAction()
     }
 
     func deleteNow(_ ids: [UUID]) async {
-        guard !isBusy else { return }
+        guard !isBusy, !Self.actionsBlocked else { return }
         isBusy = true
         await scanSettled()
         await trash.deleteNow(ids)
+        // Whatever is still recorded couldn't be deleted (out of reach, or no longer the item we trashed).
+        let remaining = Set(await trash.entries.map(\.id))
+        let failed = ids.filter(remaining.contains)
+        if !failed.isEmpty { log.notice("\(failed.count) worktrees could not be deleted") }
+        failure = Self.failureLine(failed.count, "deleted")
         lastMoved.removeAll { ids.contains($0) }
+        closeOutcomeIfSpent()
         await finishAction()
+    }
+
+    /// The result card's Undo and Delete now act on the last move; once none of it is left in the
+    /// Trash the card has nothing to offer, so it closes.
+    private func closeOutcomeIfSpent() {
+        if let outcome, !outcome.permanent, lastMoved.isEmpty { self.outcome = nil }
+    }
+
+    private static func failureLine(_ count: Int, _ verb: String) -> String? {
+        guard count > 0 else { return nil }
+        return "\(count) couldn't be \(verb) · find \(count == 1 ? "it" : "them") in the Trash"
     }
 
     /// A scan already under way (which may be reconciling the Trash record) finishes before an action starts.
@@ -169,4 +197,83 @@ final class WorktreesModel {
     }
 
     func toggle(_ item: Item) { selection.toggle(item) }
+
+    // MARK: For the views
+
+    /// What the own button would remove: ticked, safe, and not on the Keep list.
+    var tickedItems: [Item] {
+        guard let snapshot else { return [] }
+        return selection.items(in: snapshot, keep: keepList())
+    }
+
+    var tickedBytes: Int64 {
+        guard let snapshot else { return 0 }
+        return selection.bytes(in: snapshot, keep: keepList())
+    }
+
+    /// Items that may be ticked at all: safe to remove and not always kept.
+    var tickableItems: [Item] {
+        guard let snapshot else { return [] }
+        let keep = keepList()
+        return snapshot.items.filter { $0.judgement.verdict == .idle && !keep.contains($0.id) }
+    }
+
+    func isTicked(_ item: Item) -> Bool { tickedItems.contains { $0.id == item.id } }
+
+    /// The header's tick: all, some or none of the tickable items.
+    var tickState: TickState {
+        let ticked = tickedItems.count
+        if ticked == 0 { return .none }
+        return ticked == tickableItems.count ? .all : .some
+    }
+
+    /// Ticks every tickable item, or clears them all when they already are.
+    func toggleAll() {
+        if tickState == .all { selection.ticked = [] } else { selection.ticked.formUnion(tickableItems.map(\.id)) }
+    }
+
+    /// After "Keep" in the "?" sheet: the item is never ticked again.
+    func kept(_ item: Item) { selection.ticked.remove(item.id) }
+
+    /// The entries the last move put in the Trash, still there.
+    var lastMovedBytes: Int64 {
+        let ids = Set(lastMoved)
+        return (snapshot?.trashed ?? []).filter { ids.contains($0.id) }.reduce(0) { $0 + $1.bytes }
+    }
+
+    func dismissOutcome() { outcome = nil }
+
+    /// The main window scrolls to the Worktrees row (from the storage bar, or the popover opening the window).
+    private(set) var revealPending = false
+    func reveal() { revealPending = true }
+    func revealed() { revealPending = false }
+
+    // MARK: Debug fixtures
+
+    /// Debug renders (`-debugSnapshotDir`) never scan or act: they show what `debugShow` hands in.
+    private static var actionsBlocked: Bool {
+        #if DEBUG
+        isFixtureMode
+        #else
+        false
+        #endif
+    }
+
+    #if DEBUG
+    static var isFixtureMode: Bool { UserDefaults.standard.string(forKey: "debugSnapshotDir") != nil }
+
+    /// Shows a made-up snapshot, result and failure line. Only in fixture mode, so it can never mix
+    /// with a real scan.
+    func debugShow(
+        _ fixture: WorktreeSnapshot, outcome: WorktreeOutcome? = nil, lastMoved: [UUID] = [], failure: String? = nil
+    ) {
+        guard Self.isFixtureMode else { return }
+        snapshot = fixture
+        selection = WorktreeSelection()
+        selection.apply(fixture, keep: keepList(), quick: quickSelect)
+        self.outcome = outcome
+        self.lastMoved = lastMoved
+        self.failure = failure
+    }
+    #endif
 }

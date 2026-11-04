@@ -48,7 +48,8 @@ public actor Explainer {
     }
 
     public func explain(_ item: Item) async -> Explanation {
-        guard useAI else { return FallbackTexts.explanation(for: item) }
+        // A worktree's text says exactly what removing it loses (files, not a running process): never improvised.
+        guard useAI, item.category != .worktrees else { return FallbackTexts.explanation(for: item) }
         if let cached = cache[item.id] { return cached }
         if let answer = await Self.race(item, timeout: timeout, generate: generate),
            let clean = Self.validated(answer) {

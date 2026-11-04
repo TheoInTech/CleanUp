@@ -14,12 +14,19 @@ struct ExplainSheet: View {
     }
 
     /// The latest version of the item, so the verdict stays current while the sheet is open.
-    private var item: Item { model.snapshot.item(withID: original.id) ?? original }
+    private var item: Item {
+        model.snapshot.item(withID: original.id)
+            ?? model.worktrees.snapshot?.items.first { $0.id == original.id }
+            ?? original
+    }
     private var verdict: Verdict { item.judgement.verdict }
     private var color: Color { Palette.color(item.category) }
+    /// Worktrees are removed, not stopped, and only by their own Clean up: no Stop, no "Stop anyway".
+    private var isWorktree: Bool { item.category == .worktrees }
 
     private var signalsTitle: String {
-        switch verdict {
+        if isWorktree { return verdict == .idle ? "Why it's safe to remove" : "Why it's kept" }
+        return switch verdict {
         case .idle: "Why we think it's idle"
         case .inUse: "Why we think it's in use"
         case .manual, .check, .advice: "What we see"
@@ -27,7 +34,8 @@ struct ExplainSheet: View {
     }
 
     private var safety: (text: String, color: Color) {
-        switch verdict {
+        if isWorktree { return verdict == .idle ? ("✓ Safe", Palette.green) : ("⚠︎ Kept", Palette.orange) }
+        return switch verdict {
         case .idle: ("✓ Safe", Palette.green)
         case .inUse: ("⚠︎ Probably being used", Palette.orange)
         case .manual, .check, .advice: ("Your call", Palette.gray)
@@ -44,12 +52,20 @@ struct ExplainSheet: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                    if isWorktree, let place = worktreePlace {
+                        Text(place)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .help(item.detail["path"] ?? "")
+                    }
                 }
             }
 
             section("What is this?") {
                 if let explanation {
-                    Text(explanation.whatIsIt).fixedSize(horizontal: false, vertical: true)
+                    Text(styled(explanation.whatIsIt)).fixedSize(horizontal: false, vertical: true)
                 } else {
                     ProgressView().controlSize(.small)
                 }
@@ -70,7 +86,7 @@ struct ExplainSheet: View {
                 }
             }
 
-            section("Safe to stop?") {
+            section(isWorktree ? "Safe to remove?" : "Safe to stop?") {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(safety.text)
                         .font(.callout.weight(.semibold))
@@ -79,7 +95,7 @@ struct ExplainSheet: View {
                         .padding(.vertical, 5)
                         .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(safety.color.opacity(0.16)))
                     if let explanation {
-                        Text(explanation.whatYouLose)
+                        Text(styled(explanation.whatYouLose))
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -107,45 +123,96 @@ struct ExplainSheet: View {
         }
     }
 
+    /// Worktree texts are fixed and mark file names as code ("like `.env`"); the model's text stays plain.
+    private func styled(_ text: String) -> AttributedString {
+        guard isWorktree,
+              let styled = try? AttributedString(
+                markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))
+        else { return AttributedString(text) }
+        return styled
+    }
+
+    /// "8.4 GB · ~/Projects/app/.codex/worktrees/feat": its size and where it is.
+    private var worktreePlace: String? {
+        let size = item.detail["bytes"].flatMap { Int64($0) }.map(Bytes.gb)
+        let path = item.detail["path"].map { ($0 as NSString).abbreviatingWithTildeInPath }
+        let parts = [size, path].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
     @ViewBuilder
     private var buttons: some View {
         HStack(spacing: 10) {
-            switch verdict {
-            case .advice:
-                Button { dismiss() } label: {
-                    Text("Not now").frame(maxWidth: .infinity)
+            if isWorktree {
+                worktreeButtons
+            } else {
+                stopButtons
+            }
+        }
+        .controlSize(.large)
+        .frame(maxWidth: .infinity, alignment: .trailing)
+    }
+
+    /// Keep (always), and Tick or Untick for one that is safe to remove; a kept one just closes.
+    @ViewBuilder
+    private var worktreeButtons: some View {
+        let worktrees = model.worktrees
+        Button {
+            model.keep(item)
+            worktrees.kept(item)
+            dismiss()
+        } label: {
+            Text("Keep").frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.glass)
+        if verdict == .idle {
+            let ticked = worktrees.isTicked(item)
+            Button {
+                worktrees.toggle(item)
+                dismiss()
+            } label: {
+                Text(ticked ? "Untick" : "Tick").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.glassProminent)
+            .tint(color)
+            .disabled(model.keepList.contains(item.id))
+        } else {
+            Button { dismiss() } label: {
+                Text("OK").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.glassProminent)
+        }
+    }
+
+    @ViewBuilder
+    private var stopButtons: some View {
+        switch verdict {
+        case .advice:
+            Button { dismiss() } label: {
+                Text("Not now").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.glass)
+            Button {
+                dismiss()
+                Task { await model.showRestartDialog() }
+            } label: {
+                Text("Restart…").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.glassProminent)
+        case .check:
+            // CleanUp can't tell which tab it is; the browser's own task manager can close it.
+            Button { dismiss() } label: {
+                Text("OK").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.glassProminent)
+        case .inUse where item.isEngine:
+            // Quitting an engine stops everything in it, so it is never forced: no "Stop anyway".
+            VStack(alignment: .trailing, spacing: 8) {
+                if item.category == .containers {
+                    Text("Stop its containers first")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
                 }
-                .buttonStyle(.glass)
-                Button {
-                    dismiss()
-                    Task { await model.showRestartDialog() }
-                } label: {
-                    Text("Restart…").frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.glassProminent)
-            case .check:
-                // CleanUp can't tell which tab it is; the browser's own task manager can close it.
-                Button { dismiss() } label: {
-                    Text("OK").frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.glassProminent)
-            case .inUse where item.isEngine:
-                // Quitting an engine stops everything in it, so it is never forced: no "Stop anyway".
-                VStack(alignment: .trailing, spacing: 8) {
-                    if item.category == .containers {
-                        Text("Stop its containers first")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    }
-                    Button {
-                        model.keep(item)
-                        dismiss()
-                    } label: {
-                        Text("Keep").frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.glass)
-                }
-            case .idle, .inUse, .manual:
                 Button {
                     model.keep(item)
                     dismiss()
@@ -153,21 +220,27 @@ struct ExplainSheet: View {
                     Text("Keep").frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.glass)
-                Button {
-                    let target = item
-                    let force = verdict == .inUse
-                    dismiss()
-                    Task { await model.stop(target, force: force) }
-                } label: {
-                    Text(verdict == .inUse ? "Stop anyway" : "Stop").frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.glassProminent)
-                .tint(verdict == .inUse ? Palette.red : nil)
-                .disabled(model.isCleaning || model.cleanIdleInFlight)
             }
+        case .idle, .inUse, .manual:
+            Button {
+                model.keep(item)
+                dismiss()
+            } label: {
+                Text("Keep").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.glass)
+            Button {
+                let target = item
+                let force = verdict == .inUse
+                dismiss()
+                Task { await model.stop(target, force: force) }
+            } label: {
+                Text(verdict == .inUse ? "Stop anyway" : "Stop").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.glassProminent)
+            .tint(verdict == .inUse ? Palette.red : nil)
+            .disabled(model.isCleaning || model.cleanIdleInFlight)
         }
-        .controlSize(.large)
-        .frame(maxWidth: .infinity, alignment: .trailing)
     }
 
     /// Chromium browsers have a task manager (Shift+Esc); Safari and Firefox don't show one per tab.

@@ -119,6 +119,15 @@ struct ExplainerTests {
         #expect(calls.withLock { $0 } == 2)
     }
 
+    @Test func worktreesAlwaysGetTheFixedText() async {
+        let explainer = Explainer(useAI: true) { _ in ("A workspace.", "Your changes would be lost.") }
+        let item = Item.fixture(.worktree(path: "/r/wt"), category: .worktrees, name: "wt")
+        let e = await explainer.explain(item)
+        #expect(e.whatIsIt == "A second checkout of your project that an agent made for one task.")
+        #expect(e.whatYouLose == "Nothing in git. Files git ignores, like `.env`, go to the Trash with it.")
+        #expect(e.byAI == false)
+    }
+
     @Test func generatorErrorFallsBackAndIsNotCached() async {
         struct Boom: Error {}
         let calls = OSAllocatedUnfairLock(initialState: 0)

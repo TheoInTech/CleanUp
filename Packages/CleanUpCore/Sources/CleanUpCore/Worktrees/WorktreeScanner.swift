@@ -9,8 +9,15 @@ public struct TrashedWorktree: Codable, Sendable, Equatable {
     public var trashURL: String
     public var bytes: Int64
     public var date: Date
+    /// Inode and device of the item in the Trash right after it was trashed; nil in older records.
+    /// Lets later steps tell that the name has since been reused by something else.
+    public var fileID: UInt64?
+    public var device: Int64?
 
-    public init(id: UUID, path: String, repo: String?, storedAdmin: String?, trashURL: String, bytes: Int64, date: Date) {
+    public init(
+        id: UUID, path: String, repo: String?, storedAdmin: String?, trashURL: String, bytes: Int64, date: Date,
+        fileID: UInt64? = nil, device: Int64? = nil
+    ) {
         self.id = id
         self.path = path
         self.repo = repo
@@ -18,6 +25,8 @@ public struct TrashedWorktree: Codable, Sendable, Equatable {
         self.trashURL = trashURL
         self.bytes = bytes
         self.date = date
+        self.fileID = fileID
+        self.device = device
     }
 }
 

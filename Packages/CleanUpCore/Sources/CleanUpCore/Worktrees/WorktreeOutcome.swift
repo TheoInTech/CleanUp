@@ -22,7 +22,8 @@ public struct WorktreeOutcome: Sendable, Equatable {
 
     public var title: String {
         guard !moved.isEmpty else { return "Nothing moved" }
-        return permanent ? "Removed \(moved.count) worktrees" : "Moved \(moved.count) worktrees to the Trash"
+        let n = moved.count == 1 ? "1 worktree" : "\(moved.count) worktrees"
+        return permanent ? "Removed \(n)" : "Moved \(n) to the Trash"
     }
 
     public var subtitle: String? {

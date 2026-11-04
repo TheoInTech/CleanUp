@@ -210,6 +210,10 @@ import Testing
         #expect(out.skipped[0].1.contains("modified or untracked"))
         #expect(!out.skipped[0].1.contains("\n"))
         #expect(!exists(clean))
+        #expect(!listed(env, clean))
+        #expect(!exists(env.repo.root + "/.git/worktrees/wclean"))
+        #expect(listed(env, dirty))
+        #expect(exists(env.repo.root + "/.git/worktrees/wdirty"))
         #expect(exists(dirty + "/wip.txt"))
         // Branches are never deleted.
         #expect(env.repo.run("branch", "--list", "feat/clean").contains("feat/clean"))
@@ -242,6 +246,9 @@ import Testing
         #expect(kept.title == "Removed 120 worktrees")
         #expect(kept.subtitle == "208.3 GB · 2 kept")
         #expect(WorktreeOutcome(moved: [], skipped: [], bytes: 0, permanent: false).title == "Nothing moved")
+        let one = [moved[0]]
+        #expect(WorktreeOutcome(moved: one, skipped: [], bytes: 0, permanent: false).title == "Moved 1 worktree to the Trash")
+        #expect(WorktreeOutcome(moved: one, skipped: [], bytes: 0, permanent: true).title == "Removed 1 worktree")
     }
 
     // Rulings 1 and 2
@@ -317,6 +324,7 @@ import Testing
         let out = await env.trash.moveToTrash([leftovers], recheck: idle)
         #expect(out.moved.count == 1)
         #expect(!exists(f1) && !exists(f2))
+        #expect(trashContents(env).count == 2)
         let entries = await env.trash.entries
         #expect(entries.count == 2)
         #expect(entries.allSatisfy { $0.repo == nil && $0.storedAdmin == nil })
@@ -325,8 +333,131 @@ import Testing
         #expect(failed.isEmpty)
         #expect(exists(f1) && exists(f2))
 
+        #expect(trashContents(env).isEmpty)
         let perm = await env.trash.removePermanently([leftovers], recheck: idle)
         #expect(perm.moved.count == 1)
         #expect(!exists(f1) && !exists(f2))
+        #expect(trashContents(env).isEmpty)
+    }
+
+    // Fix round 1
+
+    private func trashOne(_ env: Env, _ name: String = "wa", branch: String = "feat/a") async throws -> (path: String, entry: TrashedWorktree) {
+        let wt = env.repo.addWorktree(name, branch: branch)
+        _ = await env.trash.moveToTrash([item(wt, repo: env.repo.root)], recheck: idle)
+        return (wt, try #require(await env.trash.entries.first { $0.path == wt }))
+    }
+
+    @Test func folderBackByHandWhileRepoMovedKeepsTheAdminFolder() async throws {
+        let env = try makeEnv(); defer { cleanup(env) }
+        let (wt, e) = try await trashOne(env)
+        try FileManager.default.moveItem(atPath: env.repo.root, toPath: env.base + "/projects/app-renamed")
+        try FileManager.default.moveItem(atPath: e.trashURL, toPath: wt)
+        await env.trash.reconcile()
+        #expect(await env.trash.entries.count == 1)
+        #expect(exists(e.storedAdmin!))
+        await env.trash.deleteNow([e.id])
+        #expect(await env.trash.entries.count == 1)
+        #expect(exists(e.storedAdmin!))
+        #expect(exists(wt + "/a.txt"))
+    }
+
+    @Test func unreadableTrashKeepsEntriesAndAdmins() async throws {
+        let env = try makeEnv(); defer { cleanup(env) }
+        let (_, e) = try await trashOne(env)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: env.fakeTrash.path) }
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: env.fakeTrash.path)
+        await env.trash.reconcile()
+        await env.trash.deleteNow([e.id])
+        let failed = await env.trash.putBack([e.id])
+        #expect(failed == [e.id])
+        #expect(await env.trash.entries.count == 1)
+        #expect(exists(e.storedAdmin!))
+    }
+
+    @Test func deleteNowKeepsEntryWhileFolderIsBackAtItsPath() async throws {
+        let env = try makeEnv(); defer { cleanup(env) }
+        let (wt, e) = try await trashOne(env)
+        try FileManager.default.moveItem(atPath: e.trashURL, toPath: wt)
+        await env.trash.deleteNow([e.id])
+        #expect(await env.trash.entries.count == 1)
+        #expect(exists(e.storedAdmin!))
+        #expect(exists(wt + "/a.txt"))
+    }
+
+    @Test func reusedTrashNameIsNeverDeletedOrRestored() async throws {
+        let env = try makeEnv(); defer { cleanup(env) }
+        let (wt, e) = try await trashOne(env)
+        try FileManager.default.moveItem(atPath: e.trashURL, toPath: env.base + "/moved-away")
+        try FileManager.default.createDirectory(atPath: e.trashURL, withIntermediateDirectories: true)
+        try "impostor".write(toFile: e.trashURL + "/x.txt", atomically: true, encoding: .utf8)
+        await env.trash.deleteNow([e.id])
+        let failed = await env.trash.putBack([e.id])
+        #expect(failed == [e.id])
+        #expect(exists(e.trashURL + "/x.txt"))
+        #expect(!exists(wt))
+        #expect(await env.trash.entries.count == 1)
+        #expect(exists(e.storedAdmin!))
+    }
+
+    @Test func oldRecordsWithoutIdentityStillDecode() throws {
+        let json = """
+        [{"id":"\(UUID().uuidString)","path":"/a","trashURL":"/t","bytes":1,"date":0}]
+        """
+        let decoded = try JSONDecoder().decode([TrashedWorktree].self, from: Data(json.utf8))
+        #expect(decoded.count == 1)
+        #expect(decoded[0].fileID == nil && decoded[0].device == nil)
+    }
+
+    @Test func reconcileRecoversAnOrphanedAdminFolder() async throws {
+        let env = try makeEnv(); defer { cleanup(env) }
+        let wt = env.repo.addWorktree("wa", branch: "feat/a")
+        let admin = env.repo.root + "/.git/worktrees/wa"
+        let orphan = env.store.appendingPathComponent("admin/\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: orphan.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.moveItem(atPath: admin, toPath: orphan.path)
+        #expect(!listed(env, wt))
+        await env.trash.reconcile()
+        #expect(exists(admin))
+        #expect(!exists(orphan.path))
+        #expect(listed(env, wt))
+        #expect(env.repo.git(in: wt, ["status", "--porcelain"]) == "")
+    }
+
+    @Test func orphanWhoseFolderIsGoneIsLeftAlone() async throws {
+        let env = try makeEnv(); defer { cleanup(env) }
+        let wt = env.repo.addWorktree("wa", branch: "feat/a")
+        let orphan = env.store.appendingPathComponent("admin/\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: orphan.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.moveItem(atPath: env.repo.root + "/.git/worktrees/wa", toPath: orphan.path)
+        try FileManager.default.removeItem(atPath: wt)
+        await env.trash.reconcile()
+        #expect(exists(orphan.path))
+    }
+
+    @Test func gitTimeoutSaysTheFolderMayBePartlyRemoved() async throws {
+        let env = try makeEnv(); defer { cleanup(env) }
+        let slow = GitWorktrees(run: { _, _, _ in CommandResult(status: 15, stdout: "", stderr: "", timedOut: true) })
+        let trash = WorktreeTrash(store: env.store, git: slow)
+        let folder = env.base + "/folder"
+        try FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
+        let out = await trash.removePermanently([item(folder, repo: env.repo.root)], recheck: idle)
+        #expect(out.skipped.first?.1 == "git took too long; the folder may be partly removed")
+    }
+
+    @Test func adminFolderMustBeADirectChildPointingBack() async throws {
+        let env = try makeEnv(); defer { cleanup(env) }
+        let a = env.repo.addWorktree("wa", branch: "feat/a")
+        let b = env.repo.addWorktree("wb", branch: "feat/b")
+        // wa's .git names wb's record: its gitdir file points at wb, not wa.
+        try "gitdir: \(env.repo.root)/.git/worktrees/wb\n".write(toFile: a + "/.git", atomically: true, encoding: .utf8)
+        // A nested folder inside git's record folder.
+        let nested = env.repo.root + "/.git/worktrees/wb/nested"
+        try FileManager.default.createDirectory(atPath: nested, withIntermediateDirectories: true)
+        try "gitdir: \(nested)\n".write(toFile: b + "/.git", atomically: true, encoding: .utf8)
+        let out = await env.trash.moveToTrash([item(a, repo: env.repo.root), item(b, repo: env.repo.root)], recheck: idle)
+        #expect(out.moved.isEmpty)
+        #expect(out.skipped.map(\.1) == ["can't find git's record", "can't find git's record"])
+        #expect(exists(a + "/a.txt") && exists(b + "/a.txt") && exists(nested))
     }
 }

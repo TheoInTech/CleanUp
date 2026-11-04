@@ -28,7 +28,7 @@ public struct GitWorktrees: Sendable {
         self.run = run ?? { await CommandRunner.run($0, $1, timeout: $2) }
     }
 
-    private static let removeTimeout: Duration = .seconds(120)
+    private static let removeTimeout: Duration = .seconds(15 * 60)
 
     private func git(
         _ dir: String, _ args: [String], literal: Bool = false, timeout: Duration? = nil

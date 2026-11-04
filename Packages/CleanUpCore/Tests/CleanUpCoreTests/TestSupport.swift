@@ -469,14 +469,15 @@ extension WorktreeFacts {
         lastChangeAgo: TimeInterval? = .days(6),
         lastCommitAgo: TimeInterval? = .days(6),
         repoExists: Bool = true,
-        agent: String? = nil
+        agent: String? = nil,
+        holdsOtherCheckout: Bool = false
     ) -> WorktreeFacts {
         WorktreeFacts(
             path: "/Users/u/.codex/worktrees/a1b2/app", repo: "app", branch: "codex/fix", agent: agent,
             uncommitted: uncommitted, merge: merge, locked: locked, processesInside: processesInside,
             lastChange: lastChangeAgo.map { now.addingTimeInterval(-$0) },
             lastCommit: lastCommitAgo.map { now.addingTimeInterval(-$0) },
-            repoExists: repoExists
+            repoExists: repoExists, holdsOtherCheckout: holdsOtherCheckout
         )
     }
 }

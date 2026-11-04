@@ -87,8 +87,10 @@ public struct GitWorktrees: Sendable {
         return entries
     }
 
+    /// `holdsOtherCheckout`: another worktree lives inside this one (from the folder walk or git's list).
     public func facts(
-        _ e: GitWorktreeEntry, repo: String, processes: [Int32: ProcessInfoRecord], ownPID: Int32, lastChange: Date?
+        _ e: GitWorktreeEntry, repo: String, processes: [Int32: ProcessInfoRecord], ownPID: Int32, lastChange: Date?,
+        holdsOtherCheckout: Bool = false
     ) async -> WorktreeFacts {
         // Process cwds are resolved real paths; git may report the worktree through a symlink.
         let roots = Set([e.path, realpath(e.path, nil).map { String(cString: $0) } ?? e.path])
@@ -103,7 +105,8 @@ public struct GitWorktrees: Sendable {
         guard FileManager.default.fileExists(atPath: repo, isDirectory: &isDir), isDir.boolValue else {
             return WorktreeFacts(
                 path: e.path, repo: repo, branch: e.branch, agent: agent, uncommitted: nil, merge: .unknown,
-                locked: e.locked, processesInside: inside, lastChange: lastChange, lastCommit: nil, repoExists: false)
+                locked: e.locked, processesInside: inside, lastChange: lastChange, lastCommit: nil, repoExists: false,
+                holdsOtherCheckout: holdsOtherCheckout)
         }
 
         var uncommitted: Int?
@@ -121,7 +124,7 @@ public struct GitWorktrees: Sendable {
         return WorktreeFacts(
             path: e.path, repo: repo, branch: e.branch, agent: agent, uncommitted: uncommitted,
             merge: await mergeState(at: e.path), locked: e.locked, processesInside: inside,
-            lastChange: lastChange, lastCommit: lastCommit, repoExists: true)
+            lastChange: lastChange, lastCommit: lastCommit, repoExists: true, holdsOtherCheckout: holdsOtherCheckout)
     }
 
     private func mergeState(at dir: String) async -> MergeState {

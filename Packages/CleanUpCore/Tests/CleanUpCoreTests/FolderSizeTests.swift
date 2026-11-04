@@ -157,4 +157,47 @@ import Testing
         chmod(locked.path, 0o755)
         #expect(await cache.measure(dir, now: now).complete == true)
     }
+    // Nested worktrees
+
+    @Test func gitFileBelowTopLevelMeansAnotherCheckout() throws {
+        let dir = try makeDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try write(dir.appendingPathComponent(".git"), bytes: 10)  // the worktree's own
+        #expect(!FolderSize.measure(dir).holdsOtherCheckout)
+        let nested = dir.appendingPathComponent(".claude/worktrees/b")
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        try write(nested.appendingPathComponent(".git"), bytes: 10)
+        let m = FolderSize.measure(dir)
+        #expect(m.holdsOtherCheckout)
+        #expect(m.complete)
+    }
+
+    @Test func gitFolderBelowTopLevelIsNotAnotherCheckout() throws {
+        let dir = try makeDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try write(dir.appendingPathComponent(".git"), bytes: 10)
+        // A SwiftPM checkout: a whole clone with a `.git` folder.
+        let clone = dir.appendingPathComponent(".build/checkouts/swift-argument-parser/.git")
+        try FileManager.default.createDirectory(at: clone, withIntermediateDirectories: true)
+        try write(clone.appendingPathComponent("HEAD"), bytes: 10)
+        #expect(!FolderSize.measure(dir).holdsOtherCheckout)
+    }
+
+    @Test func cacheKeepsTheNestedCheckoutFlag() async throws {
+        let dir = try makeDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fm = FileManager.default
+        let pinned = Date(timeIntervalSince1970: 1_700_000_000)
+        try fm.createDirectory(at: dir.appendingPathComponent("sub"), withIntermediateDirectories: true)
+        try write(dir.appendingPathComponent("sub/.git"), bytes: 10)
+        try fm.setAttributes([.modificationDate: pinned], ofItemAtPath: dir.path)
+        let cache = SizeCache()
+        let t0 = Date()
+        #expect(await cache.measure(dir, now: t0).holdsOtherCheckout)
+        // Served from the cache.
+        try fm.removeItem(at: dir.appendingPathComponent("sub/.git"))
+        try fm.setAttributes([.modificationDate: pinned], ofItemAtPath: dir.path)
+        #expect(await cache.measure(dir, now: t0.addingTimeInterval(5)).holdsOtherCheckout)
+        #expect(await !cache.measure(dir, now: t0.addingTimeInterval(6), fresh: true).holdsOtherCheckout)
+    }
 }

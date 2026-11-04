@@ -89,22 +89,15 @@ public actor WorktreeScanner {
         let git = self.git
         let sizes = self.sizes
 
-        var items: [Item] = []
-        await withTaskGroup(of: [Item].self) { group in
-            var next = repos.makeIterator()
-            func addNext() {
-                guard let repo = next.next() else { return }
-                group.addTask {
-                    await Self.items(
-                        repo: repo, git: git, sizes: sizes, processes: processes, ownPID: ownPID, now: now)
-                }
-            }
-            for _ in 0..<Self.concurrency { addNext() }
-            while let done = await group.next() {
-                items += done
-                addNext()
-            }
-        }
+        // Every repository's list first, so a worktree that holds another one (from any repository) is known
+        // before anything is judged, even when the folder walk can't see the inner one.
+        let lists = await Self.limited(repos) { repo in (repo, await git.list(repo: repo)) }
+        let listed = Set(lists.flatMap { $0.1 ?? [] }.map(\.path))
+        var items = await Self.limited(lists.compactMap { r in r.1.map { (r.0, $0) } }) { repo, entries in
+            await Self.items(
+                repo: repo, entries: entries, listed: listed, git: git, sizes: sizes, processes: processes,
+                ownPID: ownPID, now: now)
+        }.flatMap { $0 }
 
         if let leftovers = await leftoverItem(now: now) { items.append(leftovers) }
 
@@ -131,28 +124,56 @@ public actor WorktreeScanner {
             return Judgement(verdict: .idle, fact: item.judgement.fact, signals: item.judgement.signals)
         }
         guard let path = item.detail["path"], let repo = item.detail["repo"],
-              let entry = await git.list(repo: repo)?.first(where: { $0.path == path })
+              let entries = await git.list(repo: repo), let entry = entries.first(where: { $0.path == path })
         else { return kept("can't check it again") }
         let m = await sizes.measure(URL(fileURLWithPath: path), now: now, fresh: true)
         let facts = await git.facts(
-            entry, repo: repo, processes: processes, ownPID: ownPID, lastChange: m.complete ? m.newest : nil)
+            entry, repo: repo, processes: processes, ownPID: ownPID, lastChange: m.complete ? m.newest : nil,
+            holdsOtherCheckout: m.holdsOtherCheckout || Self.holdsListed(path, in: Set(entries.map(\.path))))
         return WorktreeJudge.judge(facts, now: now)
     }
 
     private static func bytes(_ item: Item) -> Int64 { item.detail["bytes"].flatMap { Int64($0) } ?? 0 }
 
+    /// Whether another listed worktree lives inside `path`.
+    private static func holdsListed(_ path: String, in listed: Set<String>) -> Bool {
+        let prefix = path.hasSuffix("/") ? path : path + "/"
+        return listed.contains { $0 != path && $0.hasPrefix(prefix) }
+    }
+
+    /// Runs `work` on every input, a few at a time.
+    private static func limited<T: Sendable, R: Sendable>(
+        _ inputs: [T], _ work: @escaping @Sendable (T) async -> R
+    ) async -> [R] {
+        var out: [R] = []
+        await withTaskGroup(of: R.self) { group in
+            var next = inputs.makeIterator()
+            func addNext() {
+                guard let input = next.next() else { return }
+                group.addTask { await work(input) }
+            }
+            for _ in 0..<concurrency { addNext() }
+            while let done = await group.next() {
+                out.append(done)
+                addNext()
+            }
+        }
+        return out
+    }
+
     private static func items(
-        repo: String, git: GitWorktrees, sizes: SizeCache, processes: [Int32: ProcessInfoRecord],
-        ownPID: Int32, now: Date
+        repo: String, entries: [GitWorktreeEntry], listed: Set<String>, git: GitWorktrees, sizes: SizeCache,
+        processes: [Int32: ProcessInfoRecord], ownPID: Int32, now: Date
     ) async -> [Item] {
-        guard let entries = await git.list(repo: repo) else { return [] }
         let repoName = URL(fileURLWithPath: repo).lastPathComponent
         var out: [Item] = []
         for e in entries {
             let m = await sizes.measure(URL(fileURLWithPath: e.path), now: now)
             // An incomplete or empty measure says nothing about recent activity: judge it as kept.
             let lastChange = m.complete ? m.newest : nil
-            let facts = await git.facts(e, repo: repo, processes: processes, ownPID: ownPID, lastChange: lastChange)
+            let facts = await git.facts(
+                e, repo: repo, processes: processes, ownPID: ownPID, lastChange: lastChange,
+                holdsOtherCheckout: m.holdsOtherCheckout || holdsListed(e.path, in: listed))
             var detail = ["path": e.path, "repo": repo, "repoName": repoName, "bytes": String(m.bytes)]
             if let b = e.branch { detail["branch"] = b }
             if let a = facts.agent { detail["agent"] = a }

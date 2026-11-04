@@ -219,3 +219,127 @@ import Testing
         #expect(j.fact == "no longer empty")
     }
 }
+
+/// A worktree an agent made inside another worktree, in a git-ignored folder: the outer one looks clean,
+/// but removing it would take the inner one's work with it.
+@Suite struct NestedWorktreeTests {
+    private func makeHome() throws -> URL {
+        let raw = FileManager.default.temporaryDirectory.appendingPathComponent("wn-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: raw, withIntermediateDirectories: true)
+        return URL(fileURLWithPath: String(cString: realpath(raw.path, nil)))
+    }
+
+    private func age(_ path: String, days: Double = 3) {
+        let past = Date().addingTimeInterval(-days * 86_400)
+        let fm = FileManager.default
+        var paths = [path]
+        if let e = fm.enumerator(atPath: path) { for case let rel as String in e { paths.append(path + "/" + rel) } }
+        for p in paths { try? fm.setAttributes([.modificationDate: past], ofItemAtPath: p) }
+    }
+
+    private func scan(_ s: WorktreeScanner) async -> WorktreeSnapshot? {
+        await s.scan(processes: [:], ownPID: 1, includeProtected: false, trashed: [], now: Date())
+    }
+
+    /// A repo whose main branch ignores `.claude/` and `.build/`, and a merged worktree `app-a` beside it.
+    private func makeParent(_ home: URL) throws -> (TempRepo, String) {
+        let repo = try TempRepo.make(in: home.appendingPathComponent("Projects").path, name: "app")
+        repo.commit(".gitignore", ".claude/\n.build/\n", on: nil)
+        let a = repo.addWorktree("app-a", branch: "feat/a")
+        return (repo, a)
+    }
+
+    /// Adds worktree `b` inside `parent`'s ignored `.claude/worktrees`, with uncommitted work in it.
+    private func nest(_ repo: TempRepo, in parent: String) throws -> String {
+        let b = parent + "/.claude/worktrees/b"
+        repo.run("worktree", "add", "-b", "feat/b", b)
+        try "wip\n".write(toFile: b + "/wip.txt", atomically: true, encoding: .utf8)
+        return b
+    }
+
+    @Test func parentOfNestedWorktreeIsKeptByScan() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let (repo, a) = try makeParent(home)
+        let b = try nest(repo, in: a)
+        age(a)
+        #expect(repo.git(in: a, ["status", "--porcelain"]) == "")  // git alone would call it clean
+
+        let snap = try #require(await scan(WorktreeScanner(home: home)))
+        let parent = try #require(snap.items.first { $0.id == .worktree(path: a) })
+        #expect(parent.judgement.verdict != .idle)
+        #expect(parent.judgement.fact == "holds another worktree")
+        #expect(snap.items.first { $0.id == .worktree(path: b) }?.judgement.verdict != .idle)
+    }
+
+    @Test func parentOfNestedWorktreeIsKeptByRecheck() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let (repo, a) = try makeParent(home)
+        age(a)
+        let scanner = WorktreeScanner(home: home)
+        let item = try #require(await scan(scanner)?.items.first { $0.id == .worktree(path: a) })
+        #expect(item.judgement.verdict == .idle)
+        _ = try nest(repo, in: a)
+        age(a)
+        let j = await scanner.recheck(item, processes: [:], ownPID: 1, now: Date())
+        #expect(j.verdict != .idle)
+        #expect(j.fact == "holds another worktree")
+    }
+
+    @Test func listedNestedWorktreeKeepsParentEvenWhenTheWalkMissesIt() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let (repo, a) = try makeParent(home)
+        let b = try nest(repo, in: a)
+        try FileManager.default.removeItem(atPath: b)  // git still lists it, but the walk finds no `.git` file
+        age(a)
+        #expect(repo.run("worktree", "list", "--porcelain").contains("worktree \(b)\n"))
+
+        let scanner = WorktreeScanner(home: home)
+        let parent = try #require(await scan(scanner)?.items.first { $0.id == .worktree(path: a) })
+        #expect(parent.judgement.verdict != .idle)
+        #expect(parent.judgement.fact == "holds another worktree")
+        #expect(await scanner.recheck(parent, processes: [:], ownPID: 1, now: Date()).verdict != .idle)
+    }
+
+    @Test func swiftPMCheckoutInsideIsStillSafe() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let (_, a) = try makeParent(home)
+        let clone = a + "/.build/checkouts/swift-argument-parser/.git"
+        try FileManager.default.createDirectory(atPath: clone, withIntermediateDirectories: true)
+        try "ref: refs/heads/main\n".write(toFile: clone + "/HEAD", atomically: true, encoding: .utf8)
+        age(a)
+        let scanner = WorktreeScanner(home: home)
+        let item = try #require(await scan(scanner)?.items.first { $0.id == .worktree(path: a) })
+        #expect(item.judgement.verdict == .idle)
+        #expect(await scanner.recheck(item, processes: [:], ownPID: 1, now: Date()).verdict == .idle)
+    }
+
+    @Test func moveToTrashSkipsParentWithTheRealRecheck() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let (repo, a) = try makeParent(home)
+        age(a)
+        let scanner = WorktreeScanner(home: home)
+        let item = try #require(await scan(scanner)?.items.first { $0.id == .worktree(path: a) })
+        #expect(item.judgement.verdict == .idle)
+        let b = try nest(repo, in: a)
+        age(a)
+
+        let fakeTrash = home.appendingPathComponent("FakeTrash")
+        try FileManager.default.createDirectory(at: fakeTrash, withIntermediateDirectories: true)
+        let trash = WorktreeTrash(store: home.appendingPathComponent("store"), trashItem: { url in
+            let dest = fakeTrash.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.moveItem(at: url, to: dest)
+            return dest
+        })
+        let out = await trash.moveToTrash([item], recheck: { await scanner.recheck($0, processes: [:], ownPID: 1, now: Date()) })
+        #expect(out.moved.isEmpty)
+        #expect(out.skipped.first?.1 == "holds another worktree")
+        #expect(FileManager.default.fileExists(atPath: b + "/wip.txt"))
+        #expect(((try? FileManager.default.contentsOfDirectory(atPath: fakeTrash.path)) ?? []).isEmpty)
+        #expect(await trash.entries.isEmpty)
+    }
+}

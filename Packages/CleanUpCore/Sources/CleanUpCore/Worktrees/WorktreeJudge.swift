@@ -26,10 +26,13 @@ public struct WorktreeFacts: Sendable, Equatable {
     public var lastChange: Date?
     public var lastCommit: Date?
     public var repoExists: Bool
+    /// Another worktree lives somewhere inside this one (often in a git-ignored folder git doesn't report).
+    public var holdsOtherCheckout: Bool
 
     public init(
         path: String, repo: String, branch: String?, agent: String?, uncommitted: Int?, merge: MergeState,
-        locked: Bool, processesInside: [String], lastChange: Date?, lastCommit: Date?, repoExists: Bool
+        locked: Bool, processesInside: [String], lastChange: Date?, lastCommit: Date?, repoExists: Bool,
+        holdsOtherCheckout: Bool = false
     ) {
         self.path = path
         self.repo = repo
@@ -42,6 +45,7 @@ public struct WorktreeFacts: Sendable, Equatable {
         self.lastChange = lastChange
         self.lastCommit = lastCommit
         self.repoExists = repoExists
+        self.holdsOtherCheckout = holdsOtherCheckout
     }
 }
 
@@ -62,6 +66,8 @@ public enum WorktreeJudge {
 
         check(f.repoExists, pass: "The repository is there", fail: "The repository is missing, so nothing can be checked",
               reason: "can't check: repository missing")
+        check(!f.holdsOtherCheckout, pass: "No other worktree inside it", fail: "Another worktree is inside it",
+              reason: "holds another worktree")
 
         switch f.uncommitted {
         case 0?:

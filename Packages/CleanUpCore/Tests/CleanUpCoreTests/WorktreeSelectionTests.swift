@@ -72,4 +72,30 @@ import Testing
         #expect(sel.bytes(in: s) == 107)
         #expect(Set(sel.items(in: s).map(\.id)) == [a.id, c.id])
     }
+
+    @Test func keptAfterTickingIsExcluded() {
+        let a = item("/a"), b = item("/b")
+        let s = snap([a, b])
+        var sel = WorktreeSelection()
+        sel.apply(s, keep: .empty, quick: true)
+        var keep = KeepList.empty
+        keep.add(a.id, name: "a")
+        #expect(sel.items(in: s, keep: keep).map(\.id) == [b.id])
+        #expect(sel.bytes(in: s, keep: keep) == 100)
+    }
+
+    @Test func modeSwitchMirrorsTickController() {
+        let a = item("/a"), b = item("/b")
+        let s = snap([a, b])
+        var sel = WorktreeSelection()
+        sel.apply(s, keep: .empty, quick: true)
+        sel.setMode(quick: false, in: s, keep: .empty)
+        #expect(sel.ticked.isEmpty)
+        sel.toggle(a)
+        sel.setMode(quick: true, in: s, keep: .empty)
+        #expect(sel.ticked == [a.id, b.id])
+        sel.toggle(a)
+        sel.apply(s, keep: .empty, quick: true)
+        #expect(sel.ticked == [b.id])
+    }
 }

@@ -63,7 +63,7 @@ final class AppModel {
     private(set) var cleanIdleInFlight = false
     private(set) var keepList = KeepList(defaults: .standard)
     /// Stale git worktrees: scanned and cleaned on their own, never part of the main Clean up.
-    let worktrees = WorktreesModel()
+    @ObservationIgnored private(set) lazy var worktrees = WorktreesModel(keepList: { [unowned self] in self.keepList })
     var useAI: Bool {
         didSet {
             UserDefaults.standard.set(useAI, forKey: Self.useAIKey)

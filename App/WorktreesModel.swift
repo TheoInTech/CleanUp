@@ -20,9 +20,15 @@ final class WorktreesModel {
     private(set) var isScanning = false
     /// Quick select ticks what is safe; Choose myself ticks nothing.
     var quickSelect = true {
-        didSet { if quickSelect != oldValue, let snapshot { selection.apply(snapshot, keep: keepList, quick: quickSelect) } }
+        didSet {
+            guard quickSelect != oldValue, let snapshot else { return }
+            selection.setMode(quick: quickSelect, in: snapshot, keep: keepList())
+        }
     }
-    private(set) var keepList = KeepList(defaults: .standard)
+    /// Reads the app's live Keep list, so a Keep added after launch counts straight away.
+    @ObservationIgnored private let keepList: @MainActor () -> KeepList
+    /// An action (clean up, undo, put back, delete) is under way; nothing else may start or scan meanwhile.
+    private(set) var isBusy = false
 
     var includeProtected: Bool {
         didSet {
@@ -43,12 +49,13 @@ final class WorktreesModel {
     @ObservationIgnored private var lastMoved: [UUID] = []
     @ObservationIgnored private let log = Logger(subsystem: "io.cleanup.CleanUp", category: "WorktreesModel")
 
-    init() {
+    init(keepList: @escaping @MainActor () -> KeepList) {
+        self.keepList = keepList
         includeProtected = UserDefaults.standard.bool(forKey: Self.includeProtectedKey)
         removePermanently = UserDefaults.standard.bool(forKey: Self.removePermanentlyKey)
+        // The trash creates the folder itself when it first saves, off the main thread.
         let store = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/io.cleanup.CleanUp/Worktrees", isDirectory: true)
-        try? FileManager.default.createDirectory(at: store, withIntermediateDirectories: true)
         scanner = WorktreeScanner()
         trash = WorktreeTrash(store: store)
     }
@@ -69,7 +76,7 @@ final class WorktreesModel {
 
     /// Scans again. Without `force`, a scan newer than the stale limit is left alone.
     func refresh(force: Bool) async {
-        if isScanning {
+        if isScanning || isBusy {
             if force { scanRequestedWhileScanning = true }
             return
         }
@@ -85,7 +92,7 @@ final class WorktreesModel {
                 processes: table, ownPID: ProcessInfo.processInfo.processIdentifier,
                 includeProtected: includeProtected, trashed: entries, now: Date())
             snapshot = fresh
-            if let fresh { selection.apply(fresh, keep: keepList, quick: quickSelect) } else { selection = WorktreeSelection() }
+            if let fresh { selection.apply(fresh, keep: keepList(), quick: quickSelect) } else { selection = WorktreeSelection() }
         } while scanRequestedWhileScanning
     }
 
@@ -97,9 +104,14 @@ final class WorktreesModel {
 
     /// Removes the ticked worktrees, each looked at again first. Asks nothing: the permanent-mode dialog is the UI's.
     func cleanUp() async {
-        guard let snapshot else { return }
-        let items = selection.items(in: snapshot)
-        guard !items.isEmpty else { return }
+        guard !isBusy, snapshot != nil else { return }
+        isBusy = true
+        await scanSettled()
+        // Read after any scan in flight lands, so the list is the current one, minus anything kept since.
+        guard let snapshot, case let items = selection.items(in: snapshot, keep: keepList()), !items.isEmpty else {
+            isBusy = false
+            return
+        }
         let table = await Task.detached(priority: .userInitiated) { ProcessTable.snapshot() }.value
         let pid = ProcessInfo.processInfo.processIdentifier
         let scanner = self.scanner
@@ -112,28 +124,47 @@ final class WorktreesModel {
             outcome = await trash.moveToTrash(items, recheck: recheck)
             lastMoved = await trash.entries.map(\.id).filter { !before.contains($0) }
         }
-        await refresh(force: true)
+        await finishAction()
     }
 
     /// Puts back what the last move to the Trash created.
     func undoLast() async {
         let ids = lastMoved
-        guard !ids.isEmpty else { return }
+        guard !isBusy, !ids.isEmpty else { return }
+        isBusy = true
+        await scanSettled()
         lastMoved = await trash.putBack(ids)
         outcome = nil
-        await refresh(force: true)
+        await finishAction()
     }
 
     func putBack(_ ids: [UUID]) async {
+        guard !isBusy else { return }
+        isBusy = true
+        await scanSettled()
         let failed = await trash.putBack(ids)
         if !failed.isEmpty { log.notice("\(failed.count) worktrees could not be put back") }
-        lastMoved.removeAll { !failed.contains($0) }
-        await refresh(force: true)
+        lastMoved.removeAll { ids.contains($0) && !failed.contains($0) }
+        await finishAction()
     }
 
     func deleteNow(_ ids: [UUID]) async {
+        guard !isBusy else { return }
+        isBusy = true
+        await scanSettled()
         await trash.deleteNow(ids)
         lastMoved.removeAll { ids.contains($0) }
+        await finishAction()
+    }
+
+    /// A scan already under way (which may be reconciling the Trash record) finishes before an action starts.
+    private func scanSettled() async {
+        while isScanning { try? await Task.sleep(for: .milliseconds(100)) }
+    }
+
+    /// Every action ends with a forced scan, which also runs any scan that was asked for meanwhile.
+    private func finishAction() async {
+        isBusy = false
         await refresh(force: true)
     }
 

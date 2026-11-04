@@ -32,11 +32,24 @@ public struct WorktreeSelection: Sendable, Equatable {
         }
     }
 
-    public func items(in s: WorktreeSnapshot) -> [Item] {
-        s.items.filter { ticked.contains($0.id) && $0.judgement.verdict == .idle }
+    /// Switches like `TickController.setMode`: Quick select ticks everything safe and not kept at once;
+    /// Choose myself clears every tick.
+    public mutating func setMode(quick: Bool, in s: WorktreeSnapshot, keep: KeepList) {
+        if quick {
+            proposed = Set(s.items.filter { $0.judgement.verdict == .idle && !keep.contains($0.id) }.map(\.id))
+            ticked = proposed
+        } else {
+            ticked = []
+            proposed = []
+        }
     }
 
-    public func bytes(in s: WorktreeSnapshot) -> Int64 {
-        items(in: s).reduce(0) { $0 + ($1.detail["bytes"].flatMap { Int64($0) } ?? 0) }
+    /// The ticked items that may still be removed: safe, and not on the Keep list.
+    public func items(in s: WorktreeSnapshot, keep: KeepList = .empty) -> [Item] {
+        s.items.filter { ticked.contains($0.id) && $0.judgement.verdict == .idle && !keep.contains($0.id) }
+    }
+
+    public func bytes(in s: WorktreeSnapshot, keep: KeepList = .empty) -> Int64 {
+        items(in: s, keep: keep).reduce(0) { $0 + ($1.detail["bytes"].flatMap { Int64($0) } ?? 0) }
     }
 }

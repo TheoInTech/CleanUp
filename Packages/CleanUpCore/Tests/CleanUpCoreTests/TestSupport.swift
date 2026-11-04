@@ -480,3 +480,71 @@ extension WorktreeFacts {
         )
     }
 }
+
+/// A throwaway git repository under the temp directory, for tests that need real git.
+final class TempRepo: @unchecked Sendable {
+    let root: String
+    private let base: String
+
+    private init(base: String, root: String) {
+        self.base = base
+        self.root = root
+    }
+
+    deinit { try? FileManager.default.removeItem(atPath: base) }
+
+    static func make() throws -> TempRepo {
+        let raw = FileManager.default.temporaryDirectory.path
+        let tmp = realpath(raw, nil).map { String(cString: $0) } ?? raw
+        let base = tmp + "/cleanup-repo-" + UUID().uuidString
+        let root = base + "/repo"
+        try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        let repo = TempRepo(base: base, root: root)
+        repo.run("init", "-b", "main")
+        repo.run("config", "user.name", "Test")
+        repo.run("config", "user.email", "test@example.com")
+        repo.run("config", "commit.gpgsign", "false")
+        repo.commit("a.txt", "one\n", on: nil)
+        return repo
+    }
+
+    /// Runs git in the repo and returns trimmed stdout.
+    @discardableResult
+    func run(_ args: String...) -> String { git(in: root, args) }
+
+    @discardableResult
+    func git(in dir: String, _ args: [String]) -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        p.arguments = ["-C", dir] + args
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = Pipe()
+        try? p.run()
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Writes and commits a file, on `branch` (checked out first) or the current checkout.
+    func commit(_ file: String, _ text: String, on branch: String?, in dir: String? = nil) {
+        let dir = dir ?? root
+        if let branch { git(in: dir, ["checkout", branch]) }
+        try? text.write(toFile: dir + "/" + file, atomically: true, encoding: .utf8)
+        git(in: dir, ["add", file])
+        git(in: dir, ["commit", "-m", "edit \(file)"])
+    }
+
+    /// Adds a worktree on a new branch; returns its path.
+    func addWorktree(_ name: String, branch: String) -> String {
+        let path = base + "/" + name
+        run("worktree", "add", "-b", branch, path)
+        return path
+    }
+
+    /// Lands `branch` on the current branch as one new commit, leaving `branch` itself unmerged.
+    func squashMerge(_ branch: String) {
+        run("merge", "--squash", branch)
+        run("commit", "-m", "squash \(branch)")
+    }
+}

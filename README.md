@@ -55,7 +55,7 @@ CleanUp has to watch before it can call anything quiet, so **nothing shows as id
 
 ## Install
 
-1. Download **CleanUp-0.1.0.dmg** from the [latest release](https://github.com/TheoInTech/CleanUp/releases/latest).
+1. Download **CleanUp-0.2.0.dmg** from the [latest release](https://github.com/TheoInTech/CleanUp/releases/latest).
 2. Open it and drag **CleanUp** into **Applications**.
 3. Open CleanUp. Because this preview isn't notarized by Apple yet, macOS says it can't verify it. Click **Done**, then go to **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** next to CleanUp. You only do this once.
 

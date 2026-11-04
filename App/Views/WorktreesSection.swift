@@ -178,8 +178,14 @@ private struct WorktreesCard: View {
                 if worktrees.isBusy {
                     ProgressView().controlSize(.small)
                 }
-                Text(label)
-                Text("· \(size)").opacity(0.8)
+                if let progress = worktrees.progress {
+                    // The item being looked at now, counted from 1.
+                    Text("Checking \(min(progress.done + 1, progress.total)) of \(progress.total)…")
+                        .monospacedDigit()
+                } else {
+                    Text(label)
+                    Text("· \(size)").opacity(0.8)
+                }
             }
             .font(.callout.weight(.semibold))
             .frame(maxWidth: .infinity)

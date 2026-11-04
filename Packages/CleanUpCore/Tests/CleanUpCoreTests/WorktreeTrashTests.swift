@@ -595,4 +595,29 @@ import Testing
         #expect(exists(wt + "/a.txt"))
         #expect(listed(env, elsewhere))
     }
+    // Progress
+
+    final class Seen: @unchecked Sendable {
+        private let lock = NSLock()
+        private var all: [(Int, Int)] = []
+        func add(_ done: Int, _ total: Int) { lock.withLock { all.append((done, total)) } }
+        var done: [Int] { lock.withLock { all.map(\.0) } }
+        var totals: Set<Int> { lock.withLock { Set(all.map(\.1)) } }
+    }
+
+    @Test func removalReportsProgressPerItem() async throws {
+        let env = try makeEnv(); defer { cleanup(env) }
+        let paths = ["wa", "wb", "wc"].map { env.repo.addWorktree($0, branch: "feat/\($0)") }
+        let missing = item(env.base + "/nope", repo: env.repo.root)  // skipped before any re-check
+        let seen = Seen()
+        _ = await env.trash.moveToTrash(paths.map { item($0, repo: env.repo.root) } + [missing], recheck: idle,
+                                        progress: { seen.add($0, $1) })
+        #expect(seen.done == [0, 1, 2, 3, 4])
+        #expect(seen.totals == [4])
+
+        let again = Seen()
+        _ = await env.trash.removePermanently([missing], recheck: idle, progress: { again.add($0, $1) })
+        #expect(again.done == [0, 1])
+        #expect(again.totals == [1])
+    }
 }

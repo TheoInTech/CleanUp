@@ -41,6 +41,8 @@ final class WorktreesModel {
     }
     /// An action (clean up, undo, put back, delete) is under way; nothing else may start or scan meanwhile.
     private(set) var isBusy = false
+    /// While Clean up runs: how many of the items have been looked at again, for "Checking 12 of 118…".
+    private(set) var progress: (done: Int, total: Int)?
     /// What the last put back or delete couldn't do, as one line for the Trash row
     /// ("2 couldn't be put back · find them in the Trash"); nil when everything went.
     private(set) var failure: String?
@@ -140,19 +142,31 @@ final class WorktreesModel {
             isBusy = false
             return
         }
-        let table = await Task.detached(priority: .userInitiated) { ProcessTable.snapshot() }.value
+        // The re-checks walk every folder again and can take minutes: utility priority, off the main actor,
+        // with a fresh process table for each item (an agent may start in one meanwhile).
         let pid = ProcessInfo.processInfo.processIdentifier
         let scanner = self.scanner
-        let recheck: WorktreeTrash.Recheck = { await scanner.recheck($0, processes: table, ownPID: pid, now: Date()) }
-        if permanent {
-            outcome = await trash.removePermanently(items, recheck: recheck)
-            lastMoved = []
-        } else {
+        let trash = self.trash
+        progress = (0, items.count)
+        let report: WorktreeTrash.Progress = { [weak self] done, total in await self?.showProgress(done, total) }
+        let (result, moved) = await Task.detached(priority: .utility) { () -> (WorktreeOutcome, [UUID]) in
+            let recheck = scanner.removalRecheck(ownPID: pid)
+            if permanent {
+                return (await trash.removePermanently(items, recheck: recheck, progress: report), [])
+            }
             let before = Set(await trash.entries.map(\.id))
-            outcome = await trash.moveToTrash(items, recheck: recheck)
-            lastMoved = await trash.entries.map(\.id).filter { !before.contains($0) }
-        }
+            let out = await trash.moveToTrash(items, recheck: recheck, progress: report)
+            return (out, await trash.entries.map(\.id).filter { !before.contains($0) })
+        }.value
+        outcome = result
+        lastMoved = moved
+        progress = nil
         await finishAction()
+    }
+
+    private func showProgress(_ done: Int, _ total: Int) {
+        guard isBusy else { return }
+        progress = (done, total)
     }
 
     /// Puts back what the last move to the Trash created.

@@ -203,6 +203,35 @@ import Testing
         #expect(j.fact == "can't check it again")
     }
 
+    @Test func removalRecheckReadsTheProcessTableForEachItem() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let repo = try TempRepo.make(in: home.appendingPathComponent("Projects").path, name: "app")
+        let a = repo.addWorktree("app-a", branch: "feat/a")
+        let b = repo.addWorktree("app-b", branch: "feat/b")
+        age(a); age(b)
+        let scanner = WorktreeScanner(home: home)
+        let items = try #require(await scan(scanner)?.items)
+        let first = try #require(items.first { $0.id == .worktree(path: a) })
+        let second = try #require(items.first { $0.id == .worktree(path: b) })
+
+        // An agent starts in b after a was checked: only a table read for b itself can see it.
+        final class Reads: @unchecked Sendable {
+            let lock = NSLock()
+            var count = 0
+            func next() -> Int { lock.withLock { count += 1; return count } }
+        }
+        let reads = Reads()
+        let recheck = scanner.removalRecheck(ownPID: 1) {
+            reads.next() == 1 ? [:] : processTable(.fixture(pid: 10, name: "node", cwd: b))
+        }
+        #expect(await recheck(first).verdict == .idle)
+        let j = await recheck(second)
+        #expect(j.verdict != .idle)
+        #expect(j.fact == "in use by node")
+        #expect(reads.count == 2)
+    }
+
     @Test func leftoverFolderThatGainsAFileIsKept() async throws {
         let home = try makeHome()
         defer { try? FileManager.default.removeItem(at: home) }

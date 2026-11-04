@@ -7,6 +7,8 @@ import os
 /// Create one `WorktreeTrash` per store: two instances on the same store would overwrite each other's record.
 public actor WorktreeTrash {
     public typealias Recheck = @Sendable (Item) async -> Judgement
+    /// How far a run is: `done` of `total` items handled. Called before each item and once at the end.
+    public typealias Progress = @Sendable (_ done: Int, _ total: Int) async -> Void
 
     struct TrashError: LocalizedError {
         var errorDescription: String? { "The Trash didn't say where the folder went" }
@@ -43,9 +45,10 @@ public actor WorktreeTrash {
 
     // MARK: Move to the Trash
 
-    public func moveToTrash(_ items: [Item], recheck: Recheck) async -> WorktreeOutcome {
+    public func moveToTrash(_ items: [Item], recheck: Recheck, progress: Progress? = nil) async -> WorktreeOutcome {
         var moved: [Item] = [], skipped: [(Item, String)] = [], bytes: Int64 = 0
-        for item in items {
+        for (i, item) in items.enumerated() {
+            await progress?(i, items.count)
             let result = item.id == .worktreeLeftovers
                 ? await trashLeftovers(item, recheck: recheck)
                 : await trashWorktree(item, recheck: recheck)
@@ -54,6 +57,7 @@ public actor WorktreeTrash {
             case .failure(let why): skipped.append((item, why.reason))
             }
         }
+        await progress?(items.count, items.count)
         return WorktreeOutcome(moved: moved, skipped: skipped, bytes: bytes, permanent: false)
     }
 
@@ -134,9 +138,10 @@ public actor WorktreeTrash {
 
     // MARK: Permanent removal
 
-    public func removePermanently(_ items: [Item], recheck: Recheck) async -> WorktreeOutcome {
+    public func removePermanently(_ items: [Item], recheck: Recheck, progress: Progress? = nil) async -> WorktreeOutcome {
         var moved: [Item] = [], skipped: [(Item, String)] = [], bytes: Int64 = 0
-        for item in items {
+        for (i, item) in items.enumerated() {
+            await progress?(i, items.count)
             let result = item.id == .worktreeLeftovers
                 ? await removeLeftovers(item, recheck: recheck)
                 : await removeWorktree(item, recheck: recheck)
@@ -145,6 +150,7 @@ public actor WorktreeTrash {
             case .failure(let why): skipped.append((item, why.reason))
             }
         }
+        await progress?(items.count, items.count)
         return WorktreeOutcome(moved: moved, skipped: skipped, bytes: bytes, permanent: true)
     }
 

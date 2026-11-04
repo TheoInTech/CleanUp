@@ -137,6 +137,19 @@ public actor WorktreeScanner {
         return WorktreeJudge.judge(facts, now: now)
     }
 
+    /// The re-check a removal run uses. It reads the process table again for every item, right before that
+    /// item is looked at, on the caller's task (never the main thread when the run is detached): a run can
+    /// last minutes, and an agent may start in a worktree meanwhile.
+    public nonisolated func removalRecheck(
+        ownPID: Int32,
+        processes: @escaping @Sendable () -> [Int32: ProcessInfoRecord] = { ProcessTable.snapshot() }
+    ) -> WorktreeTrash.Recheck {
+        { item in
+            let table = processes()
+            return await self.recheck(item, processes: table, ownPID: ownPID, now: Date())
+        }
+    }
+
     private static func bytes(_ item: Item) -> Int64 { item.detail["bytes"].flatMap { Int64($0) } ?? 0 }
 
     /// Whether another listed worktree lives inside `path`.

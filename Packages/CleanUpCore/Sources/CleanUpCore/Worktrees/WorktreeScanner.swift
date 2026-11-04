@@ -104,6 +104,30 @@ public actor WorktreeScanner {
         return WorktreeSnapshot(date: now, items: items, trashed: trashed)
     }
 
+    /// Looks at an item again just before it is removed: a fresh measure (never the cache), the current
+    /// git state and process table. Anything that can't be checked again is kept.
+    public func recheck(
+        _ item: Item, processes: [Int32: ProcessInfoRecord], ownPID: Int32, now: Date
+    ) async -> Judgement {
+        func kept(_ fact: String) -> Judgement {
+            Judgement(verdict: .inUse, fact: fact, signals: [Signal(kind: .inUse, text: fact)])
+        }
+        if item.id == .worktreeLeftovers {
+            let home = self.home
+            let current = Set(await Task.detached { WorktreeDiscovery.leftoverAgentFolders(home: home) }.value.map(\.path))
+            let wanted = (item.detail["paths"] ?? "").split(separator: "\n").map(String.init)
+            guard !wanted.isEmpty, wanted.allSatisfy(current.contains) else { return kept("no longer empty") }
+            return Judgement(verdict: .idle, fact: item.judgement.fact, signals: item.judgement.signals)
+        }
+        guard let path = item.detail["path"], let repo = item.detail["repo"],
+              let entry = await git.list(repo: repo)?.first(where: { $0.path == path })
+        else { return kept("can't check it again") }
+        let m = await sizes.measure(URL(fileURLWithPath: path), now: now, fresh: true)
+        let facts = await git.facts(
+            entry, repo: repo, processes: processes, ownPID: ownPID, lastChange: m.complete ? m.newest : nil)
+        return WorktreeJudge.judge(facts, now: now)
+    }
+
     private static func bytes(_ item: Item) -> Int64 { item.detail["bytes"].flatMap { Int64($0) } ?? 0 }
 
     private static func items(

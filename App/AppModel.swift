@@ -44,7 +44,11 @@ final class AppModel {
     var explaining: Item?
     /// The main window is on screen.
     var windowVisible = false {
-        didSet { if windowVisible != oldValue { wakeRefreshLoop() } }
+        didSet {
+            guard windowVisible != oldValue else { return }
+            wakeRefreshLoop()
+            if windowVisible { Task { await worktrees.windowOpened() } }
+        }
     }
     /// The menu bar popover is on screen.
     var popoverVisible = false {
@@ -58,6 +62,8 @@ final class AppModel {
     /// nothing else may start one meanwhile, and no "Nothing idle" toast covers the real one.
     private(set) var cleanIdleInFlight = false
     private(set) var keepList = KeepList(defaults: .standard)
+    /// Stale git worktrees: scanned and cleaned on their own, never part of the main Clean up.
+    let worktrees = WorktreesModel()
     var useAI: Bool {
         didSet {
             UserDefaults.standard.set(useAI, forKey: Self.useAIKey)
@@ -132,6 +138,7 @@ final class AppModel {
     /// Starts the single refresh loop (idempotent): every 5 s while visible, every 60 s otherwise.
     func start() {
         guard loop == nil else { return }
+        worktrees.start()
         startSnapshotSharing()
         startIntegrations()
         loop = Task { [weak self] in

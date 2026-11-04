@@ -134,3 +134,88 @@ import Testing
         #expect(back == t)
     }
 }
+
+@Suite struct WorktreeRecheckTests {
+    private func makeHome() throws -> URL {
+        let raw = FileManager.default.temporaryDirectory.appendingPathComponent("wr-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: raw, withIntermediateDirectories: true)
+        return URL(fileURLWithPath: String(cString: realpath(raw.path, nil)))
+    }
+
+    private func age(_ path: String, days: Double = 3) {
+        let past = Date().addingTimeInterval(-days * 86_400)
+        let fm = FileManager.default
+        var paths = [path]
+        if let e = fm.enumerator(atPath: path) { for case let rel as String in e { paths.append(path + "/" + rel) } }
+        for p in paths { try? fm.setAttributes([.modificationDate: past], ofItemAtPath: p) }
+    }
+
+    private func scan(_ s: WorktreeScanner) async -> WorktreeSnapshot? {
+        await s.scan(processes: [:], ownPID: 1, includeProtected: false, trashed: [], now: Date())
+    }
+
+    @Test func worktreeThatBecomesDirtyIsKept() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let repo = try TempRepo.make(in: home.appendingPathComponent("Projects").path, name: "app")
+        let wt = repo.addWorktree("app-wt", branch: "feat/wt")
+        age(wt)
+        let scanner = WorktreeScanner(home: home)
+        let item = try #require(await scan(scanner)?.items.first)
+        #expect(item.judgement.verdict == .idle)
+        try "wip\n".write(toFile: wt + "/wip.txt", atomically: true, encoding: .utf8)
+        age(wt)
+        let j = await scanner.recheck(item, processes: [:], ownPID: 1, now: Date())
+        #expect(j.verdict != .idle)
+    }
+
+    @Test func deepFileWrittenAfterCachedScanIsCaught() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let repo = try TempRepo.make(in: home.appendingPathComponent("Projects").path, name: "app")
+        try FileManager.default.createDirectory(atPath: repo.root + "/a/b/c", withIntermediateDirectories: true)
+        repo.commit(".gitignore", "*.log\n", on: nil)
+        repo.commit("a/b/c/deep.txt", "x", on: nil)
+        let wt = repo.addWorktree("app-wt", branch: "feat/wt")
+        age(wt)
+        let scanner = WorktreeScanner(home: home)
+        let item = try #require(await scan(scanner)?.items.first)
+        #expect(item.judgement.verdict == .idle)
+        // A git-ignored file deep down leaves git clean; only a fresh measure can see it.
+        try "later".write(toFile: wt + "/a/b/c/build.log", atomically: true, encoding: .utf8)
+        let j = await scanner.recheck(item, processes: [:], ownPID: 1, now: Date())
+        #expect(j.verdict != .idle)
+        #expect(j.fact.contains("changed"))
+        #expect(j.fact.contains("ago"))
+    }
+
+    @Test func missingWorktreeCannotBeChecked() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let repo = try TempRepo.make(in: home.appendingPathComponent("Projects").path, name: "app")
+        let wt = repo.addWorktree("app-wt", branch: "feat/wt")
+        age(wt)
+        let scanner = WorktreeScanner(home: home)
+        let item = try #require(await scan(scanner)?.items.first)
+        _ = repo.run("worktree", "remove", "--force", wt)
+        let j = await scanner.recheck(item, processes: [:], ownPID: 1, now: Date())
+        #expect(j.verdict != .idle)
+        #expect(j.fact == "can't check it again")
+    }
+
+    @Test func leftoverFolderThatGainsAFileIsKept() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let folder = home.appendingPathComponent(".codex/worktrees/a1")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let scanner = WorktreeScanner(home: home)
+        let item = try #require(await scan(scanner)?.items.first)
+        #expect(await scanner.recheck(item, processes: [:], ownPID: 1, now: Date()).verdict == .idle)
+        // A leftover is under 1 MB; a real checkout's worth of files is not.
+        try String(repeating: "x", count: 2_000_000).write(
+            to: folder.appendingPathComponent("notes.txt"), atomically: true, encoding: .utf8)
+        let j = await scanner.recheck(item, processes: [:], ownPID: 1, now: Date())
+        #expect(j.verdict != .idle)
+        #expect(j.fact == "no longer empty")
+    }
+}

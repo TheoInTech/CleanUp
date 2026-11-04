@@ -145,10 +145,10 @@ public enum WorktreeAgent {
 }
 
 public enum Bytes {
-    /// "208.3 GB", or "<0.1 GB" for anything under 0.05 GB.
+    /// "208.3 GB", or "<0.1 GB" for anything under 0.1 GB.
     public static func gb(_ bytes: Int64) -> String {
         let value = Double(bytes) / 1_000_000_000
-        if value < 0.05 { return "<0.1 GB" }
+        if value < 0.1 { return "<0.1 GB" }
         return String(format: "%.1f GB", value)
     }
 }

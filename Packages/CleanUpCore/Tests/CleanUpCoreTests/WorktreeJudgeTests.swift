@@ -37,5 +37,6 @@ struct WorktreeJudgeTests {
         #expect(WorktreeAgent.label(path: "/Users/u/p/app-fix", branch: "codex/fix") == "Codex")
         #expect(WorktreeAgent.label(path: "/Users/u/p/app-fix", branch: "fix/thing") == nil)
     }
+    @Test func gigabytesBoundary() { #expect(Bytes.gb(70_000_000) == "<0.1 GB"); #expect(Bytes.gb(100_000_000) == "0.1 GB") }
     @Test func gigabytes() { #expect(Bytes.gb(208_300_000_000) == "208.3 GB"); #expect(Bytes.gb(40_000_000) == "<0.1 GB") }
 }

@@ -149,7 +149,7 @@ struct MenuBarPopover: View {
             } label: {
                 HStack(spacing: 6) {
                     StorageBar(
-                        safe: worktrees.safeBytes, kept: worktrees.keptBytes, trashed: worktrees.trashedBytes,
+                        safe: model.worktrees.safeBytes, kept: model.worktrees.keptBytes, trashed: worktrees.trashedBytes,
                         compact: true)
                     Image(systemName: "chevron.right")
                         .font(.caption2.weight(.semibold))

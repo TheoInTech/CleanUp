@@ -126,7 +126,7 @@ struct MainView: View {
                 model.expanded.insert(.worktrees)
                 model.worktrees.reveal()
             } label: {
-                StorageBar(safe: worktrees.safeBytes, kept: worktrees.keptBytes, trashed: worktrees.trashedBytes)
+                StorageBar(safe: model.worktrees.safeBytes, kept: model.worktrees.keptBytes, trashed: worktrees.trashedBytes)
                     .frame(maxWidth: 280)
                     .contentShape(Rectangle())
             }

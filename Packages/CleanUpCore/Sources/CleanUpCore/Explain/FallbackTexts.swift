@@ -25,9 +25,12 @@ public enum FallbackTexts {
                 "The page reloads when you open it again, and anything typed into it can be lost."
             )
         case .worktrees:
+            // What removing it would lose, only for one CleanUp would remove; a kept one says why it stays.
             return (
                 "A second checkout of your project that an agent made for one task.",
-                "Nothing in git. Files git ignores, like `.env`, go to the Trash with it."
+                item.judgement.verdict == .idle
+                    ? "Nothing in git. Files git ignores, like `.env`, go to the Trash with it."
+                    : "CleanUp won't remove it: \(item.judgement.fact)"
             )
         case .restart:
             return (

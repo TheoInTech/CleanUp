@@ -23,9 +23,13 @@ struct ExplainSheet: View {
     private var color: Color { Palette.color(item.category) }
     /// Worktrees are removed, not stopped, and only by their own Clean up: no Stop, no "Stop anyway".
     private var isWorktree: Bool { item.category == .worktrees }
+    /// A worktree CleanUp would remove: judged safe and not always kept.
+    private var worktreeSafe: Bool { model.worktrees.isSafe(item) }
+    /// Why a kept worktree stays: its fact, or "always kept" for one on the Keep list.
+    private var keptReason: String { verdict == .idle ? "always kept" : item.judgement.fact }
 
     private var signalsTitle: String {
-        if isWorktree { return verdict == .idle ? "Why it's safe to remove" : "Why it's kept" }
+        if isWorktree { return worktreeSafe ? "Why it's safe to remove" : "Why it's kept" }
         return switch verdict {
         case .idle: "Why we think it's idle"
         case .inUse: "Why we think it's in use"
@@ -34,7 +38,7 @@ struct ExplainSheet: View {
     }
 
     private var safety: (text: String, color: Color) {
-        if isWorktree { return verdict == .idle ? ("✓ Safe", Palette.green) : ("⚠︎ Kept", Palette.orange) }
+        if isWorktree { return worktreeSafe ? ("✓ Safe", Palette.green) : ("⚠︎ Kept", Palette.orange) }
         return switch verdict {
         case .idle: ("✓ Safe", Palette.green)
         case .inUse: ("⚠︎ Probably being used", Palette.orange)
@@ -95,7 +99,7 @@ struct ExplainSheet: View {
                         .padding(.vertical, 5)
                         .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(safety.color.opacity(0.16)))
                     if let explanation {
-                        Text(styled(explanation.whatYouLose))
+                        Text(loseText(explanation))
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -121,6 +125,14 @@ struct ExplainSheet: View {
         .task(id: original.id) {
             explanation = await model.explain(original)
         }
+    }
+
+    /// What removing it would lose, only for a worktree CleanUp would remove; a kept one says why it stays.
+    private func loseText(_ explanation: Explanation) -> AttributedString {
+        guard isWorktree else { return AttributedString(explanation.whatYouLose) }
+        return worktreeSafe
+            ? styled(explanation.whatYouLose)
+            : AttributedString("CleanUp won't remove it: \(keptReason)")
     }
 
     /// Worktree texts are fixed and mark file names as code ("like `.env`"); the model's text stays plain.
@@ -165,7 +177,7 @@ struct ExplainSheet: View {
             Text("Keep").frame(maxWidth: .infinity)
         }
         .buttonStyle(.glass)
-        if verdict == .idle {
+        if worktreeSafe {
             let ticked = worktrees.isTicked(item)
             Button {
                 worktrees.toggle(item)
@@ -175,7 +187,7 @@ struct ExplainSheet: View {
             }
             .buttonStyle(.glassProminent)
             .tint(color)
-            .disabled(model.keepList.contains(item.id))
+            .disabled(worktrees.isBusy)
         } else {
             Button { dismiss() } label: {
                 Text("OK").frame(maxWidth: .infinity)

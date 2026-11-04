@@ -43,10 +43,21 @@ public struct WorktreeSnapshot: Sendable {
 
     private static func bytes(_ item: Item) -> Int64 { item.detail["bytes"].flatMap { Int64($0) } ?? 0 }
 
-    /// Bytes in worktrees that are safe to remove (including leftover folders).
-    public var safeBytes: Int64 { items.filter { $0.judgement.verdict == .idle }.reduce(0) { $0 + Self.bytes($1) } }
-    /// Bytes in worktrees that are kept.
-    public var keptBytes: Int64 { items.filter { $0.judgement.verdict != .idle }.reduce(0) { $0 + Self.bytes($1) } }
+    /// Safe to remove: judged safe and not on the Keep list. Everything else is kept.
+    public static func isSafe(_ item: Item, keep: KeepList) -> Bool {
+        item.judgement.verdict == .idle && !keep.contains(item.id)
+    }
+
+    /// Bytes in worktrees that are safe to remove (including leftover folders), always-kept ones excluded.
+    public func safeBytes(keep: KeepList) -> Int64 {
+        items.filter { Self.isSafe($0, keep: keep) }.reduce(0) { $0 + Self.bytes($1) }
+    }
+    /// Bytes in worktrees that are kept, always-kept ones included.
+    public func keptBytes(keep: KeepList) -> Int64 {
+        items.filter { !Self.isSafe($0, keep: keep) }.reduce(0) { $0 + Self.bytes($1) }
+    }
+    public var safeBytes: Int64 { safeBytes(keep: .empty) }
+    public var keptBytes: Int64 { keptBytes(keep: .empty) }
     public var trashedBytes: Int64 { trashed.reduce(0) { $0 + $1.bytes } }
 }
 

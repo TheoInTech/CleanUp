@@ -249,6 +249,11 @@ import Testing
         let one = [moved[0]]
         #expect(WorktreeOutcome(moved: one, skipped: [], bytes: 0, permanent: false).title == "Moved 1 worktree to the Trash")
         #expect(WorktreeOutcome(moved: one, skipped: [], bytes: 0, permanent: true).title == "Removed 1 worktree")
+        // Leftover agent folders are not counted as worktrees.
+        let leftovers = Item.fixture(.worktreeLeftovers, category: .worktrees, name: "Leftover agent folders")
+        let mixed = WorktreeOutcome(moved: Array(moved.prefix(3)) + [leftovers], skipped: [], bytes: 0, permanent: false)
+        #expect(mixed.title == "Moved 3 worktrees and leftover folders to the Trash")
+        #expect(WorktreeOutcome(moved: [leftovers], skipped: [], bytes: 0, permanent: true).title == "Removed leftover folders")
     }
 
     // Rulings 1 and 2

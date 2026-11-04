@@ -46,7 +46,13 @@ public struct WorktreeSelection: Sendable, Equatable {
 
     /// The ticked items that may still be removed: safe, and not on the Keep list.
     public func items(in s: WorktreeSnapshot, keep: KeepList = .empty) -> [Item] {
-        s.items.filter { ticked.contains($0.id) && $0.judgement.verdict == .idle && !keep.contains($0.id) }
+        Self.items(withIDs: ticked, in: s, keep: keep)
+    }
+
+    /// Exactly the items the user confirmed, as they are in `s` now: an id that is gone, no longer safe,
+    /// or kept since is left out, and nothing else is ever added.
+    public static func items(withIDs ids: Set<ItemIdentity>, in s: WorktreeSnapshot, keep: KeepList) -> [Item] {
+        s.items.filter { ids.contains($0.id) && WorktreeSnapshot.isSafe($0, keep: keep) }
     }
 
     public func bytes(in s: WorktreeSnapshot, keep: KeepList = .empty) -> Int64 {

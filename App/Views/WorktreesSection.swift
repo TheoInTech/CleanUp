@@ -3,27 +3,26 @@ import SwiftUI
 
 /// The Worktrees category in the main window: a row like the others (tick, icon, "N of M ticked",
 /// GB instead of cores) that opens into its worktrees, each with a size bar. It has its own Clean up
-/// button and result card and never joins the main Clean up. What a cleanup moved to the Trash stays
-/// on the row, with Put back and Delete now, until it is deleted or put back.
+/// button and result (inside the same card) and never joins the main Clean up. What a cleanup moved to
+/// the Trash stays on the row, under the result, with Put back and Delete now.
 struct WorktreesSection: View {
     @Environment(AppModel.self) private var model
     let onExplain: (Item) -> Void
     /// The one question asked before anything is deleted for good.
     @State private var confirming: Confirmation?
 
+    /// What the dialog asks about, captured when the button was pressed: the dialog's count and the
+    /// removal both come from this same set, whatever a scan changes meanwhile.
     enum Confirmation: Equatable {
-        /// Clean up with "Remove worktrees permanently" on.
-        case cleanUp(count: Int)
-        case deleteNow([UUID])
+        /// Clean up with "Remove worktrees permanently" on when it was pressed.
+        case cleanUp(ids: Set<ItemIdentity>, phrase: String)
+        case deleteNow(ids: [UUID], phrase: String)
 
-        var count: Int {
+        var title: String {
             switch self {
-            case .cleanUp(let count): count
-            case .deleteNow(let ids): ids.count
+            case .cleanUp(_, let phrase), .deleteNow(_, let phrase): "Delete \(phrase) permanently?"
             }
         }
-
-        var title: String { "Delete \(count == 1 ? "1 worktree" : "\(count) worktrees") permanently?" }
     }
 
     private var worktrees: WorktreesModel { model.worktrees }
@@ -33,10 +32,6 @@ struct WorktreesSection: View {
             GlassEffectContainer(spacing: 8) {
                 VStack(spacing: 8) {
                     WorktreesCard(snapshot: snapshot, onExplain: onExplain, confirming: $confirming)
-                    if let outcome = worktrees.outcome {
-                        WorktreeOutcomeCard(outcome: outcome, confirming: $confirming)
-                            .transition(.move(edge: .top).combined(with: .opacity))
-                    }
                 }
             }
             .animation(.snappy, value: worktrees.outcome)
@@ -57,15 +52,16 @@ struct WorktreesSection: View {
 
     private func perform(_ confirmation: Confirmation) {
         switch confirmation {
-        case .cleanUp: Task { await worktrees.cleanUp() }
-        case .deleteNow(let ids): Task { await worktrees.deleteNow(ids) }
+        case .cleanUp(let ids, _): Task { await worktrees.cleanUp(ids: ids, permanent: true) }
+        case .deleteNow(let ids, _): Task { await worktrees.deleteNow(ids) }
         }
     }
 }
 
 // MARK: The row
 
-/// The glass card: header, the worktrees when open, the own button, and the "In the Trash" row.
+/// The glass card: header, the worktrees when open, the own button, the last result, and the
+/// "In the Trash" row. The result opens inside the card, clipped to it, so nothing slides over the rows.
 private struct WorktreesCard: View {
     @Environment(AppModel.self) private var model
     let snapshot: WorktreeSnapshot
@@ -76,12 +72,6 @@ private struct WorktreesCard: View {
     private var isExpanded: Bool { model.expanded.contains(.worktrees) }
     private var color: Color { Palette.indigo }
     private var subtitle: String { "\(worktrees.tickedItems.count) of \(snapshot.items.count) ticked" }
-    /// While the result card offers Undo and Delete now for the last move, the Trash row would repeat it.
-    private var showsTrash: Bool {
-        guard !snapshot.trashed.isEmpty else { return false }
-        if let outcome = worktrees.outcome, !outcome.permanent, !worktrees.lastMoved.isEmpty { return false }
-        return true
-    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -104,7 +94,16 @@ private struct WorktreesCard: View {
                 }
                 .transition(.itemsReveal)
             }
-            if showsTrash {
+            if let outcome = worktrees.outcome {
+                VStack(spacing: 0) {
+                    Divider().padding(.leading, 30)
+                    WorktreeOutcomeView(outcome: outcome, confirming: $confirming)
+                        .padding(.vertical, 10)
+                }
+                .transition(.itemsReveal)
+            }
+            // Always there while anything is in the Trash, so older entries stay reachable under a result.
+            if !snapshot.trashed.isEmpty {
                 Divider().padding(.leading, 30)
                 TrashRow(trashed: snapshot.trashed, confirming: $confirming)
             }
@@ -126,7 +125,7 @@ private struct WorktreesCard: View {
                     .contentShape(Circle())
             }
             .buttonStyle(.plain)
-            .disabled(!canTickAll)
+            .disabled(!canTickAll || worktrees.isBusy)
             .help(canTickAll ? "Tick the ones safe to remove" : "Nothing here is safe to remove")
             .accessibilityLabel("Tick worktrees safe to remove")
             .accessibilityAddTraits(state == .all ? .isSelected : [])
@@ -163,14 +162,16 @@ private struct WorktreesCard: View {
 
     /// "Clean up 3 worktrees · 14.2 GB": only what is ticked, never the main Clean up's items.
     private var cleanUpButton: some View {
-        let count = worktrees.tickedItems.count
-        let label = "Clean up \(count == 1 ? "1 worktree" : "\(count) worktrees")"
+        let phrase = WorktreeCount.phrase(worktrees.tickedItems)
+        let label = "Clean up \(phrase)"
         let size = Bytes.gb(worktrees.tickedBytes)
         return Button {
+            // What is ticked and how it goes are fixed now; a scan landing later can't add to it.
+            let ids = Set(worktrees.tickedItems.map(\.id))
             if worktrees.removePermanently {
-                confirming = .cleanUp(count: count)
+                confirming = .cleanUp(ids: ids, phrase: phrase)
             } else {
-                Task { await worktrees.cleanUp() }
+                Task { await worktrees.cleanUp(ids: ids, permanent: false) }
             }
         } label: {
             HStack(spacing: 4) {
@@ -212,20 +213,22 @@ private struct WorktreeRow: View {
     static func bytes(_ item: Item) -> Int64 { item.detail["bytes"].flatMap { Int64($0) } ?? 0 }
 
     private var color: Color { Palette.indigo }
-    private var safe: Bool { item.judgement.verdict == .idle }
-    private var tickable: Bool { safe && !model.keepList.contains(item.id) }
+    /// Safe to remove, with the Keep list: an always-kept one is kept, gray and dimmed like the others.
+    private var safe: Bool { model.worktrees.isSafe(item) }
     private var ticked: Bool { model.worktrees.isTicked(item) }
+    /// Kept rows are dimmed like ItemRow's in-use tick; the "?" stays bright so the reason is easy to find.
+    private var dim: Double { safe ? 1 : 0.4 }
 
     var body: some View {
         HStack(spacing: 10) {
             Button { model.worktrees.toggle(item) } label: {
                 TickCircle(state: ticked ? .all : .none, color: color)
-                    .opacity(tickable ? 1 : 0.4)
+                    .opacity(dim)
                     .contentShape(Circle())
             }
             .buttonStyle(.plain)
-            .disabled(!tickable)
-            .help(tickable ? "" : "Kept: \(item.judgement.fact)")
+            .disabled(!safe || model.worktrees.isBusy)
+            .help(safe ? "" : "Kept: \(keptReason)")
             .accessibilityLabel("Tick \(item.name)")
             .accessibilityAddTraits(ticked ? .isSelected : [])
 
@@ -246,14 +249,15 @@ private struct WorktreeRow: View {
                 .font(.callout)
                 SizeBar(bytes: Self.bytes(item), largest: largest, safe: safe)
                     .padding(.vertical, 1)
-                if !item.judgement.fact.isEmpty {
-                    Text(item.judgement.fact)
+                if !keptReason.isEmpty {
+                    Text(keptReason)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            .opacity(dim)
             .help(item.detail["path"] ?? "")
 
             // A fixed column, so every size bar ends at the same place.
@@ -263,6 +267,7 @@ private struct WorktreeRow: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .frame(width: 58, alignment: .trailing)
+                .opacity(dim)
 
             Button(action: onExplain) {
                 Image(systemName: "questionmark")
@@ -277,6 +282,11 @@ private struct WorktreeRow: View {
             .accessibilityLabel("What is \(item.name)?")
         }
         .padding(.vertical, 7)
+    }
+
+    /// The fact, or "always kept" for one on the Keep list that would otherwise be safe.
+    private var keptReason: String {
+        item.judgement.verdict == .idle && !safe ? "always kept" : item.judgement.fact
     }
 }
 
@@ -297,15 +307,18 @@ private struct TrashRow: View {
                     Text("In the Trash · \(Bytes.gb(bytes))")
                         .font(.callout)
                         .lineLimit(1)
-                    Text(trashed.count == 1 ? "1 worktree · not freed yet" : "\(trashed.count) worktrees · not freed yet")
+                    Text("\(WorktreeCount.phrase(trashed)) · not freed yet")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 // Plain text actions: glass buttons on the glass card would stack glass on glass.
                 textButton("Put back", color: Palette.blue) { Task { await model.worktrees.putBack(trashed.map(\.id)) } }
-                textButton("Delete now", color: Palette.red) { confirming = .deleteNow(trashed.map(\.id)) }
+                textButton("Delete now", color: Palette.red) {
+                    confirming = .deleteNow(ids: trashed.map(\.id), phrase: WorktreeCount.phrase(trashed))
+                }
             }
             // What the last put back or delete couldn't do; those entries stay until they can be.
             if let failure = model.worktrees.failure {
@@ -319,6 +332,7 @@ private struct TrashRow: View {
         .disabled(model.worktrees.isBusy)
         .padding(.vertical, 7)
     }
+
     private func textButton(_ title: String, color: Color, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
@@ -333,11 +347,11 @@ private struct TrashRow: View {
     }
 }
 
-// MARK: Result card
+// MARK: Result
 
 /// What the worktrees' own Clean up did: "Moved 3 worktrees to the Trash", each worktree, Undo, and
-/// "Delete now · frees 12.5 GB" to free the space for good.
-private struct WorktreeOutcomeCard: View {
+/// "Delete now · frees 12.5 GB" to free the space for good. Drawn inside the Worktrees card.
+private struct WorktreeOutcomeView: View {
     @Environment(AppModel.self) private var model
     let outcome: WorktreeOutcome
     @Binding var confirming: WorktreesSection.Confirmation?
@@ -374,10 +388,16 @@ private struct WorktreeOutcomeCard: View {
                 }
                 Spacer(minLength: 6)
                 if inTrash {
-                    Button("Undo") { Task { await worktrees.undoLast() } }
-                        .buttonStyle(.glass)
-                        .controlSize(.small)
-                        .disabled(worktrees.isBusy)
+                    // Plain text, like the Trash row's actions: no glass on the card's glass.
+                    Button { Task { await worktrees.undoLast() } } label: {
+                        Text("Undo")
+                            .font(.callout.weight(.medium))
+                            .foregroundStyle(Palette.blue)
+                            .padding(4)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(worktrees.isBusy)
                 }
                 Button { worktrees.dismissOutcome() } label: {
                     Image(systemName: "xmark")
@@ -404,20 +424,26 @@ private struct WorktreeOutcomeCard: View {
             }
 
             if inTrash {
-                Button { confirming = .deleteNow(worktrees.lastMoved) } label: {
+                Button {
+                    let ids = worktrees.lastMoved
+                    let moved = Set(ids)
+                    let entries = (worktrees.snapshot?.trashed ?? []).filter { moved.contains($0.id) }
+                    confirming = .deleteNow(
+                        ids: ids, phrase: entries.isEmpty ? WorktreeCount.phrase(outcome.moved) : WorktreeCount.phrase(entries))
+                } label: {
                     Text("Delete now · frees \(Bytes.gb(freed))")
                         .font(.callout.weight(.semibold))
                         .frame(maxWidth: .infinity)
+                        .padding(.vertical, 2)
                 }
-                .buttonStyle(.glass)
+                // Like the "?" sheet's "Stop anyway": prominent and red, and it still asks first.
+                .buttonStyle(.glassProminent)
                 .tint(Palette.red)
                 .controlSize(.large)
                 .disabled(worktrees.isBusy)
                 .padding(.top, 2)
             }
         }
-        .padding(12)
-        .glassEffect(.regular, in: .rect(cornerRadius: 16))
     }
 
     /// One worktree: icon, name, and a green "Moved" (or "Removed") or the reason it was kept.

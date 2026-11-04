@@ -23,7 +23,7 @@ enum DebugSnapshot {
             NSApp.appearance = NSAppearance(named: .darkAqua)
         }
         let fixture = WorktreeFixture()
-        model.worktrees.debugShow(fixture.before)
+        model.worktrees.debugShow(fixture.before, alwaysKept: fixture.alwaysKept)
         while !model.hasScanned { await pause(0.5) }
         // The first scan has no CPU deltas yet; wait for the next one.
         await pause(7)
@@ -98,12 +98,16 @@ enum DebugSnapshot {
         capture("main-worktrees", into: dir)
         await captureSection(model, into: dir, name: "worktrees-open")
 
-        worktrees.debugShow(fixture.after, outcome: fixture.outcome, lastMoved: fixture.moved)
+        worktrees.debugShow(fixture.after, outcome: fixture.outcome, lastMoved: fixture.moved, alwaysKept: fixture.alwaysKept)
         await pause(1)
         await captureSection(model, into: dir, name: "worktrees-outcome")
-
         model.expanded.remove(.worktrees)
-        worktrees.debugShow(fixture.after, failure: "1 couldn't be put back · find it in the Trash")
+        worktrees.reveal()
+        await pause(1.5)
+        capture("main-worktrees-outcome", into: dir)
+
+        worktrees.debugShow(
+            fixture.after, failure: "1 couldn't be put back · find it in the Trash", alwaysKept: fixture.alwaysKept)
         await pause(1)
         await captureSection(model, into: dir, name: "worktrees-trash")
         worktrees.reveal()
@@ -111,19 +115,27 @@ enum DebugSnapshot {
         capture("main-worktrees-trash", into: dir)
 
         model.explaining = fixture.keptItem
-        await pause(10)   // the explainer gives up on the model after 8 s
+        await pause(3)
         capture("worktrees-explain", into: dir)
         model.explaining = nil
         await pause(1)
+        // The same sheets on their own: a kept worktree, an always-kept one and a safe one.
+        await captureHosted(ExplainSheet(item: fixture.keptItem), model, into: dir, name: "worktrees-explain-kept")
+        await captureHosted(ExplainSheet(item: fixture.alwaysKeptItem), model, into: dir, name: "worktrees-explain-always-kept")
+        await captureHosted(ExplainSheet(item: fixture.safeItem), model, into: dir, name: "worktrees-explain-safe")
 
-        worktrees.debugShow(fixture.before)
+        worktrees.debugShow(fixture.before, alwaysKept: fixture.alwaysKept)
     }
 
     /// The Worktrees section alone, on the window's background, at the window's content width.
     private static func captureSection(_ model: AppModel, into dir: URL, name: String) async {
-        let content = WorktreesSection { _ in }
-            .padding(16)
-            .frame(width: 420)
+        await captureHosted(WorktreesSection { _ in }.padding(16).frame(width: 420), model, into: dir, name: name)
+    }
+
+    /// A view in its own small window, on the window's background. Tall glass in the main window or a
+    /// sheet sometimes captures as an empty hole; a small hosted window captures reliably.
+    private static func captureHosted(_ view: some View, _ model: AppModel, into dir: URL, name: String) async {
+        let content = view
             .background(Color(nsColor: .windowBackgroundColor))
             .environment(model)
         let host = NSHostingView(rootView: content)
@@ -218,6 +230,10 @@ private struct WorktreeFixture {
     /// The Trash records the fixture cleanup made.
     let moved: [UUID]
     let keptItem: Item
+    /// On the fixture's own Keep list: safe by its facts, but always kept.
+    let alwaysKept: Set<ItemIdentity>
+    let alwaysKeptItem: Item
+    let safeItem: Item
 
     init(now: Date = Date()) {
         let day: TimeInterval = 86_400
@@ -249,6 +265,7 @@ private struct WorktreeFixture {
             "fix-login-crash", repo: "atlas", gb: gb(4.1), agent: "Claude Code", merge: .squash, committed: 2 * day)
         let dashboard = worktree("dashboard", repo: "studio", gb: gb(1.8), agent: nil, processes: ["node"])
         let refactor = worktree("refactor-api", repo: "studio", gb: gb(1.7), agent: nil, committed: 21 * day)
+        let notes = worktree("release-notes", repo: "studio", gb: gb(0.9), agent: nil, committed: 4 * day)
         let spike = worktree("spike-search", repo: "studio", gb: gb(0.4), agent: "Codex", changed: nil)
         let leftovers = Item(
             id: .worktreeLeftovers, category: .worktrees, name: "Leftover agent folders",
@@ -268,7 +285,8 @@ private struct WorktreeFixture {
             trashed(worktree("old-experiment", repo: "atlas", gb: gb(2.3), agent: "Codex"), daysAgo: 2),
             trashed(worktree("docs-refresh", repo: "studio", gb: gb(0.8), agent: nil), daysAgo: 1),
         ]
-        let items = [onboarding, payments, login, dashboard, refactor, spike, leftovers]
+        let items = [onboarding, payments, login, dashboard, refactor, notes, spike, leftovers]
+        alwaysKept = [notes.id]
         before = WorktreeSnapshot(date: now, items: items, trashed: older)
 
         let movedItems = [onboarding, login, leftovers]
@@ -280,6 +298,8 @@ private struct WorktreeFixture {
             moved: movedItems, skipped: [(refactor, "changed 4 min ago")],
             bytes: fresh.reduce(0) { $0 + $1.bytes }, permanent: false)
         keptItem = payments
+        alwaysKeptItem = notes
+        safeItem = login
     }
 }
 #endif

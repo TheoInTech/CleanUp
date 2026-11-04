@@ -126,6 +126,12 @@ struct ExplainerTests {
         #expect(e.whatIsIt == "A second checkout of your project that an agent made for one task.")
         #expect(e.whatYouLose == "Nothing in git. Files git ignores, like `.env`, go to the Trash with it.")
         #expect(e.byAI == false)
+        // A kept one never says what removing it would lose: CleanUp won't remove it, and says why.
+        let kept = Item(
+            id: .worktree(path: "/r/k"), category: .worktrees, name: "k", symbol: "circle",
+            judgement: Judgement(verdict: .inUse, fact: "3 uncommitted changes", signals: []),
+            cores: 0, memoryBytes: 0, processes: [], detail: [:])
+        #expect(await explainer.explain(kept).whatYouLose == "CleanUp won't remove it: 3 uncommitted changes")
     }
 
     @Test func generatorErrorFallsBackAndIsNotCached() async {

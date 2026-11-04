@@ -11,13 +11,7 @@ struct StorageBar: View {
     let trashed: Int64
     var compact = false
 
-    static func caption(safe: Int64, kept: Int64, trashed: Int64) -> String {
-        var text = "\(Bytes.gb(safe)) safe to remove · \(Bytes.gb(kept)) kept"
-        if trashed > 0 { text += " · \(Bytes.gb(trashed)) in the Trash" }
-        return text
-    }
-
-    private var caption: String { Self.caption(safe: safe, kept: kept, trashed: trashed) }
+    private var caption: String { WorktreeStorageCaption.text(safe: safe, kept: kept, trashed: trashed) }
 
     var body: some View {
         Group {

@@ -22,11 +22,23 @@ final class WorktreesModel {
     var quickSelect = true {
         didSet {
             guard quickSelect != oldValue, let snapshot else { return }
-            selection.setMode(quick: quickSelect, in: snapshot, keep: keepList())
+            selection.setMode(quick: quickSelect, in: snapshot, keep: currentKeep())
         }
     }
     /// Reads the app's live Keep list, so a Keep added after launch counts straight away.
     @ObservationIgnored private let keepList: @MainActor () -> KeepList
+
+    /// The Keep list every check uses: the app's, or in debug renders the fixture's own (never saved).
+    private func currentKeep() -> KeepList {
+        #if DEBUG
+        if Self.isFixtureMode {
+            var keep = KeepList.empty
+            for id in debugKept { keep.add(id, name: id.rawValue) }
+            return keep
+        }
+        #endif
+        return keepList()
+    }
     /// An action (clean up, undo, put back, delete) is under way; nothing else may start or scan meanwhile.
     private(set) var isBusy = false
     /// What the last put back or delete couldn't do, as one line for the Trash row
@@ -99,7 +111,7 @@ final class WorktreesModel {
                 processes: table, ownPID: ProcessInfo.processInfo.processIdentifier,
                 includeProtected: includeProtected, trashed: entries, now: Date())
             snapshot = fresh
-            if let fresh { selection.apply(fresh, keep: keepList(), quick: quickSelect) } else { selection = WorktreeSelection() }
+            if let fresh { selection.apply(fresh, keep: currentKeep(), quick: quickSelect) } else { selection = WorktreeSelection() }
         } while scanRequestedWhileScanning
     }
 
@@ -109,14 +121,17 @@ final class WorktreesModel {
 
     // MARK: Actions
 
-    /// Removes the ticked worktrees, each looked at again first. Asks nothing: the permanent-mode dialog is the UI's.
-    func cleanUp() async {
-        guard !isBusy, snapshot != nil, !Self.actionsBlocked else { return }
+    /// Removes exactly `ids`, the worktrees ticked when the button was pressed, the way `permanent` said
+    /// then (the permanent-mode dialog is the UI's, and confirmed this same set). A scan that lands
+    /// meanwhile can only take items away: one that is gone, no longer safe or kept since is skipped,
+    /// and each one left is looked at again first.
+    func cleanUp(ids: Set<ItemIdentity>, permanent: Bool) async {
+        guard !isBusy, !ids.isEmpty, snapshot != nil, !Self.actionsBlocked else { return }
         isBusy = true
         failure = nil
         await scanSettled()
-        // Read after any scan in flight lands, so the list is the current one, minus anything kept since.
-        guard let snapshot, case let items = selection.items(in: snapshot, keep: keepList()), !items.isEmpty else {
+        guard let snapshot, case let items = WorktreeSelection.items(withIDs: ids, in: snapshot, keep: currentKeep()),
+              !items.isEmpty else {
             isBusy = false
             return
         }
@@ -124,7 +139,7 @@ final class WorktreesModel {
         let pid = ProcessInfo.processInfo.processIdentifier
         let scanner = self.scanner
         let recheck: WorktreeTrash.Recheck = { await scanner.recheck($0, processes: table, ownPID: pid, now: Date()) }
-        if removePermanently {
+        if permanent {
             outcome = await trash.removePermanently(items, recheck: recheck)
             lastMoved = []
         } else {
@@ -196,27 +211,38 @@ final class WorktreesModel {
         await refresh(force: true)
     }
 
-    func toggle(_ item: Item) { selection.toggle(item) }
+    /// Ticks stay as they are while an action runs.
+    func toggle(_ item: Item) {
+        guard !isBusy else { return }
+        selection.toggle(item)
+    }
 
     // MARK: For the views
 
     /// What the own button would remove: ticked, safe, and not on the Keep list.
     var tickedItems: [Item] {
         guard let snapshot else { return [] }
-        return selection.items(in: snapshot, keep: keepList())
+        return selection.items(in: snapshot, keep: currentKeep())
     }
 
     var tickedBytes: Int64 {
         guard let snapshot else { return 0 }
-        return selection.bytes(in: snapshot, keep: keepList())
+        return selection.bytes(in: snapshot, keep: currentKeep())
     }
 
     /// Items that may be ticked at all: safe to remove and not always kept.
     var tickableItems: [Item] {
         guard let snapshot else { return [] }
-        let keep = keepList()
-        return snapshot.items.filter { $0.judgement.verdict == .idle && !keep.contains($0.id) }
+        let keep = currentKeep()
+        return snapshot.items.filter { WorktreeSnapshot.isSafe($0, keep: keep) }
     }
+
+    /// Safe to remove right now: judged safe and not always kept. Always-kept ones count as kept.
+    func isSafe(_ item: Item) -> Bool { WorktreeSnapshot.isSafe(item, keep: currentKeep()) }
+
+    /// Storage split with the live Keep list, for the storage bar and the popover line.
+    var safeBytes: Int64 { snapshot?.safeBytes(keep: currentKeep()) ?? 0 }
+    var keptBytes: Int64 { snapshot?.keptBytes(keep: currentKeep()) ?? 0 }
 
     func isTicked(_ item: Item) -> Bool { tickedItems.contains { $0.id == item.id } }
 
@@ -229,6 +255,7 @@ final class WorktreesModel {
 
     /// Ticks every tickable item, or clears them all when they already are.
     func toggleAll() {
+        guard !isBusy else { return }
         if tickState == .all { selection.ticked = [] } else { selection.ticked.formUnion(tickableItems.map(\.id)) }
     }
 
@@ -260,17 +287,22 @@ final class WorktreesModel {
     }
 
     #if DEBUG
+    /// The fixture's "always kept" worktrees, kept apart from the owner's real Keep list.
+    private var debugKept: Set<ItemIdentity> = []
+
     static var isFixtureMode: Bool { UserDefaults.standard.string(forKey: "debugSnapshotDir") != nil }
 
     /// Shows a made-up snapshot, result and failure line. Only in fixture mode, so it can never mix
     /// with a real scan.
     func debugShow(
-        _ fixture: WorktreeSnapshot, outcome: WorktreeOutcome? = nil, lastMoved: [UUID] = [], failure: String? = nil
+        _ fixture: WorktreeSnapshot, outcome: WorktreeOutcome? = nil, lastMoved: [UUID] = [], failure: String? = nil,
+        alwaysKept: Set<ItemIdentity> = []
     ) {
         guard Self.isFixtureMode else { return }
+        debugKept = alwaysKept
         snapshot = fixture
         selection = WorktreeSelection()
-        selection.apply(fixture, keep: keepList(), quick: quickSelect)
+        selection.apply(fixture, keep: currentKeep(), quick: quickSelect)
         self.outcome = outcome
         self.lastMoved = lastMoved
         self.failure = failure

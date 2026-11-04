@@ -13,10 +13,13 @@ public struct TrashedWorktree: Codable, Sendable, Equatable {
     /// Lets later steps tell that the name has since been reused by something else.
     public var fileID: UInt64?
     public var device: Int64?
+    /// Where git's record lived before it was moved to the store (`<repo>/.git/worktrees/<name>`); nil in
+    /// older records and for leftover folders.
+    public var gitDir: String?
 
     public init(
         id: UUID, path: String, repo: String?, storedAdmin: String?, trashURL: String, bytes: Int64, date: Date,
-        fileID: UInt64? = nil, device: Int64? = nil
+        fileID: UInt64? = nil, device: Int64? = nil, gitDir: String? = nil
     ) {
         self.id = id
         self.path = path
@@ -27,6 +30,7 @@ public struct TrashedWorktree: Codable, Sendable, Equatable {
         self.date = date
         self.fileID = fileID
         self.device = device
+        self.gitDir = gitDir
     }
 }
 

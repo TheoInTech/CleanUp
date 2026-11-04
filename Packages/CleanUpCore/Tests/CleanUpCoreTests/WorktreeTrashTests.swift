@@ -505,4 +505,94 @@ import Testing
         #expect(exists(e.storedAdmin!))
         #expect(!listed(env, wt))
     }
+    // A new worktree at the old path
+
+    /// Trashes `wa`, then has git make a new worktree at the same path. Git's record for the new one lands
+    /// where ours came from (`.git/worktrees/wa`), since ours is in the store.
+    private func trashThenRecreate(_ env: Env) async throws -> (path: String, entry: TrashedWorktree) {
+        let (wt, e) = try await trashOne(env)
+        env.repo.run("worktree", "add", "-b", "feat/again", wt)
+        #expect(listed(env, wt))
+        #expect(exists(env.repo.root + "/.git/worktrees/wa"))
+        return (wt, e)
+    }
+
+    private func newWorktreeIsUntouched(_ env: Env, _ wt: String) {
+        #expect(listed(env, wt))
+        #expect(exists(wt + "/a.txt"))
+        #expect(exists(env.repo.root + "/.git/worktrees/wa"))
+        #expect(env.repo.git(in: wt, ["branch", "--show-current"]) == "feat/again")
+        #expect(env.repo.git(in: wt, ["status", "--porcelain"]) == "")
+    }
+
+    @Test func deleteNowClearsAnEntryWhosePathHoldsANewWorktree() async throws {
+        let env = try makeEnv(); defer { cleanup(env) }
+        let (wt, e) = try await trashThenRecreate(env)
+        await env.trash.deleteNow([e.id])
+        #expect(await env.trash.entries.isEmpty)
+        #expect(!exists(e.trashURL))
+        #expect(!exists(e.storedAdmin!))
+        newWorktreeIsUntouched(env, wt)
+    }
+
+    @Test func deleteNowClearsAnEmptiedEntryWhosePathHoldsANewWorktree() async throws {
+        let env = try makeEnv(); defer { cleanup(env) }
+        let (wt, e) = try await trashThenRecreate(env)
+        try FileManager.default.removeItem(atPath: e.trashURL)
+        await env.trash.deleteNow([e.id])
+        #expect(await env.trash.entries.isEmpty)
+        #expect(!exists(e.storedAdmin!))
+        newWorktreeIsUntouched(env, wt)
+    }
+
+    @Test func reconcileDropsAnEmptiedEntryWhosePathHoldsANewWorktree() async throws {
+        let env = try makeEnv(); defer { cleanup(env) }
+        let (wt, e) = try await trashThenRecreate(env)
+        try FileManager.default.removeItem(atPath: e.trashURL)
+        await env.trash.reconcile()
+        #expect(await env.trash.entries.isEmpty)
+        #expect(!exists(e.storedAdmin!))
+        newWorktreeIsUntouched(env, wt)
+    }
+
+    @Test func reconcileKeepsAnEntryWhosePathHoldsANewWorktreeWhileItIsInTheTrash() async throws {
+        let env = try makeEnv(); defer { cleanup(env) }
+        let (wt, e) = try await trashThenRecreate(env)
+        await env.trash.reconcile()
+        #expect(await env.trash.entries.count == 1)
+        #expect(exists(e.trashURL + "/a.txt"))
+        #expect(exists(e.storedAdmin!))
+        newWorktreeIsUntouched(env, wt)
+    }
+
+    @Test func folderPutBackByHandIsStillReconnected() async throws {
+        let env = try makeEnv(); defer { cleanup(env) }
+        let (wt, e) = try await trashOne(env)
+        try FileManager.default.moveItem(atPath: e.trashURL, toPath: wt)
+        // Its `.git` names the original record, and no live record is there.
+        #expect(!exists(env.repo.root + "/.git/worktrees/wa"))
+        await env.trash.deleteNow([e.id])
+        #expect(await env.trash.entries.count == 1)
+        #expect(exists(e.storedAdmin!))
+        await env.trash.reconcile()
+        #expect(await env.trash.entries.isEmpty)
+        #expect(listed(env, wt))
+        #expect(env.repo.git(in: wt, ["status", "--porcelain"]) == "")
+    }
+
+    @Test func liveRecordOfAWorktreeElsewhereDoesNotCount() async throws {
+        let env = try makeEnv(); defer { cleanup(env) }
+        let (wt, e) = try await trashOne(env)
+        try FileManager.default.moveItem(atPath: e.trashURL, toPath: wt)
+        // Another worktree called `wa`, somewhere else, takes the record name ours came from.
+        let elsewhere = env.base + "/elsewhere/wa"
+        env.repo.run("worktree", "add", "-b", "feat/elsewhere", elsewhere)
+        #expect(exists(env.repo.root + "/.git/worktrees/wa"))
+        await env.trash.deleteNow([e.id])
+        await env.trash.reconcile()
+        #expect(await env.trash.entries.count == 1)
+        #expect(exists(e.storedAdmin!))
+        #expect(exists(wt + "/a.txt"))
+        #expect(listed(env, elsewhere))
+    }
 }

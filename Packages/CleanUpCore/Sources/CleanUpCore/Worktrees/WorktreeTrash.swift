@@ -90,7 +90,7 @@ public actor WorktreeTrash {
         let identity = Self.identity(trashURL.path)
         entries.append(TrashedWorktree(
             id: id, path: path, repo: repo, storedAdmin: stored.path, trashURL: trashURL.path,
-            bytes: Self.bytes(item), date: Date(), fileID: identity?.0, device: identity?.1))
+            bytes: Self.bytes(item), date: Date(), fileID: identity?.0, device: identity?.1, gitDir: adminPath))
         save()
         return .success(())
     }
@@ -243,7 +243,7 @@ public actor WorktreeTrash {
                 // Already gone, unless the Trash itself is out of reach (an unplugged volume); and git's
                 // record may only go when the folder is gone from its path too.
                 guard Self.trashFolderIsReachable(e) else { continue }
-                if e.storedAdmin != nil, Self.kind(e.path) != .missing { continue }
+                if e.storedAdmin != nil, Self.kind(e.path) != .missing, !Self.pathHoldsNewWorktree(e) { continue }
             default:
                 // Only the exact recorded Trash entry, and only if it is still the item we trashed.
                 guard Self.isStillTheTrashedItem(e) else { continue }
@@ -279,6 +279,11 @@ public actor WorktreeTrash {
                 continue
             default:
                 guard let repo = e.repo, let stored = e.storedAdmin else { break }  // a leftover moved back by hand
+                if Self.pathHoldsNewWorktree(e) {
+                    // Ours is gone from the Trash and can never come back: its record goes too.
+                    do { try removeStoredAdmin(stored) } catch { continue }
+                    break
+                }
                 guard Self.kind(e.path) == .folder, Self.isDirectory(repo), Self.kind(stored) == .folder,
                       let dest = Self.adminDestination(gitFile: e.path + "/.git", repo: repo),
                       Self.kind(dest) == .missing else { continue }
@@ -385,6 +390,24 @@ public actor WorktreeTrash {
         }
         guard let now = identity(e.trashURL) else { return false }
         return now.0 == id && now.1 == dev
+    }
+
+    /// The folder at the entry's path is a different worktree, made after ours was trashed: git has a live
+    /// record where ours came from (ours is in the store, so that one is new), and it points at this path.
+    private static func pathHoldsNewWorktree(_ e: TrashedWorktree) -> Bool {
+        guard e.repo != nil, e.storedAdmin != nil, kind(e.path) == .folder, let original = originalGitDir(e),
+              kind(original) == .folder,
+              let back = firstLine(original + "/gitdir"), let backReal = real(back),
+              let mine = real(e.path + "/.git") else { return false }
+        return backReal == mine
+    }
+
+    /// Where git's record lived before we moved it: from the entry, or (older records) from the `.git` file
+    /// of the item still in the Trash.
+    private static func originalGitDir(_ e: TrashedWorktree) -> String? {
+        if let dir = e.gitDir { return dir }
+        guard let repo = e.repo, isStillTheTrashedItem(e) else { return nil }
+        return adminDestination(gitFile: e.trashURL + "/.git", repo: repo)
     }
 
     private static func isDirectory(_ path: String) -> Bool {

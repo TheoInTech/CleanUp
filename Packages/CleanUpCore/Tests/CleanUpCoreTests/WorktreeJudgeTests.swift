@@ -36,6 +36,10 @@ struct WorktreeJudgeTests {
         #expect(j.signals.contains { $0.kind == .inUse && $0.text == "Another worktree is inside it" })
         #expect(WorktreeJudge.judge(.fixture(), now: now).signals.contains { $0.kind == .idle && $0.text == "No other worktree inside it" })
     }
+    @Test func missingFolderKeeps() {
+        let j = WorktreeJudge.judge(.fixture(folderMissing: true), now: now)
+        #expect(j.verdict == .inUse); #expect(j.fact == "folder is missing")
+    }
     @Test func agentLabels() {
         #expect(WorktreeAgent.label(path: "/Users/u/.codex/worktrees/a/app", branch: nil) == "Codex")
         #expect(WorktreeAgent.label(path: "/Users/u/.cursor/worktrees/x/app", branch: nil) == "Cursor")

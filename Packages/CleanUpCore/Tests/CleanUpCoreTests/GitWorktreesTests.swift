@@ -175,4 +175,17 @@ import Testing
         #expect(writes.count == 2)
         #expect(writes.allSatisfy { !$0.contains("--no-optional-locks") })
     }
+    @Test func prunableWorktreeIsMissingAndGitNeverRunsInIt() async throws {
+        let calls = Calls()
+        let fake = GitWorktrees(run: { tool, args, _ in
+            calls.add([tool] + args)
+            return CommandResult(status: 0, stdout: "", stderr: "", timedOut: false)
+        })
+        let repo = FileManager.default.temporaryDirectory.path
+        let entry = GitWorktreeEntry(path: repo + "/gone-\(UUID().uuidString)", head: "abc", branch: "x", locked: false, prunable: true)
+        let f = await fake.facts(entry, repo: repo, processes: [:], ownPID: 1, lastChange: nil)
+        #expect(calls.args.isEmpty)
+        #expect(f.folderMissing)
+        #expect(WorktreeJudge.judge(f, now: Date()).fact == "folder is missing")
+    }
 }

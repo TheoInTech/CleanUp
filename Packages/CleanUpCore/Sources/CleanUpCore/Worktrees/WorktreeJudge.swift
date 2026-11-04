@@ -28,11 +28,13 @@ public struct WorktreeFacts: Sendable, Equatable {
     public var repoExists: Bool
     /// Another worktree lives somewhere inside this one (often in a git-ignored folder git doesn't report).
     public var holdsOtherCheckout: Bool
+    /// Git lists the worktree as prunable: its folder is gone.
+    public var folderMissing: Bool
 
     public init(
         path: String, repo: String, branch: String?, agent: String?, uncommitted: Int?, merge: MergeState,
         locked: Bool, processesInside: [String], lastChange: Date?, lastCommit: Date?, repoExists: Bool,
-        holdsOtherCheckout: Bool = false
+        holdsOtherCheckout: Bool = false, folderMissing: Bool = false
     ) {
         self.path = path
         self.repo = repo
@@ -46,6 +48,7 @@ public struct WorktreeFacts: Sendable, Equatable {
         self.lastCommit = lastCommit
         self.repoExists = repoExists
         self.holdsOtherCheckout = holdsOtherCheckout
+        self.folderMissing = folderMissing
     }
 }
 
@@ -64,6 +67,10 @@ public enum WorktreeJudge {
             if !passes { reasons.append(reason) }
         }
 
+        if f.folderMissing {
+            signals.append(Signal(kind: .inUse, text: "Its folder is missing"))
+            reasons.append("folder is missing")
+        }
         check(f.repoExists, pass: "The repository is there", fail: "The repository is missing, so nothing can be checked",
               reason: "can't check: repository missing")
         check(!f.holdsOtherCheckout, pass: "No other worktree inside it", fail: "Another worktree is inside it",

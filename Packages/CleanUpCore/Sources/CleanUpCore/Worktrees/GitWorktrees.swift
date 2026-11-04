@@ -105,11 +105,13 @@ public struct GitWorktrees: Sendable {
         let agent = WorktreeAgent.label(path: e.path, branch: e.branch)
 
         var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: repo, isDirectory: &isDir), isDir.boolValue else {
+        let repoExists = FileManager.default.fileExists(atPath: repo, isDirectory: &isDir) && isDir.boolValue
+        // A prunable worktree's folder is gone: git is never run in it, and it is kept.
+        guard repoExists, !e.prunable else {
             return WorktreeFacts(
                 path: e.path, repo: repo, branch: e.branch, agent: agent, uncommitted: nil, merge: .unknown,
-                locked: e.locked, processesInside: inside, lastChange: lastChange, lastCommit: nil, repoExists: false,
-                holdsOtherCheckout: holdsOtherCheckout)
+                locked: e.locked, processesInside: inside, lastChange: lastChange, lastCommit: nil, repoExists: repoExists,
+                holdsOtherCheckout: holdsOtherCheckout, folderMissing: e.prunable)
         }
 
         var uncommitted: Int?

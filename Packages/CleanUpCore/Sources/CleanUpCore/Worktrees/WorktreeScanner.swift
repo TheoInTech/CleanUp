@@ -89,7 +89,7 @@ public actor WorktreeScanner {
     ) async -> WorktreeSnapshot? {
         guard await git.available() else { return nil }
         let home = self.home
-        let repos = await Task.detached { WorktreeDiscovery.repositories(home: home, includeProtected: includeProtected) }.value
+        let repos = await Task.detached(priority: .utility) { WorktreeDiscovery.repositories(home: home, includeProtected: includeProtected) }.value
         let git = self.git
         let sizes = self.sizes
 
@@ -122,7 +122,7 @@ public actor WorktreeScanner {
         }
         if item.id == .worktreeLeftovers {
             let home = self.home
-            let current = Set(await Task.detached { WorktreeDiscovery.leftoverAgentFolders(home: home) }.value.map(\.path))
+            let current = Set(await Task.detached(priority: .utility) { WorktreeDiscovery.leftoverAgentFolders(home: home) }.value.map(\.path))
             let wanted = (item.detail["paths"] ?? "").split(separator: "\n").map(String.init)
             guard !wanted.isEmpty, wanted.allSatisfy(current.contains) else { return kept("no longer empty") }
             return Judgement(verdict: .idle, fact: item.judgement.fact, signals: item.judgement.signals)
@@ -172,7 +172,10 @@ public actor WorktreeScanner {
         let repoName = URL(fileURLWithPath: repo).lastPathComponent
         var out: [Item] = []
         for e in entries {
-            let m = await sizes.measure(URL(fileURLWithPath: e.path), now: now)
+            // A prunable worktree's folder is gone: nothing to walk (it is kept either way).
+            let m = e.prunable
+                ? FolderMeasure(bytes: 0, newest: nil, complete: false)
+                : await sizes.measure(URL(fileURLWithPath: e.path), now: now)
             // An incomplete or empty measure says nothing about recent activity: judge it as kept.
             let lastChange = m.complete ? m.newest : nil
             let facts = await git.facts(
@@ -192,7 +195,7 @@ public actor WorktreeScanner {
 
     private func leftoverItem(now: Date) async -> Item? {
         let home = self.home
-        let folders = await Task.detached { WorktreeDiscovery.leftoverAgentFolders(home: home) }.value
+        let folders = await Task.detached(priority: .utility) { WorktreeDiscovery.leftoverAgentFolders(home: home) }.value
         guard !folders.isEmpty else { return nil }
         var total: Int64 = 0
         for f in folders { total += await sizes.measure(f, now: now).bytes }

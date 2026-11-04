@@ -28,8 +28,8 @@ public struct GitWorktrees: Sendable {
         self.run = run ?? { await CommandRunner.run($0, $1, timeout: $2) }
     }
 
-    private func git(_ dir: String, _ args: [String]) async -> CommandResult {
-        await run(Self.git, ["-C", dir] + args, Self.timeout)
+    private func git(_ dir: String, _ args: [String], literal: Bool = false) async -> CommandResult {
+        await run(Self.git, (literal ? ["--literal-pathspecs"] : []) + ["-C", dir] + args, Self.timeout)
     }
 
     /// Whether git can run at all (the Xcode command line tools are installed).
@@ -76,8 +76,11 @@ public struct GitWorktrees: Sendable {
     public func facts(
         _ e: GitWorktreeEntry, repo: String, processes: [Int32: ProcessInfoRecord], ownPID: Int32, lastChange: Date?
     ) async -> WorktreeFacts {
+        // Process cwds are resolved real paths; git may report the worktree through a symlink.
+        let roots = Set([e.path, realpath(e.path, nil).map { String(cString: $0) } ?? e.path])
         let inside = Array(Set(processes.values.compactMap { p -> String? in
-            guard p.pid != ownPID, let cwd = p.cwd, cwd == e.path || cwd.hasPrefix(e.path + "/") else { return nil }
+            guard p.pid != ownPID, let cwd = p.cwd,
+                  roots.contains(where: { cwd == $0 || cwd.hasPrefix($0 + "/") }) else { return nil }
             return p.name
         })).sorted()
         let agent = WorktreeAgent.label(path: e.path, branch: e.branch)
@@ -123,11 +126,11 @@ public struct GitWorktrees: Sendable {
             let mb = await git(dir, ["merge-base", ref, "HEAD"])
             guard mb.status == 0 else { continue }
             let base = mb.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-            let diff = await git(dir, ["diff", "--name-only", base, "HEAD"])
-            guard diff.status == 0 else { continue }
-            let files = diff.stdout.split(separator: "\n").map(String.init)
+            let diff = await git(dir, ["diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", base, "HEAD"], literal: true)
+            guard diff.status == 0, !diff.timedOut else { continue }
+            let files = diff.stdout.split(separator: "\0").map(String.init)
             if files.isEmpty { return .ancestor }
-            if await git(dir, ["diff", "--quiet", ref, "HEAD", "--"] + files).status == 0 { return .squash }
+            if await git(dir, ["diff", "--quiet", "--no-ext-diff", ref, "HEAD", "--"] + files, literal: true).status == 0 { return .squash }
         }
 
         let count = await git(dir, ["rev-list", "--count", "\(first)..HEAD"])

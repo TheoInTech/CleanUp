@@ -109,4 +109,39 @@ import Testing
         #expect(f.merge == .unknown)
         #expect(f.uncommitted == nil)
     }
+
+    @Test func nonAsciiFileNeverMergedIsNotSquash() async throws {
+        let repo = try TempRepo.make()
+        let wt = repo.addWorktree("wt", branch: "feat/x")
+        repo.commit("café.txt", "x\n", on: nil, in: wt)
+        #expect(await facts(repo, wt).merge == .notMerged(commitsAhead: 1, base: "main"))
+    }
+
+    @Test func nonAsciiFileSquashMergedIsSquash() async throws {
+        let repo = try TempRepo.make()
+        let wt = repo.addWorktree("wt", branch: "feat/x")
+        repo.commit("café.txt", "x\n", on: nil, in: wt)
+        repo.squashMerge("feat/x")
+        #expect(await facts(repo, wt).merge == .squash)
+    }
+
+    @Test func renameNotOnBaseIsNotMerged() async throws {
+        let repo = try TempRepo.make()
+        let wt = repo.addWorktree("wt", branch: "feat/x")
+        repo.git(in: wt, ["mv", "a.txt", "b.txt"])
+        repo.git(in: wt, ["commit", "-m", "rename"])
+        #expect(await facts(repo, wt).merge == .notMerged(commitsAhead: 1, base: "main"))
+    }
+
+    @Test func processInsideThroughSymlinkIsReported() async throws {
+        let repo = try TempRepo.make()
+        let wt = repo.addWorktree("wt", branch: "feat/x")
+        let link = (wt as NSString).deletingLastPathComponent + "/link"
+        try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: wt)
+        let entry = GitWorktreeEntry(path: link, head: "", branch: "feat/x", locked: false, prunable: false)
+        let table = processTable(.fixture(pid: 10, name: "node", cwd: wt + "/src"))
+        let f = await git.facts(entry, repo: repo.root, processes: table, ownPID: 1, lastChange: nil)
+        #expect(f.processesInside == ["node"])
+        #expect(f.path == link)
+    }
 }

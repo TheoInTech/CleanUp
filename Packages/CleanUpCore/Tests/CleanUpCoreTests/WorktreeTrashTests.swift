@@ -460,4 +460,44 @@ import Testing
         #expect(out.skipped.map(\.1) == ["can't find git's record", "can't find git's record"])
         #expect(exists(a + "/a.txt") && exists(b + "/a.txt") && exists(nested))
     }
+
+    // Fix round 2
+
+    @Test func vanishedTrashFolderKeepsEntriesAndAdmins() async throws {
+        let env = try makeEnv(); defer { cleanup(env) }
+        let (_, e) = try await trashOne(env)
+        try FileManager.default.removeItem(at: env.fakeTrash)  // the volume went away
+        await env.trash.reconcile()
+        await env.trash.deleteNow([e.id])
+        #expect(await env.trash.entries.count == 1)
+        #expect(exists(e.storedAdmin!))
+    }
+
+    @Test func recordWithoutIdentityIsNeverDeletedOrRestored() async throws {
+        let env = try makeEnv(); defer { cleanup(env) }
+        let (wt, e) = try await trashOne(env)
+        let url = env.store.appendingPathComponent("trashed-worktrees.json")
+        var rows = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [[String: Any]])
+        for i in rows.indices { rows[i].removeValue(forKey: "fileID"); rows[i].removeValue(forKey: "device") }
+        try JSONSerialization.data(withJSONObject: rows).write(to: url)
+        let old = WorktreeTrash(store: env.store)
+        await old.deleteNow([e.id])
+        #expect(await old.putBack([e.id]) == [e.id])
+        #expect(exists(e.trashURL + "/a.txt"))
+        #expect(!exists(wt))
+        #expect(await old.entries.count == 1)
+        #expect(exists(e.storedAdmin!))
+    }
+
+    @Test func pathThatBecameALinkIsNotRestoredByReconcile() async throws {
+        let env = try makeEnv(); defer { cleanup(env) }
+        let (wt, e) = try await trashOne(env)
+        let real = env.base + "/real-folder"
+        try FileManager.default.moveItem(atPath: e.trashURL, toPath: real)
+        try FileManager.default.createSymbolicLink(atPath: wt, withDestinationPath: real)
+        await env.trash.reconcile()
+        #expect(await env.trash.entries.count == 1)
+        #expect(exists(e.storedAdmin!))
+        #expect(!listed(env, wt))
+    }
 }

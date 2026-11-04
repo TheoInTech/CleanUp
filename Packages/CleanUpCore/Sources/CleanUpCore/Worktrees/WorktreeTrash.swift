@@ -240,7 +240,9 @@ public actor WorktreeTrash {
             case .unknown:
                 continue
             case .missing:
-                // Already gone: git's record may only go when the folder is gone from its path too.
+                // Already gone, unless the Trash itself is out of reach (an unplugged volume); and git's
+                // record may only go when the folder is gone from its path too.
+                guard Self.trashFolderIsReachable(e) else { continue }
                 if e.storedAdmin != nil, Self.kind(e.path) != .missing { continue }
             default:
                 // Only the exact recorded Trash entry, and only if it is still the item we trashed.
@@ -267,7 +269,7 @@ public actor WorktreeTrash {
     public func reconcile() async {
         for e in entries {
             // Only a definite "no such file" means gone; any other error means unknown, so touch nothing.
-            guard Self.kind(e.trashURL) == .missing else { continue }
+            guard Self.kind(e.trashURL) == .missing, Self.trashFolderIsReachable(e) else { continue }
             switch Self.kind(e.path) {
             case .missing:
                 if let stored = e.storedAdmin {
@@ -277,7 +279,7 @@ public actor WorktreeTrash {
                 continue
             default:
                 guard let repo = e.repo, let stored = e.storedAdmin else { break }  // a leftover moved back by hand
-                guard Self.isDirectory(e.path), Self.isDirectory(repo), Self.isDirectory(stored),
+                guard Self.kind(e.path) == .folder, Self.isDirectory(repo), Self.kind(stored) == .folder,
                       let dest = Self.adminDestination(gitFile: e.path + "/.git", repo: repo),
                       Self.kind(dest) == .missing else { continue }
                 do { try FileManager.default.moveItem(atPath: stored, toPath: dest) } catch { continue }
@@ -358,6 +360,13 @@ public actor WorktreeTrash {
         }
     }
 
+    /// An item missing from the Trash only counts as gone when the folder that held it is a real, readable
+    /// directory; otherwise the Trash (or its volume) may simply be unreachable.
+    private static func trashFolderIsReachable(_ e: TrashedWorktree) -> Bool {
+        let parent = URL(fileURLWithPath: e.trashURL).deletingLastPathComponent().path
+        return kind(parent) == .folder && access(parent, R_OK | X_OK) == 0
+    }
+
     private static func identity(_ path: String) -> (UInt64, Int64)? {
         var st = stat()
         guard lstat(path, &st) == 0 else { return nil }
@@ -370,7 +379,10 @@ public actor WorktreeTrash {
         case .missing, .unknown: return false
         default: break
         }
-        guard let id = e.fileID, let dev = e.device else { return true }
+        guard let id = e.fileID, let dev = e.device else {
+            log.error("no recorded identity for the Trash item at \(e.trashURL, privacy: .public); leaving it alone")
+            return false
+        }
         guard let now = identity(e.trashURL) else { return false }
         return now.0 == id && now.1 == dev
     }

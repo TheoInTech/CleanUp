@@ -30,20 +30,23 @@ public struct GitWorktrees: Sendable {
 
     private static let removeTimeout: Duration = .seconds(15 * 60)
 
+    /// Runs git in `dir`. Read-only calls (`writes: false`) pass `--no-optional-locks`, so `git status` never
+    /// takes `index.lock` and can't get in the way of an agent committing in that worktree.
     private func git(
-        _ dir: String, _ args: [String], literal: Bool = false, timeout: Duration? = nil
+        _ dir: String, _ args: [String], literal: Bool = false, writes: Bool = false, timeout: Duration? = nil
     ) async -> CommandResult {
-        await run(Self.git, (literal ? ["--literal-pathspecs"] : []) + ["-C", dir] + args, timeout ?? Self.timeout)
+        let global = (writes ? [] : ["--no-optional-locks"]) + (literal ? ["--literal-pathspecs"] : [])
+        return await run(Self.git, global + ["-C", dir] + args, timeout ?? Self.timeout)
     }
 
     /// `git worktree remove <path>`. Never forced: git refuses when the worktree has changes or is locked.
     public func removeWorktree(repo: String, path: String) async -> CommandResult {
-        await git(repo, ["worktree", "remove", path], literal: true, timeout: Self.removeTimeout)
+        await git(repo, ["worktree", "remove", path], literal: true, writes: true, timeout: Self.removeTimeout)
     }
 
     /// `git worktree repair <path>`: reconnects a worktree whose folder or git record was moved.
     public func repairWorktree(repo: String, path: String) async -> CommandResult {
-        await git(repo, ["worktree", "repair", path], literal: true)
+        await git(repo, ["worktree", "repair", path], literal: true, writes: true)
     }
 
     /// Whether git can run at all (the Xcode command line tools are installed).

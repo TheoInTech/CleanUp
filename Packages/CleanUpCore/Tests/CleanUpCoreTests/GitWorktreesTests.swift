@@ -144,4 +144,35 @@ import Testing
         #expect(f.processesInside == ["node"])
         #expect(f.path == link)
     }
+    /// Every git call a fake runner saw, in order.
+    final class Calls: @unchecked Sendable {
+        private let lock = NSLock()
+        private var all: [[String]] = []
+        func add(_ args: [String]) { lock.withLock { all.append(args) } }
+        var args: [[String]] { lock.withLock { all } }
+    }
+
+    @Test func readOnlyGitCallsNeverTakeTheIndexLock() async throws {
+        let calls = Calls()
+        let fake = GitWorktrees(run: { tool, args, _ in
+            if tool == "/usr/bin/git" { calls.add(args) }
+            // Not an ancestor, so the squash check (and its diffs) runs too.
+            return CommandResult(status: args.contains("--is-ancestor") ? 1 : 0, stdout: "", stderr: "", timedOut: false)
+        })
+        let dir = FileManager.default.temporaryDirectory.path  // a folder that exists, so facts asks git
+        _ = await fake.list(repo: dir)
+        let entry = GitWorktreeEntry(path: dir, head: "abc", branch: "x", locked: false, prunable: false)
+        _ = await fake.facts(entry, repo: dir, processes: [:], ownPID: 1, lastChange: nil)
+        let reads = calls.args
+        #expect(reads.count > 5)
+        #expect(reads.contains { $0.contains("status") })
+        #expect(reads.contains { $0.contains("diff") })
+        #expect(reads.allSatisfy { $0.first == "--no-optional-locks" })
+
+        _ = await fake.removeWorktree(repo: dir, path: dir + "/wt")
+        _ = await fake.repairWorktree(repo: dir, path: dir + "/wt")
+        let writes = calls.args.dropFirst(reads.count)
+        #expect(writes.count == 2)
+        #expect(writes.allSatisfy { !$0.contains("--no-optional-locks") })
+    }
 }

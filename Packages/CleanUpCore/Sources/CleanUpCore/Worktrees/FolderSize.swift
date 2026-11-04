@@ -18,10 +18,12 @@ public enum FolderSize {
     /// One enumerator pass with prefetched keys. Symlinks count as themselves and are never followed;
     /// file contents are never read.
     public static func measure(_ url: URL) -> FolderMeasure {
-        let keys: [URLResourceKey] = [.totalFileAllocatedSizeKey, .contentModificationDateKey, .isRegularFileKey, .isSymbolicLinkKey]
+        let keys: [URLResourceKey] = [.totalFileAllocatedSizeKey, .contentModificationDateKey, .isRegularFileKey, .isSymbolicLinkKey,
+            .linkCountKey, .fileResourceIdentifierKey]
         var bytes: Int64 = 0
         var newest: Date?
         var complete = true
+        var seen = Set<NSObject>()   // files with several hard links, counted once like `du`
         let handler: (URL, Error) -> Bool = { _, _ in complete = false; return true }
         guard let walker = FileManager.default.enumerator(at: url, includingPropertiesForKeys: keys, options: [], errorHandler: handler) else {
             return FolderMeasure(bytes: 0, newest: nil, complete: false)
@@ -33,7 +35,9 @@ public enum FolderSize {
                 // Size of the link itself; the enumerator does not descend into symlinked directories.
                 bytes += Int64(v.totalFileAllocatedSize ?? 0)
             } else if v.isRegularFile == true {
-                // Hard links are counted once per link, so this is an estimate and may be above `du`.
+                if (v.linkCount ?? 1) > 1, let id = v.fileResourceIdentifier as? NSObject, !seen.insert(id).inserted {
+                    continue
+                }
                 if let size = v.totalFileAllocatedSize { bytes += Int64(size) } else { complete = false }
             }
         }
@@ -52,7 +56,7 @@ public actor SizeCache {
     private let maxAge: TimeInterval
     private var entries: [String: Entry] = [:]
 
-    public init(maxAge: TimeInterval = 6 * 3600) {
+    public init(maxAge: TimeInterval = 24 * 3600) {
         self.maxAge = maxAge
     }
 

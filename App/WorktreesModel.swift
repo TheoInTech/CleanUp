@@ -107,9 +107,14 @@ final class WorktreesModel {
             await trash.reconcile()
             let table = await Task.detached(priority: .utility) { ProcessTable.snapshot() }.value
             let entries = await trash.entries
-            let fresh = await scanner.scan(
-                processes: table, ownPID: ProcessInfo.processInfo.processIdentifier,
-                includeProtected: includeProtected, trashed: entries, now: Date())
+            // Utility priority (background QoS throttles disk I/O so hard the walk takes hours): a full walk is heavy and nobody is waiting for it. Folder measuring is
+            // already serial (the SizeCache actor runs one measure at a time).
+            let pid = ProcessInfo.processInfo.processIdentifier
+            let protected = includeProtected
+            let scanner = self.scanner
+            let fresh = await Task.detached(priority: .utility) {
+                await scanner.scan(processes: table, ownPID: pid, includeProtected: protected, trashed: entries, now: Date())
+            }.value
             snapshot = fresh
             if let fresh { selection.apply(fresh, keep: currentKeep(), quick: quickSelect) } else { selection = WorktreeSelection() }
         } while scanRequestedWhileScanning

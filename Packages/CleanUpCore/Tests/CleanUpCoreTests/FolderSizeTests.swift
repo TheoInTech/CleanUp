@@ -28,6 +28,17 @@ import Testing
         #expect(m.complete)
     }
 
+    @Test func hardLinksAreCountedOnce() throws {
+        let dir = try makeDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let original = dir.appendingPathComponent("orig")
+        try write(original, bytes: 1_000_000)
+        for i in 1...3 { try FileManager.default.linkItem(at: original, to: dir.appendingPathComponent("link\(i)")) }
+        let m = FolderSize.measure(dir)
+        #expect(m.bytes >= 1_000_000 && m.bytes < 1_100_000)
+        #expect(m.complete)
+    }
+
     @Test func symlinkTargetsAreNotCounted() throws {
         let dir = try makeDir()
         let outside = try makeDir()
@@ -129,7 +140,7 @@ import Testing
         try write(dir.appendingPathComponent("sub/big"), bytes: 1_000_000)
         try fm.setAttributes([.modificationDate: pinned], ofItemAtPath: dir.path)
         #expect(await cache.measure(dir, now: t0.addingTimeInterval(3600)) == first)
-        let expired = await cache.measure(dir, now: t0.addingTimeInterval(7 * 3600))
+        let expired = await cache.measure(dir, now: t0.addingTimeInterval(25 * 3600))
         #expect(expired.bytes > first.bytes)
     }
 

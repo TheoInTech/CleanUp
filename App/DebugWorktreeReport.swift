@@ -10,7 +10,7 @@ enum DebugWorktreeReport {
     static var requested: Bool { UserDefaults.standard.bool(forKey: "debugWorktreeReport") }
 
     static func run() {
-        Task.detached {
+        Task.detached(priority: .utility) {
             let text = await report()
             if let path = UserDefaults.standard.string(forKey: "debugWorktreeReportPath") {
                 try? text.write(toFile: path, atomically: true, encoding: .utf8)

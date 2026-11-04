@@ -103,8 +103,14 @@ public enum WorktreeDiscovery {
         return false
     }
 
-    /// Direct children of the Codex and Cursor worktree roots with no `.git` within 3 levels and under 1 MB.
-    /// Fails safe: a folder that cannot be fully read is never listed.
+    /// Files an agent leaves in an otherwise empty worktree folder.
+    static let markerFiles: Set<String> = [".codex-worktree-name"]
+    /// A folder with more entries than this is not a leftover.
+    static let leftoverWalkCap = 200
+
+    /// Direct children of the Codex and Cursor worktree roots that hold nothing but folders, `.DS_Store`
+    /// and the agent's marker files. Fails safe: anything else (any other file, a symlink, a `.git`, an
+    /// unreadable entry, or more than `leftoverWalkCap` entries) means the folder is not listed.
     public static func leftoverAgentFolders(home: URL) -> [URL] {
         let fm = FileManager.default
         var out: [URL] = []
@@ -117,42 +123,31 @@ public enum WorktreeDiscovery {
             for kid in kids {
                 guard let v = try? kid.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
                       v.isDirectory == true, v.isSymbolicLink != true else { continue }
-                guard hasGit(kid, depth: 3) == false else { continue }
-                guard let size = allocatedBytes(kid, limit: 1_000_000), size < 1_000_000 else { continue }
-                out.append(kid)
+                if holdsOnlyMarkers(kid) { out.append(kid) }
             }
         }
         return out
     }
 
-    /// Whether a `.git` exists within `depth` levels; nil when the folder could not be fully read.
-    private static func hasGit(_ folder: URL, depth: Int) -> Bool? {
+    private static func holdsOnlyMarkers(_ folder: URL) -> Bool {
         var failed = false
         guard let e = FileManager.default.enumerator(
-            at: folder, includingPropertiesForKeys: nil, options: [],
+            at: folder, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey], options: [],
             errorHandler: { _, _ in failed = true; return false }
-        ) else { return nil }
+        ) else { return false }
+        var count = 0
         while let item = e.nextObject() as? URL {
-            if item.lastPathComponent == ".git" { return true }
-            if e.level >= depth { e.skipDescendants() }
+            count += 1
+            if count > leftoverWalkCap { return false }
+            guard let v = try? item.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else { return false }
+            if v.isSymbolicLink != false { return false }
+            let name = item.lastPathComponent
+            if v.isDirectory == true {
+                if name == ".git" { return false }
+            } else if name != ".DS_Store" && !markerFiles.contains(name) {
+                return false
+            }
         }
-        return failed ? nil : false
-    }
-
-    /// Allocated bytes under `folder`, stopping early once `limit` is reached; nil when anything could not be read.
-    private static func allocatedBytes(_ folder: URL, limit: Int) -> Int? {
-        var failed = false
-        guard let e = FileManager.default.enumerator(
-            at: folder, includingPropertiesForKeys: [.totalFileAllocatedSizeKey], options: [],
-            errorHandler: { _, _ in failed = true; return false }
-        ) else { return nil }
-        var total = 0
-        while let item = e.nextObject() as? URL {
-            guard let size = (try? item.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?.totalFileAllocatedSize
-            else { return nil }
-            total += size
-            if total >= limit { return total }
-        }
-        return failed ? nil : total
+        return !failed
     }
 }

@@ -211,8 +211,8 @@ import Testing
         let scanner = WorktreeScanner(home: home)
         let item = try #require(await scan(scanner)?.items.first)
         #expect(await scanner.recheck(item, processes: [:], ownPID: 1, now: Date()).verdict == .idle)
-        // A leftover is under 1 MB; a real checkout's worth of files is not.
-        try String(repeating: "x", count: 2_000_000).write(
+        // Any file that isn't an agent marker makes it a real folder.
+        try "hi".write(
             to: folder.appendingPathComponent("notes.txt"), atomically: true, encoding: .utf8)
         let j = await scanner.recheck(item, processes: [:], ownPID: 1, now: Date())
         #expect(j.verdict != .idle)

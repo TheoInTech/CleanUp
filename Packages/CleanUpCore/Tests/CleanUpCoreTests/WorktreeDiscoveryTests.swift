@@ -109,8 +109,43 @@ import Testing
         let big = home.appendingPathComponent(".cursor/worktrees/big")
         try dir(big)
         try Data(count: 2_000_000).write(to: big.appendingPathComponent("blob"))
+        try "x".write(to: old.appendingPathComponent(".DS_Store"), atomically: true, encoding: .utf8)
         let found = WorktreeDiscovery.leftoverAgentFolders(home: home).map(\.path).sorted()
         #expect(found == [home.appendingPathComponent(".cursor/worktrees/empty").path, old.path].sorted())
+    }
+
+    @Test func smallRealFileIsNotLeftover() throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let f = home.appendingPathComponent(".codex/worktrees/notes")
+        try dir(f)
+        try "0123456789".write(to: f.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
+        #expect(WorktreeDiscovery.leftoverAgentFolders(home: home).isEmpty)
+    }
+
+    @Test func emptyNestedFoldersAreLeftover() throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let f = home.appendingPathComponent(".cursor/worktrees/nest")
+        try dir(f.appendingPathComponent("a/b/c"))
+        #expect(WorktreeDiscovery.leftoverAgentFolders(home: home).map(\.path) == [f.path])
+    }
+
+    @Test func symlinkInsideIsNotLeftover() throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let f = home.appendingPathComponent(".codex/worktrees/link")
+        try dir(f)
+        try FileManager.default.createSymbolicLink(at: f.appendingPathComponent("l"), withDestinationURL: home)
+        #expect(WorktreeDiscovery.leftoverAgentFolders(home: home).isEmpty)
+    }
+
+    @Test func tooManyEntriesIsNotLeftover() throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let f = home.appendingPathComponent(".codex/worktrees/many")
+        for i in 0..<250 { try dir(f.appendingPathComponent("d\(i)")) }
+        #expect(WorktreeDiscovery.leftoverAgentFolders(home: home).isEmpty)
     }
 
     @Test func unreadableLeftoverCandidateIsNotListed() throws {

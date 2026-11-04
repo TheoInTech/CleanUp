@@ -485,21 +485,32 @@ extension WorktreeFacts {
 final class TempRepo: @unchecked Sendable {
     let root: String
     private let base: String
+    private let ownsBase: Bool
 
-    private init(base: String, root: String) {
+    private init(base: String, root: String, ownsBase: Bool = true) {
         self.base = base
         self.root = root
+        self.ownsBase = ownsBase
     }
 
-    deinit { try? FileManager.default.removeItem(atPath: base) }
+    deinit { if ownsBase { try? FileManager.default.removeItem(atPath: base) } }
+
+    /// A repository at `parent/name`; `parent` (and its cleanup) belongs to the caller, and worktrees
+    /// are added beside the repo, under `parent`.
+    static func make(in parent: String, name: String) throws -> TempRepo {
+        try make(base: parent, rootName: name, ownsBase: false)
+    }
 
     static func make() throws -> TempRepo {
         let raw = FileManager.default.temporaryDirectory.path
         let tmp = realpath(raw, nil).map { String(cString: $0) } ?? raw
-        let base = tmp + "/cleanup-repo-" + UUID().uuidString
-        let root = base + "/repo"
+        return try make(base: tmp + "/cleanup-repo-" + UUID().uuidString, rootName: "repo", ownsBase: true)
+    }
+
+    private static func make(base: String, rootName: String, ownsBase: Bool) throws -> TempRepo {
+        let root = base + "/" + rootName
         try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
-        let repo = TempRepo(base: base, root: root)
+        let repo = TempRepo(base: base, root: root, ownsBase: ownsBase)
         repo.run("init", "-b", "main")
         repo.run("config", "user.name", "Test")
         repo.run("config", "user.email", "test@example.com")

@@ -1,0 +1,5 @@
+# Search engines and AI assistants are welcome.
+User-agent: *
+Allow: /
+
+Sitemap: https://theointech.github.io/CleanUp/sitemap.xml

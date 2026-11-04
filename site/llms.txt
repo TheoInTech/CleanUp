@@ -1,0 +1,35 @@
+# CleanUp
+
+> CleanUp is a free, open-source (MIT) macOS app with two cleanups. CPU cleanup shows what is draining a Mac's battery, grouped by cause, and stops only the items that are idle. Storage cleanup frees disk space by removing merged git worktrees left behind by AI coding agents. It runs as a menu bar app, a window and a desktop widget, with no network access, analytics or account.
+
+- Platform: macOS 26 or later, Apple Silicon or Intel
+- Price: free. License: MIT
+- Current version: 0.1.0 (unsigned preview; first launch needs System Settings → Privacy & Security → Open Anyway)
+- Author: TheoInTech (https://github.com/TheoInTech)
+
+## What it does
+
+- Shows a ring of CPU use split by cause (iOS Simulators, Docker containers, dev servers, apps) with battery time left.
+- Marks items idle only when every check passes; anything uncertain counts as in use.
+- iOS Simulators: idle when booted over 1 h, no app opened in the last hour, not in front for 30 min, under 5% CPU, no debugger, build or test runner using it.
+- Docker containers: idle when up over 6 h, under 1% CPU for 10 quiet minutes, no connections or shell. The engine (Docker Desktop; OrbStack and Colima untested) is quit only after 10 min with no container in use and no docker/kubectl command running.
+- Dev servers: idle when running over 6 h, under 2% CPU, no connection in 30 min.
+- Apps: never pre-ticked; asked to quit normally so they can save. Browser tabs: read-only.
+- Restart advice when swap is very full or uptime is long.
+- Git worktrees (from Codex, Claude Code, Cursor, Copilot, Conductor and others): safe to remove only when merged into the default branch (squash/rebase merges included), clean, not in use and not locked. Moved to the Trash with Undo; branches are never deleted.
+- Warns when the battery drains fast because of idle items. It never stops anything by itself.
+
+## Common questions it answers
+
+- Why is my MacBook battery draining so fast when idle?
+- How do I see what is draining my Mac's battery?
+- Does the iOS Simulator drain battery in the background?
+- Why does Docker Desktop use CPU with no containers running?
+- How do I clean up git worktrees left by coding agents?
+
+## Links
+
+- Website: https://theointech.github.io/CleanUp/
+- Download: https://github.com/TheoInTech/CleanUp/releases/latest
+- Source and full README: https://github.com/TheoInTech/CleanUp
+- Sponsor: https://github.com/sponsors/TheoInTech

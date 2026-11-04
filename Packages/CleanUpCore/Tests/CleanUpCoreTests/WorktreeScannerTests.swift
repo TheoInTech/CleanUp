@@ -1,0 +1,120 @@
+import Foundation
+import Testing
+@testable import CleanUpCore
+
+@Suite struct WorktreeScannerTests {
+    private func makeHome() throws -> URL {
+        let raw = FileManager.default.temporaryDirectory.appendingPathComponent("ws-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: raw, withIntermediateDirectories: true)
+        return URL(fileURLWithPath: String(cString: realpath(raw.path, nil)))
+    }
+
+    /// Pushes every file's modification time `days` into the past so the recent-change check passes.
+    private func age(_ path: String, days: Double = 3) {
+        let past = Date().addingTimeInterval(-days * 86_400)
+        let fm = FileManager.default
+        var paths = [path]
+        if let e = fm.enumerator(atPath: path) { for case let rel as String in e { paths.append(path + "/" + rel) } }
+        for p in paths { try? fm.setAttributes([.modificationDate: past], ofItemAtPath: p) }
+    }
+
+    private func scan(_ scanner: WorktreeScanner, trashed: [TrashedWorktree] = []) async -> WorktreeSnapshot? {
+        await scanner.scan(processes: [:], ownPID: 1, includeProtected: false, trashed: trashed, now: Date())
+    }
+
+    @Test func scansSafeAndKeptWorktrees() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let repo = try TempRepo.make(in: home.appendingPathComponent("Projects").path, name: "app")
+        repo.commit("big.txt", String(repeating: "x", count: 50_000), on: nil)
+        let merged = repo.addWorktree("app-merged", branch: "feat/merged")
+        let dirty = repo.addWorktree("app-dirty", branch: "feat/dirty")
+        try "wip\n".write(toFile: dirty + "/wip.txt", atomically: true, encoding: .utf8)
+        age(merged); age(dirty)
+
+        let snap = try #require(await scan(WorktreeScanner(home: home)))
+        #expect(snap.items.count == 2)
+        let safe = try #require(snap.items.first { $0.name == "app-merged" })
+        let kept = try #require(snap.items.first { $0.name == "app-dirty" })
+        #expect(safe.judgement.verdict == .idle)
+        #expect(kept.judgement.verdict != .idle)
+        #expect(safe.id == .worktree(path: merged))
+        #expect(safe.detail["repo"] == repo.root)
+        #expect(safe.detail["repoName"] == "app")
+        #expect(safe.detail["branch"] == "feat/merged")
+        #expect(safe.detail["path"] == merged)
+        #expect(snap.safeBytes > 0)
+        #expect(snap.keptBytes > 0)
+        #expect(snap.safeBytes == Int64(safe.detail["bytes"]!))
+        #expect(snap.trashedBytes == 0)
+        // Largest first.
+        let sizes = snap.items.map { Int64($0.detail["bytes"]!)! }
+        #expect(sizes == sizes.sorted(by: >))
+    }
+
+    @Test func sameFolderNameInTwoReposStaysSeparate() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let a = try TempRepo.make(in: home.appendingPathComponent("p1").path, name: "alpha")
+        let b = try TempRepo.make(in: home.appendingPathComponent("p2").path, name: "beta")
+        let wa = a.addWorktree("wt/app", branch: "feat/a")
+        let wb = b.addWorktree("wt/app", branch: "feat/b")
+        age(wa); age(wb)
+
+        let snap = try #require(await scan(WorktreeScanner(home: home)))
+        #expect(snap.items.count == 2)
+        #expect(Set(snap.items.map(\.id)).count == 2)
+        #expect(Set(snap.items.compactMap { $0.detail["repoName"] }) == ["alpha", "beta"])
+        #expect(snap.items.allSatisfy { $0.name == "app" })
+    }
+
+    @Test func noGitMeansNoCategory() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let git = GitWorktrees(run: { _, _, _ in CommandResult(status: 2, stdout: "", stderr: "", timedOut: false) })
+        #expect(await scan(WorktreeScanner(git: git, home: home)) == nil)
+    }
+
+    @Test func leftoversBecomeOneItem() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        for n in ["a1", "b2"] {
+            try FileManager.default.createDirectory(at: home.appendingPathComponent(".codex/worktrees/\(n)"), withIntermediateDirectories: true)
+        }
+        let snap = try #require(await scan(WorktreeScanner(home: home)))
+        let item = try #require(snap.items.first)
+        #expect(snap.items.count == 1)
+        #expect(item.id == .worktreeLeftovers)
+        #expect(item.name == "Leftover agent folders")
+        #expect(item.judgement.verdict == .idle)
+        #expect(item.judgement.fact == "2 empty folders")
+        #expect(item.detail["paths"]?.split(separator: "\n").count == 2)
+        #expect(item.detail["bytes"] != nil)
+    }
+
+    @Test func mainCheckoutIsNeverAnItem() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        _ = try TempRepo.make(in: home.appendingPathComponent("Projects").path, name: "app")
+        let snap = try #require(await scan(WorktreeScanner(home: home)))
+        #expect(snap.items.isEmpty)
+    }
+
+    @Test func freshlyTouchedWorktreeIsKept() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let repo = try TempRepo.make(in: home.appendingPathComponent("Projects").path, name: "app")
+        _ = repo.addWorktree("app-new", branch: "feat/new")
+        let snap = try #require(await scan(WorktreeScanner(home: home)))
+        #expect(snap.items.first?.judgement.verdict != .idle)
+    }
+
+    @Test func trashedBytesSumAndCodable() throws {
+        let t = TrashedWorktree(id: UUID(), path: "/a", repo: "/r", storedAdmin: nil, trashURL: "file:///t", bytes: 7, date: Date(timeIntervalSince1970: 0))
+        let u = TrashedWorktree(id: UUID(), path: "/b", repo: nil, storedAdmin: "x", trashURL: "file:///u", bytes: 5, date: Date(timeIntervalSince1970: 0))
+        let snap = WorktreeSnapshot(date: Date(), items: [], trashed: [t, u])
+        #expect(snap.trashedBytes == 12)
+        let back = try JSONDecoder().decode(TrashedWorktree.self, from: JSONEncoder().encode(t))
+        #expect(back == t)
+    }
+}

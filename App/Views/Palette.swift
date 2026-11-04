@@ -24,6 +24,7 @@ enum Palette {
         case .apps: green
         case .browserTabs: teal
         case .restart: gray
+        case .worktrees: Color(hex: 0x5E5CE6)
         }
     }
 
@@ -35,6 +36,7 @@ enum Palette {
         case .apps: "Apps"
         case .browserTabs: "Browser tabs"
         case .restart: "Restart"
+        case .worktrees: "Worktrees"
         }
     }
 
@@ -46,6 +48,7 @@ enum Palette {
         case .apps: "square.grid.2x2.fill"
         case .browserTabs: "globe"
         case .restart: "arrow.clockwise"
+        case .worktrees: "arrow.triangle.branch"
         }
     }
 

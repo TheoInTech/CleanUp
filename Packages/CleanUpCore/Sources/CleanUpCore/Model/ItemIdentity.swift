@@ -22,4 +22,6 @@ public struct ItemIdentity: Codable, Hashable, Sendable, RawRepresentable {
     public static func app(bundleID: String) -> ItemIdentity { .init(rawValue: "app:\(bundleID)") }
     public static func browserTab(pid: Int32) -> ItemIdentity { .init(rawValue: "tab:\(pid)") }
     public static let restart = ItemIdentity(rawValue: "restart")
+    public static func worktree(path: String) -> ItemIdentity { .init(rawValue: "worktree:\(path)") }
+    public static let worktreeLeftovers = ItemIdentity(rawValue: "worktree-leftovers")
 }

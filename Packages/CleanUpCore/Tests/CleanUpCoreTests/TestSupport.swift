@@ -459,3 +459,103 @@ struct SlowModule: CategoryModule {
     func stop(_ item: Item, ctx: ScanContext, force: Bool) async -> StopResult { .failed(reason: "slow") }
     func undo(_ token: UndoToken) async -> Bool { false }
 }
+
+extension WorktreeFacts {
+    static func fixture(
+        uncommitted: Int? = 0,
+        merge: MergeState = .ancestor,
+        locked: Bool = false,
+        processesInside: [String] = [],
+        lastChangeAgo: TimeInterval? = .days(6),
+        lastCommitAgo: TimeInterval? = .days(6),
+        repoExists: Bool = true,
+        agent: String? = nil
+    ) -> WorktreeFacts {
+        WorktreeFacts(
+            path: "/Users/u/.codex/worktrees/a1b2/app", repo: "app", branch: "codex/fix", agent: agent,
+            uncommitted: uncommitted, merge: merge, locked: locked, processesInside: processesInside,
+            lastChange: lastChangeAgo.map { now.addingTimeInterval(-$0) },
+            lastCommit: lastCommitAgo.map { now.addingTimeInterval(-$0) },
+            repoExists: repoExists
+        )
+    }
+}
+
+/// A throwaway git repository under the temp directory, for tests that need real git.
+final class TempRepo: @unchecked Sendable {
+    let root: String
+    private let base: String
+    private let ownsBase: Bool
+
+    private init(base: String, root: String, ownsBase: Bool = true) {
+        self.base = base
+        self.root = root
+        self.ownsBase = ownsBase
+    }
+
+    deinit { if ownsBase { try? FileManager.default.removeItem(atPath: base) } }
+
+    /// A repository at `parent/name`; `parent` (and its cleanup) belongs to the caller, and worktrees
+    /// are added beside the repo, under `parent`.
+    static func make(in parent: String, name: String) throws -> TempRepo {
+        try make(base: parent, rootName: name, ownsBase: false)
+    }
+
+    static func make() throws -> TempRepo {
+        let raw = FileManager.default.temporaryDirectory.path
+        let tmp = realpath(raw, nil).map { String(cString: $0) } ?? raw
+        return try make(base: tmp + "/cleanup-repo-" + UUID().uuidString, rootName: "repo", ownsBase: true)
+    }
+
+    private static func make(base: String, rootName: String, ownsBase: Bool) throws -> TempRepo {
+        let root = base + "/" + rootName
+        try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        let repo = TempRepo(base: base, root: root, ownsBase: ownsBase)
+        repo.run("init", "-b", "main")
+        repo.run("config", "user.name", "Test")
+        repo.run("config", "user.email", "test@example.com")
+        repo.run("config", "commit.gpgsign", "false")
+        repo.commit("a.txt", "one\n", on: nil)
+        return repo
+    }
+
+    /// Runs git in the repo and returns trimmed stdout.
+    @discardableResult
+    func run(_ args: String...) -> String { git(in: root, args) }
+
+    @discardableResult
+    func git(in dir: String, _ args: [String]) -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        p.arguments = ["-C", dir] + args
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = Pipe()
+        try? p.run()
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Writes and commits a file, on `branch` (checked out first) or the current checkout.
+    func commit(_ file: String, _ text: String, on branch: String?, in dir: String? = nil) {
+        let dir = dir ?? root
+        if let branch { git(in: dir, ["checkout", branch]) }
+        try? text.write(toFile: dir + "/" + file, atomically: true, encoding: .utf8)
+        git(in: dir, ["add", file])
+        git(in: dir, ["commit", "-m", "edit \(file)"])
+    }
+
+    /// Adds a worktree on a new branch; returns its path.
+    func addWorktree(_ name: String, branch: String) -> String {
+        let path = base + "/" + name
+        run("worktree", "add", "-b", branch, path)
+        return path
+    }
+
+    /// Lands `branch` on the current branch as one new commit, leaving `branch` itself unmerged.
+    func squashMerge(_ branch: String) {
+        run("merge", "--squash", branch)
+        run("commit", "-m", "squash \(branch)")
+    }
+}

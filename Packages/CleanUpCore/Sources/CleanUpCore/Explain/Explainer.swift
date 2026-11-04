@@ -109,6 +109,7 @@ public actor Explainer {
         case .apps: return "a Mac app"
         case .browserTabs: return "a web page in a browser"
         case .restart: return "advice to restart the Mac"
+        case .worktrees: return "a git worktree, a second checkout of a project, made by an AI coding agent for one task"
         }
     }
 

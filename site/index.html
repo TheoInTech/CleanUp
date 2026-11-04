@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CleanUp: Find What's Draining Your Mac's Battery</title>
+  <meta name="description" content="Free, open-source Mac app that stops idle iOS Simulators, Docker containers and dev servers draining your battery, and clears merged git worktrees.">
+  <link rel="canonical" href="https://theointech.github.io/CleanUp/">
+  <meta name="robots" content="index, follow, max-image-preview:large">
+  <meta name="author" content="TheoInTech">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f6f6f4" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#111214" media="(prefers-color-scheme: dark)">
+  <link rel="icon" type="image/png" href="assets/icon.png">
+  <link rel="apple-touch-icon" href="assets/icon.png">
+  <link rel="sitemap" type="application/xml" href="sitemap.xml">
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="CleanUp">
+  <meta property="og:url" content="https://theointech.github.io/CleanUp/">
+  <meta property="og:title" content="CleanUp: Find What's Draining Your Mac's Battery">
+  <meta property="og:description" content="A free, open-source Mac app that stops idle simulators, containers and dev servers draining your battery, and removes merged worktrees left by coding agents.">
+  <meta property="og:image" content="https://theointech.github.io/CleanUp/assets/social-preview.png">
+  <meta property="og:image:type" content="image/png">
+  <meta property="og:image:width" content="1280">
+  <meta property="og:image:height" content="640">
+  <meta property="og:image:alt" content="CleanUp logo next to a ring showing 7.8 CPU cores busy, split into simulators, containers, dev servers and apps">
+  <meta property="og:locale" content="en_US">
+
+  <!-- Twitter / X -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="CleanUp: Find What's Draining Your Mac's Battery">
+  <meta name="twitter:description" content="A free, open-source Mac app that stops idle simulators, containers and dev servers draining your battery, and removes merged worktrees left by coding agents.">
+  <meta name="twitter:image" content="https://theointech.github.io/CleanUp/assets/social-preview.png">
+  <meta name="twitter:image:alt" content="CleanUp logo next to a ring showing 7.8 CPU cores busy, split into simulators, containers, dev servers and apps">
+
+  <!-- Structured data -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "SoftwareApplication",
+        "@id": "https://theointech.github.io/CleanUp/#app",
+        "name": "CleanUp",
+        "description": "A free, open-source macOS menu bar app, window and widget that shows what is draining a Mac's battery, grouped by cause (iOS Simulators, Docker containers, dev servers, apps), and stops only the items that are idle. It also frees disk space by removing merged git worktrees left behind by AI coding agents.",
+        "applicationCategory": "UtilitiesApplication",
+        "applicationSubCategory": "Battery and system monitor",
+        "operatingSystem": "macOS 26 or later",
+        "processorRequirements": "Apple Silicon or Intel",
+        "softwareVersion": "0.1.0",
+        "url": "https://theointech.github.io/CleanUp/",
+        "downloadUrl": "https://github.com/TheoInTech/CleanUp/releases/latest",
+        "installUrl": "https://github.com/TheoInTech/CleanUp#install",
+        "image": "https://theointech.github.io/CleanUp/assets/social-preview.png",
+        "screenshot": "https://theointech.github.io/CleanUp/assets/main-window.png",
+        "license": "https://opensource.org/licenses/MIT",
+        "isAccessibleForFree": true,
+        "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+        "featureList": [
+          "Ring chart of CPU use split by cause, with battery time left",
+          "Finds idle iOS Simulators, Docker containers and engines, and dev servers",
+          "Quick select stops everything idle; or tick items one by one",
+          "Explains why each item is judged idle or in use",
+          "Menu bar popover and desktop widget",
+          "Warns when the battery drains fast because of idle items",
+          "Finds git worktrees left by coding agents (Codex, Claude Code, Cursor) and moves merged, clean ones to the Trash",
+          "No network access, no analytics, no account"
+        ],
+        "author": { "@id": "https://github.com/TheoInTech#person" },
+        "sameAs": ["https://github.com/TheoInTech/CleanUp"]
+      },
+      {
+        "@type": "SoftwareSourceCode",
+        "name": "CleanUp source code",
+        "codeRepository": "https://github.com/TheoInTech/CleanUp",
+        "programmingLanguage": "Swift",
+        "license": "https://opensource.org/licenses/MIT",
+        "targetProduct": { "@id": "https://theointech.github.io/CleanUp/#app" }
+      },
+      {
+        "@type": "Person",
+        "@id": "https://github.com/TheoInTech#person",
+        "name": "TheoInTech",
+        "url": "https://github.com/TheoInTech",
+        "sameAs": ["https://github.com/sponsors/TheoInTech"]
+      },
+      {
+        "@type": "WebSite",
+        "name": "CleanUp",
+        "url": "https://theointech.github.io/CleanUp/",
+        "dateModified": "2026-11-04"
+      },
+      {
+        "@type": "FAQPage",
+        "mainEntity": [
+          { "@type": "Question", "name": "Why is my MacBook battery draining so fast when I'm not doing anything?",
+            "acceptedAnswer": { "@type": "Answer", "text": "On a developer's Mac the usual cause is tools left running in the background: a booted iOS Simulator, Docker Desktop's virtual machine, or a dev server started days ago. Each one keeps the CPU busy even when you aren't using it. Activity Monitor lists processes, but it doesn't tell you which ones are idle. CleanUp groups CPU use by cause, shows how much battery time you have left, and marks what is safe to stop." } },
+          { "@type": "Question", "name": "How do I see what is draining my Mac's battery?",
+            "acceptedAnswer": { "@type": "Answer", "text": "macOS shows apps using significant energy in the battery menu and in Activity Monitor's Energy tab. CleanUp adds the part those don't: a ring split by cause (simulators, containers, dev servers, apps) with the cores each one keeps busy, and a checklist of the items that look idle. It lives in the menu bar and has a desktop widget." } },
+          { "@type": "Question", "name": "Does the iOS Simulator drain battery when I'm not using it?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Yes. A simulator stays booted after you stop your app in Xcode, and its background processes keep using CPU. CleanUp marks a simulator idle only when it has been booted for over an hour, no app was opened in it in the last hour, it hasn't been in front for 30 minutes, it uses under 5% CPU, and no debugger, build or test runner is using it." } },
+          { "@type": "Question", "name": "Why does Docker Desktop use CPU when no containers are running?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Docker Desktop runs a Linux virtual machine that keeps going until you quit the engine. CleanUp marks a container idle only after it has been up over 6 hours with almost no CPU, network traffic or connections, and no shell attached. It quits the engine itself only after 10 minutes with no container in use and no docker or kubectl command running. Tested with Docker Desktop; OrbStack and Colima are supported but untested." } },
+          { "@type": "Question", "name": "How do I clean up git worktrees left by Codex, Claude Code or Cursor?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Coding agents create a git worktree per task, each with its own dependencies and build output, and many are never removed. CleanUp finds every linked worktree of your repositories, checks that its work is merged into the default branch (squash and rebase merges included), that nothing is uncommitted or untracked, and that no process is using it. Safe ones go to the Trash in one tap, with Undo, and branches are never deleted." } },
+          { "@type": "Question", "name": "Will CleanUp stop something I'm still using?",
+            "acceptedAnswer": { "@type": "Answer", "text": "No. Every check must pass before something counts as idle, and anything uncertain counts as in use. Apps are never pre-ticked and are asked to quit normally, so they can still offer to save. Browser tabs are read-only. Nothing is stopped automatically: CleanUp only warns, and you press the button." } },
+          { "@type": "Question", "name": "Is CleanUp free and private?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Yes. CleanUp is free and open source under the MIT license, with no ads, no account, no analytics and no network access. Everything is read and decided on your Mac." } },
+          { "@type": "Question", "name": "What do I need to run it, and why does macOS say it can't verify the app?",
+            "acceptedAnswer": { "@type": "Answer", "text": "CleanUp needs macOS 26 or later, on Apple Silicon or Intel. This preview isn't notarized by Apple yet, so the first time you open it, click Done, then go to System Settings → Privacy & Security and click Open Anyway. You only do this once. A signed download is the first sponsorship goal." } }
+        ]
+      }
+    ]
+  }
+  </script>
+  <style>
+    :root {
+      --bg: #f6f6f4;
+      --ink: #1c1d21;
+      --muted: #6b6d75;
+      --line: #e3e3df;
+      --card: #ffffff;
+      --primary: #1c1d21;
+      --primary-ink: #ffffff;
+      --pink: #db61a2;
+      --green: #4fbf5a;
+      --gray: #c9c9c4;
+      --shadow: 0 30px 60px -20px rgba(20, 20, 30, .25), 0 0 0 1px rgba(0, 0, 0, .06);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111214;
+        --ink: #f2f2f0;
+        --muted: #9a9ca3;
+        --line: #26272b;
+        --card: #1a1b1e;
+        --primary: #f2f2f0;
+        --primary-ink: #111214;
+        --green: #5ccc67;
+        --gray: #44464c;
+        --shadow: 0 30px 60px -20px rgba(0, 0, 0, .7), 0 0 0 1px rgba(255, 255, 255, .08);
+      }
+    }
+    * { box-sizing: border-box; }
+    html { -webkit-text-size-adjust: 100%; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 17px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+    a { color: inherit; }
+    .wrap { max-width: 1040px; margin: 0 auto; padding: 0 20px; }
+
+    /* Hero */
+    header { text-align: center; padding: 72px 0 40px; }
+    .logo { width: 220px; height: auto; }
+    .logo-dark { display: none; }
+    @media (prefers-color-scheme: dark) {
+      .logo-light { display: none; }
+      .logo-dark { display: inline; }
+    }
+    h1 {
+      font-size: clamp(34px, 6vw, 56px);
+      line-height: 1.05;
+      letter-spacing: -0.03em;
+      margin: 36px auto 16px;
+      max-width: 19ch;
+    }
+    .lede { color: var(--muted); font-size: clamp(17px, 2.2vw, 20px); max-width: 34em; margin: 0 auto; }
+    .ctas { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-top: 32px; }
+    .btn {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 14px 22px; border-radius: 999px;
+      font-weight: 600; font-size: 16px; text-decoration: none;
+      transition: transform .15s ease, opacity .15s ease;
+    }
+    .btn:hover { transform: translateY(-1px); }
+    .btn svg { width: 18px; height: 18px; flex: none; }
+    .btn-primary { background: var(--primary); color: var(--primary-ink); }
+    .btn-ghost { border: 1px solid var(--line); background: var(--card); }
+    .meta { color: var(--muted); font-size: 14px; margin-top: 16px; }
+
+    /* Hero: the two cleanups */
+    .modes {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 14px;
+      max-width: 760px; margin: 32px auto 0; text-align: left;
+    }
+    .mode {
+      display: flex; gap: 16px; align-items: center;
+      background: var(--card); border: 1px solid var(--line); border-radius: 18px;
+      padding: 16px 18px; text-decoration: none;
+      transition: transform .15s ease, border-color .15s ease;
+    }
+    .mode:hover { transform: translateY(-1px); border-color: var(--muted); }
+    .mode-art { flex: none; width: 64px; height: 64px; display: grid; place-items: center; }
+    .ring {
+      border-radius: 50%;
+      background: conic-gradient(#f5a33d 0 25%, #3b82f6 25% 34%, #b35ee8 34% 35%, #63cf6a 35% 45%, var(--gray) 45% 100%);
+      -webkit-mask: radial-gradient(circle, transparent 20px, #000 21px);
+              mask: radial-gradient(circle, transparent 20px, #000 21px);
+    }
+    .store { gap: 6px; align-content: center; }
+    .store .bar { width: 64px; height: 10px; }
+    .store-gb { font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--green); }
+    .mode-title { display: block; font-weight: 600; font-size: 17px; letter-spacing: -0.01em; }
+    .mode-text { display: block; color: var(--muted); font-size: 14px; line-height: 1.4; margin-top: 2px; }
+    @media (max-width: 760px) { .modes { grid-template-columns: 1fr; } }
+
+    /* Screenshots */
+    .shots {
+      position: relative;
+      display: flex; justify-content: center; align-items: flex-end; gap: 28px;
+      padding: 32px 0 88px;
+    }
+    .shots img { border-radius: 14px; box-shadow: var(--shadow); height: auto; display: block; }
+    .shot-main { width: 340px; }
+    .shot-side { display: flex; flex-direction: column; gap: 28px; }
+    .shot-pop { width: 260px; }
+    .shot-widget { width: 320px; border-radius: 22px !important; }
+    @media (max-width: 760px) {
+      .shots { flex-direction: column; align-items: center; }
+      .shot-main { width: min(320px, 100%); }
+      .shot-side { align-items: center; }
+      .shot-widget { width: min(320px, 100%); }
+      .shot-pop { display: none !important; }
+    }
+
+    /* Points */
+    .points {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 32px;
+      border-top: 1px solid var(--line); padding: 56px 0;
+    }
+    .points h3 { margin: 0 0 6px; font-size: 18px; letter-spacing: -0.01em; }
+    .points p { margin: 0; color: var(--muted); font-size: 16px; }
+    .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; vertical-align: 1px; }
+    @media (max-width: 760px) { .points { grid-template-columns: 1fr; gap: 24px; } }
+
+    /* Worktrees (coming next) */
+    .next {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 40px; align-items: center;
+      border-top: 1px solid var(--line); padding: 56px 0;
+    }
+    .badge {
+      display: inline-block; font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+      padding: 4px 10px; border-radius: 999px; background: var(--card); border: 1px solid var(--line); color: var(--muted);
+    }
+    .next h2 { margin: 14px 0 10px; font-size: clamp(26px, 3.4vw, 34px); line-height: 1.1; letter-spacing: -0.02em; }
+    .next p { margin: 0 0 12px; color: var(--muted); }
+    .next p strong { color: var(--ink); font-weight: 600; }
+    .mock {
+      background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 22px;
+      font-size: 14px;
+    }
+    .bar { display: flex; height: 12px; border-radius: 999px; overflow: hidden; background: var(--line); }
+    .bar .safe { background: var(--green); }
+    .bar .kept { background: var(--gray); }
+    .bar-cap { margin: 10px 0 18px; color: var(--muted); font-size: 13px; }
+    .bar-cap b { color: var(--ink); font-weight: 600; }
+    .wt { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; padding: 10px 0; border-top: 1px solid var(--line); }
+    .wt-name { font-weight: 600; }
+    .wt-size { font-variant-numeric: tabular-nums; text-align: right; }
+    .wt-fact { color: var(--muted); font-size: 13px; grid-column: 1 / -1; }
+    .wt .bar { height: 6px; grid-column: 1 / -1; margin-top: 4px; background: transparent; }
+    .mock-btn {
+      margin-top: 14px; text-align: center; padding: 10px; border-radius: 999px;
+      background: #3b82f6; color: #fff; font-weight: 600;
+    }
+    @media (max-width: 760px) { .next { grid-template-columns: 1fr; gap: 28px; } }
+
+    /* FAQ */
+    .faq { border-top: 1px solid var(--line); padding: 56px 0; }
+    .faq > h2 { margin: 0 0 20px; font-size: clamp(26px, 3.4vw, 34px); letter-spacing: -0.02em; }
+    .faq details { border-bottom: 1px solid var(--line); }
+    .faq summary {
+      cursor: pointer; list-style: none; padding: 18px 32px 18px 0; position: relative;
+      font-weight: 600; font-size: 18px; letter-spacing: -0.01em;
+    }
+    .faq summary::-webkit-details-marker { display: none; }
+    .faq summary::after {
+      content: "+"; position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+      font-weight: 400; font-size: 22px; color: var(--muted);
+    }
+    .faq details[open] summary::after { content: "–"; }
+    .faq h3 { display: inline; font: inherit; margin: 0; }
+    .faq details p { margin: 0 0 18px; color: var(--muted); max-width: 46em; }
+    .faq code { font: 14px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink); }
+
+    /* Sponsor */
+    .sponsor {
+      background: var(--card); border: 1px solid var(--line); border-radius: 24px;
+      padding: 40px; display: flex; gap: 32px; align-items: center; justify-content: space-between;
+      margin-bottom: 56px;
+    }
+    .sponsor h2 { margin: 0 0 8px; font-size: 26px; letter-spacing: -0.02em; }
+    .sponsor p { margin: 0; color: var(--muted); max-width: 36em; }
+    .btn-sponsor { border: 1px solid var(--line); background: var(--bg); white-space: nowrap; }
+    .btn-sponsor svg { color: var(--pink); }
+    @media (max-width: 760px) { .sponsor { flex-direction: column; align-items: flex-start; padding: 28px; } }
+
+    footer {
+      border-top: 1px solid var(--line); padding: 28px 0 40px;
+      color: var(--muted); font-size: 14px;
+      display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px;
+    }
+    footer a { text-decoration: none; }
+    footer a:hover { color: var(--ink); }
+    footer nav { display: flex; gap: 20px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <img class="logo logo-light" src="assets/logo-light.png" alt="CleanUp" width="720" height="219">
+      <img class="logo logo-dark" src="assets/logo-dark.png" alt="CleanUp" width="720" height="221">
+      <h1>Get your Mac's battery and disk space back.</h1>
+      <p class="lede">CleanUp finds the idle simulators, containers and dev servers burning your CPU, and the merged worktrees your coding agents left behind. It cleans up only what is safe, in one tap.</p>
+      <div class="modes">
+        <a class="mode" href="#cpu">
+          <span class="mode-art ring" aria-hidden="true"></span>
+          <span>
+            <span class="mode-title">CPU cleanup</span>
+            <span class="mode-text">Stops idle iOS Simulators, Docker containers and dev servers draining your battery.</span>
+          </span>
+        </a>
+        <a class="mode" href="#worktrees">
+          <span class="mode-art store" aria-hidden="true">
+            <span class="bar"><span class="safe" style="width:84%"></span><span class="kept" style="width:16%"></span></span>
+            <span class="store-gb">208 GB</span>
+          </span>
+          <span>
+            <span class="mode-title">Storage cleanup</span>
+            <span class="mode-text">Removes merged git worktrees left by Codex, Claude Code and Cursor.</span>
+          </span>
+        </a>
+      </div>
+      <div class="ctas">
+        <a class="btn btn-primary" href="https://github.com/TheoInTech/CleanUp/releases/latest">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 20h14"/></svg>
+          Download for macOS
+        </a>
+        <a class="btn btn-ghost" href="https://github.com/TheoInTech/CleanUp">
+          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+          Star on GitHub
+        </a>
+      </div>
+      <p class="meta">Free and open source · macOS 26 or later · <a href="https://github.com/TheoInTech/CleanUp#install">First-launch steps</a></p>
+    </header>
+
+    <section class="shots" id="cpu" aria-label="Screenshots of CPU cleanup">
+      <img class="shot-main" src="assets/main-window.png" alt="CleanUp window: a ring split by cause, and a checklist of what is idle" width="840" height="1520">
+      <div class="shot-side">
+        <img class="shot-pop" src="assets/menubar-popover.png" alt="Menu bar popover" width="580" height="628" loading="lazy">
+        <img class="shot-widget" src="assets/widget-medium-busy.png" alt="Desktop widget with a Clean up button" width="808" height="420" loading="lazy">
+      </div>
+    </section>
+
+    <section class="points">
+      <div>
+        <h3><span class="dot" style="background:#f5a33d"></span>A ring, then a list</h3>
+        <p>Each colour is one cause. Tap Quick select to stop everything idle, or tick items yourself.</p>
+      </div>
+      <div>
+        <h3><span class="dot" style="background:#3b82f6"></span>Careful by default</h3>
+        <p>Anything uncertain counts as in use. Every item has a ? that says why CleanUp judged it.</p>
+      </div>
+      <div>
+        <h3><span class="dot" style="background:#63cf6a"></span>Stays on your Mac</h3>
+        <p>No network access, no analytics, no account. Menu bar, window and widget.</p>
+      </div>
+    </section>
+
+    <section class="next" aria-labelledby="worktrees">
+      <div>
+        <span class="badge">Storage cleanup</span>
+        <h2 id="worktrees">Get back the disk your coding agents filled.</h2>
+        <p>Codex, Claude Code, Cursor and other agents make a git worktree for each task and rarely remove it. On one Mac that came to <strong>138 worktrees and 247 GB</strong>, and 208 GB of it was work that had already been merged.</p>
+        <p>CleanUp finds them, marks a worktree safe only when its work is merged and nothing is uncommitted or in use, and moves them to the Trash in one tap. Branches are always kept.</p>
+      </div>
+      <div class="mock" role="img" aria-label="CleanUp's worktree storage bar showing 208 GB safe to remove and 39 GB kept, above a list of worktrees with their sizes">
+        <div class="bar"><span class="safe" style="width:84%"></span><span class="kept" style="width:16%"></span></div>
+        <div class="bar-cap"><b>208 GB safe to remove</b> · 39 GB kept</div>
+        <div class="wt">
+          <span class="wt-name">checkout-redesign</span><span class="wt-size">14.2 GB</span>
+          <span class="bar"><span class="safe" style="width:100%"></span></span>
+          <span class="wt-fact">merged 6 days ago · Codex</span>
+        </div>
+        <div class="wt">
+          <span class="wt-name">fix-login-timeout</span><span class="wt-size">3.6 GB</span>
+          <span class="bar"><span class="safe" style="width:25%"></span></span>
+          <span class="wt-fact">merged 2 weeks ago · Claude Code</span>
+        </div>
+        <div class="wt">
+          <span class="wt-name">search-filters</span><span class="wt-size">2.1 GB</span>
+          <span class="bar"><span class="kept" style="width:15%"></span></span>
+          <span class="wt-fact">kept: 3 uncommitted changes</span>
+        </div>
+        <div class="mock-btn">Clean up 120 worktrees · 208 GB</div>
+      </div>
+    </section>
+
+    <section class="faq" aria-labelledby="faq">
+      <h2 id="faq">Questions</h2>
+      <details open>
+        <summary><h3>Why is my MacBook battery draining so fast when I'm not doing anything?</h3></summary>
+        <p>On a developer's Mac the usual cause is tools left running in the background: a booted iOS Simulator, Docker Desktop's virtual machine, or a dev server started days ago. Each one keeps the CPU busy even when you aren't using it. Activity Monitor lists processes, but it doesn't tell you which ones are idle. CleanUp groups CPU use by cause, shows how much battery time you have left, and marks what is safe to stop.</p>
+      </details>
+      <details>
+        <summary><h3>How do I see what is draining my Mac's battery?</h3></summary>
+        <p>macOS shows apps using significant energy in the battery menu and in Activity Monitor's Energy tab. CleanUp adds the part those don't: a ring split by cause (simulators, containers, dev servers, apps) with the cores each one keeps busy, and a checklist of the items that look idle. It lives in the menu bar and has a desktop widget.</p>
+      </details>
+      <details>
+        <summary><h3>Does the iOS Simulator drain battery when I'm not using it?</h3></summary>
+        <p>Yes. A simulator stays booted after you stop your app in Xcode, and its background processes keep using CPU. CleanUp marks a simulator idle only when it has been booted for over an hour, no app was opened in it in the last hour, it hasn't been in front for 30 minutes, it uses under 5% CPU, and no debugger, build or test runner is using it.</p>
+      </details>
+      <details>
+        <summary><h3>Why does Docker Desktop use CPU when no containers are running?</h3></summary>
+        <p>Docker Desktop runs a Linux virtual machine that keeps going until you quit the engine. CleanUp marks a container idle only after it has been up over 6 hours with almost no CPU, network traffic or connections, and no shell attached. It quits the engine itself only after 10 minutes with no container in use and no <code>docker</code> or <code>kubectl</code> command running. Tested with Docker Desktop; OrbStack and Colima are supported but untested.</p>
+      </details>
+      <details>
+        <summary><h3>How do I clean up git worktrees left by Codex, Claude Code or Cursor?</h3></summary>
+        <p>Coding agents create a git worktree per task, each with its own dependencies and build output, and many are never removed. CleanUp finds every linked worktree of your repositories, checks that its work is merged into the default branch (squash and rebase merges included), that nothing is uncommitted or untracked, and that no process is using it. Safe ones go to the Trash in one tap, with Undo, and branches are never deleted.</p>
+      </details>
+      <details>
+        <summary><h3>Will CleanUp stop something I'm still using?</h3></summary>
+        <p>No. Every check must pass before something counts as idle, and anything uncertain counts as in use. Apps are never pre-ticked and are asked to quit normally, so they can still offer to save. Browser tabs are read-only. Nothing is stopped automatically: CleanUp only warns, and you press the button.</p>
+      </details>
+      <details>
+        <summary><h3>Is CleanUp free and private?</h3></summary>
+        <p>Yes. CleanUp is free and open source under the MIT license, with no ads, no account, no analytics and no network access. Everything is read and decided on your Mac.</p>
+      </details>
+      <details>
+        <summary><h3>What do I need to run it, and why does macOS say it can't verify the app?</h3></summary>
+        <p>CleanUp needs macOS 26 or later, on Apple Silicon or Intel. This preview isn't notarized by Apple yet, so the first time you open it, click Done, then go to System Settings → Privacy &amp; Security and click Open Anyway. You only do this once. A signed download is the first sponsorship goal.</p>
+      </details>
+    </section>
+
+    <section class="sponsor">
+      <div>
+        <h2>Keep CleanUp free</h2>
+        <p>CleanUp has no ads, accounts or tracking. The first sponsorship goal is $10 a month: it pays Apple's developer fee, so CleanUp can ship as a signed download that opens in one click.</p>
+      </div>
+      <a class="btn btn-sponsor" href="https://github.com/sponsors/TheoInTech">
+        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 14.25.345 6.903A4.3 4.3 0 0 1 6.42.844L8 2.42 9.58.844a4.3 4.3 0 0 1 6.075 6.06Z"/></svg>
+        Sponsor on GitHub
+      </a>
+    </section>
+
+    <footer>
+      <span>CleanUp · MIT licensed</span>
+      <nav>
+        <a href="https://github.com/TheoInTech/CleanUp">Source</a>
+        <a href="https://github.com/TheoInTech/CleanUp/releases">Releases</a>
+        <a href="https://github.com/TheoInTech/CleanUp/issues">Issues</a>
+        <a href="https://github.com/sponsors/TheoInTech">Sponsor</a>
+      </nav>
+    </footer>
+  </div>
+</body>
+</html>

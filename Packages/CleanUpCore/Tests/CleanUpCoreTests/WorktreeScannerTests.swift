@@ -92,6 +92,22 @@ import Testing
         #expect(item.detail["bytes"] != nil)
     }
 
+    @Test func missingWorktreeFolderIsKept() async throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let repo = try TempRepo.make(in: home.appendingPathComponent("Projects").path, name: "app")
+        let wt = repo.addWorktree("app-gone", branch: "feat/gone")
+        try FileManager.default.removeItem(atPath: wt)
+        #expect(repo.run("worktree", "list", "--porcelain").contains("prunable"))
+
+        let snap = try #require(await scan(WorktreeScanner(home: home)))
+        // The scanner leaves it out entirely (discovery finds repositories through the worktrees' own
+        // `.git` files), so a missing folder can never be offered for removal. Were it ever listed, it must be kept.
+        let item = snap.items.first { $0.id == .worktree(path: wt) }
+        #expect(item == nil || item?.judgement.verdict != .idle)
+        #expect(item == nil)
+    }
+
     @Test func mainCheckoutIsNeverAnItem() async throws {
         let home = try makeHome()
         defer { try? FileManager.default.removeItem(at: home) }

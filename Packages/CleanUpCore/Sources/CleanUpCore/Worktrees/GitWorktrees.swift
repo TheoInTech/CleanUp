@@ -28,8 +28,22 @@ public struct GitWorktrees: Sendable {
         self.run = run ?? { await CommandRunner.run($0, $1, timeout: $2) }
     }
 
-    private func git(_ dir: String, _ args: [String], literal: Bool = false) async -> CommandResult {
-        await run(Self.git, (literal ? ["--literal-pathspecs"] : []) + ["-C", dir] + args, Self.timeout)
+    private static let removeTimeout: Duration = .seconds(120)
+
+    private func git(
+        _ dir: String, _ args: [String], literal: Bool = false, timeout: Duration? = nil
+    ) async -> CommandResult {
+        await run(Self.git, (literal ? ["--literal-pathspecs"] : []) + ["-C", dir] + args, timeout ?? Self.timeout)
+    }
+
+    /// `git worktree remove <path>`. Never forced: git refuses when the worktree has changes or is locked.
+    public func removeWorktree(repo: String, path: String) async -> CommandResult {
+        await git(repo, ["worktree", "remove", path], literal: true, timeout: Self.removeTimeout)
+    }
+
+    /// `git worktree repair <path>`: reconnects a worktree whose folder or git record was moved.
+    public func repairWorktree(repo: String, path: String) async -> CommandResult {
+        await git(repo, ["worktree", "repair", path], literal: true)
     }
 
     /// Whether git can run at all (the Xcode command line tools are installed).

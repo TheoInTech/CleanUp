@@ -6,3 +6,4 @@ DerivedData/
 Config/Team.xcconfig
 CleanUp.xcodeproj/
 .build/
+.build-dd/

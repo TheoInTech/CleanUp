@@ -112,4 +112,33 @@ import Testing
         let found = WorktreeDiscovery.leftoverAgentFolders(home: home).map(\.path).sorted()
         #expect(found == [home.appendingPathComponent(".cursor/worktrees/empty").path, old.path].sorted())
     }
+
+    @Test func unreadableLeftoverCandidateIsNotListed() throws {
+        let home = try makeHome()
+        let cand = home.appendingPathComponent(".codex/worktrees/locked")
+        let sub = cand.appendingPathComponent("hidden")
+        try dir(sub)
+        try dir(home.appendingPathComponent(".codex/worktrees/fine"))
+        chmod(sub.path, 0o000)
+        defer {
+            chmod(sub.path, 0o755)
+            try? FileManager.default.removeItem(at: home)
+        }
+        let found = WorktreeDiscovery.leftoverAgentFolders(home: home).map(\.path)
+        #expect(found == [home.appendingPathComponent(".codex/worktrees/fine").path])
+    }
+
+    @Test func symlinkedAgentRootIsNotScanned() throws {
+        let home = try makeHome()
+        let outside = try makeHome()
+        defer {
+            try? FileManager.default.removeItem(at: home)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        try gitFile(in: outside.appendingPathComponent("worktrees/a/app"), "gitdir: /r/a/.git/worktrees/a\n")
+        try dir(outside.appendingPathComponent("worktrees/old"))
+        try FileManager.default.createSymbolicLink(at: home.appendingPathComponent(".codex"), withDestinationURL: outside)
+        #expect(WorktreeDiscovery.repositories(home: home, includeProtected: false).isEmpty)
+        #expect(WorktreeDiscovery.leftoverAgentFolders(home: home).isEmpty)
+    }
 }

@@ -57,6 +57,7 @@ public enum WorktreeDiscovery {
         } marker: { found.insert($0) }
 
         for root in agentRoots {
+            if crossesSymlink(home: home, relative: root) { continue }
             let url = home.appendingPathComponent(root)
             walk(root: url, maxLevel: agentDepth) { _, _, name in !isSkipped(name) } marker: { found.insert($0) }
         }
@@ -91,46 +92,67 @@ public enum WorktreeDiscovery {
 
     // MARK: Leftover agent folders
 
+    /// True when `relative` (below home) or any of its parent components is a symbolic link, or cannot be read.
+    static func crossesSymlink(home: URL, relative: String) -> Bool {
+        var url = home
+        for part in relative.split(separator: "/") {
+            url = url.appendingPathComponent(String(part))
+            guard let v = try? url.resourceValues(forKeys: [.isSymbolicLinkKey]) else { return true }
+            if v.isSymbolicLink == true { return true }
+        }
+        return false
+    }
+
     /// Direct children of the Codex and Cursor worktree roots with no `.git` within 3 levels and under 1 MB.
+    /// Fails safe: a folder that cannot be fully read is never listed.
     public static func leftoverAgentFolders(home: URL) -> [URL] {
         let fm = FileManager.default
         var out: [URL] = []
         for root in [".codex/worktrees", ".cursor/worktrees"] {
+            if crossesSymlink(home: home, relative: root) { continue }
             let url = home.appendingPathComponent(root)
             guard let kids = try? fm.contentsOfDirectory(
-                at: url, includingPropertiesForKeys: [.isDirectoryKey], options: []
+                at: url, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey], options: []
             ) else { continue }
-            for kid in kids where (try? kid.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
-                if hasGit(kid, depth: 3) { continue }
-                if allocatedBytes(kid, limit: 1_000_000) >= 1_000_000 { continue }
+            for kid in kids {
+                guard let v = try? kid.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+                      v.isDirectory == true, v.isSymbolicLink != true else { continue }
+                guard hasGit(kid, depth: 3) == false else { continue }
+                guard let size = allocatedBytes(kid, limit: 1_000_000), size < 1_000_000 else { continue }
                 out.append(kid)
             }
         }
         return out
     }
 
-    private static func hasGit(_ folder: URL, depth: Int) -> Bool {
+    /// Whether a `.git` exists within `depth` levels; nil when the folder could not be fully read.
+    private static func hasGit(_ folder: URL, depth: Int) -> Bool? {
+        var failed = false
         guard let e = FileManager.default.enumerator(
-            at: folder, includingPropertiesForKeys: [.isDirectoryKey], options: [], errorHandler: { _, _ in true }
-        ) else { return false }
+            at: folder, includingPropertiesForKeys: nil, options: [],
+            errorHandler: { _, _ in failed = true; return false }
+        ) else { return nil }
         while let item = e.nextObject() as? URL {
             if item.lastPathComponent == ".git" { return true }
             if e.level >= depth { e.skipDescendants() }
         }
-        return false
+        return failed ? nil : false
     }
 
-    /// Allocated bytes under `folder`, stopping early once `limit` is reached.
-    private static func allocatedBytes(_ folder: URL, limit: Int) -> Int {
+    /// Allocated bytes under `folder`, stopping early once `limit` is reached; nil when anything could not be read.
+    private static func allocatedBytes(_ folder: URL, limit: Int) -> Int? {
+        var failed = false
         guard let e = FileManager.default.enumerator(
             at: folder, includingPropertiesForKeys: [.totalFileAllocatedSizeKey], options: [],
-            errorHandler: { _, _ in true }
-        ) else { return 0 }
+            errorHandler: { _, _ in failed = true; return false }
+        ) else { return nil }
         var total = 0
         while let item = e.nextObject() as? URL {
-            total += (try? item.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?.totalFileAllocatedSize ?? 0
-            if total >= limit { break }
+            guard let size = (try? item.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?.totalFileAllocatedSize
+            else { return nil }
+            total += size
+            if total >= limit { return total }
         }
-        return total
+        return failed ? nil : total
     }
 }

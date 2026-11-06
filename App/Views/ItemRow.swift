@@ -31,17 +31,20 @@ struct ItemRow: View {
 
             IconTile(symbol: item.symbol, color: color, size: 22)
 
+            // Both lines get cut off when long ("not used since CleanUp…"); hovering shows the whole text.
             VStack(alignment: .leading, spacing: 1) {
                 Text(item.name)
                     .font(.callout)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .help(item.name)
                 // A short manual fact ("not used 5 h") is the badge itself.
                 if !VerdictBadge.factFitsBadge(item), !item.judgement.fact.isEmpty {
                     Text(item.judgement.fact)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                        .help(item.judgement.fact)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
